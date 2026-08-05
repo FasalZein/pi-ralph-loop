@@ -52,6 +52,7 @@ const TEST_PROVIDER_RECOVERY_NUDGE_DELAY_ENV =
 const TEST_PROVIDER_RECOVERY_FALLBACK_DELAY_ENV =
 	"RALPH_TEST_PROVIDER_RECOVERY_FALLBACK_DELAY_MS";
 const TEST_WAIT_PARK_TIMEOUT_ENV = "RALPH_TEST_WAIT_PARK_TIMEOUT_MS";
+const NEXT_ITERATION_DELAY_ENV = "RALPH_NEXT_ITERATION_DELAY_SECONDS";
 const FINAL_PROVIDER_RECOVERY_NUDGE = [
 	"continue",
 	"Reminder: continue this same Ralph iteration.",
@@ -130,6 +131,13 @@ function getDelayMs(envName: string, fallbackMs: number): number {
 	if (!raw) return fallbackMs;
 	const parsed = Number.parseInt(raw, 10);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
+}
+
+function getNextIterationDelaySeconds(): number {
+	const raw = process.env[NEXT_ITERATION_DELAY_ENV];
+	if (!raw || !/^\d+(?:\.\d+)?$/.test(raw)) return 0;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? Math.floor(parsed) : 0;
 }
 
 function shouldStop(cwd: string): boolean {
@@ -633,7 +641,23 @@ function scheduleNextIteration(
 	ctx: ExtensionContext,
 	state: RalphLoopState,
 ): void {
-	setTimeout(() => {
+	const delaySeconds = getNextIterationDelaySeconds();
+	const nextIteration = state.iteration + 1;
+	const openNextIteration = () => {
+		const latest = readState(ctx.cwd);
+		if (
+			!latest?.running ||
+			latest.loop_token !== state.loop_token ||
+			latest.iteration !== nextIteration ||
+			!latest.transitioning
+		) {
+			return;
+		}
+		if (shouldStop(ctx.cwd)) {
+			handleRequestedStop(ctx, latest);
+			return;
+		}
+
 		const cmdCtx = getCommandCtx();
 		if (!cmdCtx || cmdCtx.cwd !== ctx.cwd) {
 			showLoopNotice(
@@ -645,7 +669,54 @@ function scheduleNextIteration(
 			return;
 		}
 		void openFreshIterationSession(cmdCtx, state.error_count);
-	}, 0);
+	};
+
+	if (delaySeconds === 0) {
+		showLoopNotice(
+			ctx,
+			`Starting iteration ${nextIteration}/${state.max_iterations} in a fresh session...`,
+			"info",
+			{ autoClear: true },
+		);
+		const timeout = setTimeout(openNextIteration, 0);
+		timeout.unref?.();
+		return;
+	}
+
+	let secondsRemaining = delaySeconds;
+	const render = () => {
+		showLoopNotice(
+			ctx,
+			`Starting Ralph iteration ${nextIteration}/${state.max_iterations} in ${secondsRemaining} ${secondsRemaining === 1 ? "second" : "seconds"}…`,
+			"info",
+		);
+	};
+	render();
+	const interval = setInterval(() => {
+		const latest = readState(ctx.cwd);
+		if (
+			!latest?.running ||
+			latest.loop_token !== state.loop_token ||
+			latest.iteration !== nextIteration ||
+			!latest.transitioning
+		) {
+			clearInterval(interval);
+			return;
+		}
+		if (shouldStop(ctx.cwd)) {
+			clearInterval(interval);
+			handleRequestedStop(ctx, latest);
+			return;
+		}
+		secondsRemaining = Math.max(0, secondsRemaining - 1);
+		if (secondsRemaining > 0) {
+			render();
+			return;
+		}
+		clearInterval(interval);
+		openNextIteration();
+	}, 1_000);
+	interval.unref?.();
 }
 
 function handleNextPromise(
@@ -670,12 +741,6 @@ function handleNextPromise(
 	}
 
 	const nextIteration = state.iteration + 1;
-	showLoopNotice(
-		ctx,
-		`Starting iteration ${nextIteration}/${state.max_iterations} in a fresh session...`,
-		"info",
-		{ autoClear: true },
-	);
 	updateState(ctx.cwd, {
 		iteration: nextIteration,
 		transitioning: true,

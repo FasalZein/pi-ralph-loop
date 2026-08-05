@@ -196,6 +196,23 @@ Stop after the current iteration finishes.
 
 Show iteration, elapsed time, and error state.
 
+## Delay between iterations
+
+Use `RALPH_NEXT_ITERATION_DELAY_SECONDS` when Ralph must wait before the next iteration. The delay can support rate limits, cooling periods, and scheduled workflows.
+
+For example, Claude and Codex subscriptions can have five-hour usage limits. The delay can spread a Ralph loop across more than one limit period.
+
+Set a five-minute delay:
+
+```bash
+export RALPH_NEXT_ITERATION_DELAY_SECONDS=300
+pi
+```
+
+After Ralph accepts `<promise>NEXT</promise>`, it shows a seconds countdown and waits before opening the next fresh session. The first iteration, same-iteration recovery, `WAIT`, `COMPLETE`, and `STOP` are not delayed.
+
+Ralph interprets the value as seconds. Ralph rounds decimal values down, so `60.9` gives a 60-second delay. Unset, empty, negative, alphanumeric, and other invalid values apply no delay. A stop or cancellation request during the countdown prevents the next session from opening.
+
 ## Loop state
 
 Ralph writes `.ralph/loop.md`. The YAML frontmatter is runtime state, not a user-authored config file, but these fields help when you inspect or recover a run.

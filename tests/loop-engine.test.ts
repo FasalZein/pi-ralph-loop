@@ -86,6 +86,16 @@ function lastNoticeWidget(h: Harness) {
 	return h.widgets.filter((w) => w.key === "ralph-loop-notice").at(-1);
 }
 
+function lastNoticeText(h: Harness): string {
+	const content = lastNoticeWidget(h)?.content;
+	if (typeof content !== "function") return "";
+	const text = content(
+		{},
+		{ fg: (_token: string, value: string) => value },
+	) as { render: (width: number) => string[] };
+	return text.render(200).join("\n").trim();
+}
+
 function makeBaseState(
 	overrides: Partial<RalphLoopState> = {},
 ): RalphLoopState {
@@ -1550,6 +1560,158 @@ test("agent_end with NEXT shows notice, advances iteration, and requests new ses
 	// newSession is called via setTimeout, so wait a tick.
 	await new Promise((r) => setTimeout(r, 600));
 	assert.equal(h.newSessionCalls, 1);
+});
+
+test("accepted NEXT delays the fresh iteration with a visible seconds countdown", async () => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const previousValue = process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+	process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = "2";
+	try {
+		const h = createHarness();
+		h.writeState(
+			makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+		);
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+
+		assert.equal(h.newSessionCalls, 0);
+		assert.equal(
+			lastNoticeText(h),
+			"Starting Ralph iteration 2/3 in 2 seconds…",
+		);
+
+		mock.timers.tick(1_000);
+		assert.equal(h.newSessionCalls, 0);
+		assert.equal(
+			lastNoticeText(h),
+			"Starting Ralph iteration 2/3 in 1 second…",
+		);
+
+		mock.timers.tick(1_000);
+		assert.equal(h.newSessionCalls, 1);
+	} finally {
+		mock.timers.reset();
+		if (previousValue === undefined) {
+			delete process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+		} else {
+			process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = previousValue;
+		}
+	}
+});
+
+test("next-iteration delay floors decimal seconds", async () => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const previousValue = process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+	process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = "2.9";
+	try {
+		const h = createHarness();
+		h.writeState(
+			makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+		);
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+		assert.equal(
+			lastNoticeText(h),
+			"Starting Ralph iteration 2/3 in 2 seconds…",
+		);
+
+		mock.timers.tick(1_999);
+		assert.equal(h.newSessionCalls, 0);
+		mock.timers.tick(1);
+		assert.equal(h.newSessionCalls, 1);
+	} finally {
+		mock.timers.reset();
+		if (previousValue === undefined) {
+			delete process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+		} else {
+			process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = previousValue;
+		}
+	}
+});
+
+test("alphanumeric next-iteration delay is invalid and applies no delay", async () => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const previousValue = process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+	process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = "2seconds";
+	try {
+		const h = createHarness();
+		h.writeState(
+			makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+		);
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+		assert.equal(h.newSessionCalls, 0);
+		mock.timers.tick(0);
+		assert.equal(h.newSessionCalls, 1);
+	} finally {
+		mock.timers.reset();
+		if (previousValue === undefined) {
+			delete process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+		} else {
+			process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = previousValue;
+		}
+	}
+});
+
+test("stop request during next-iteration countdown prevents a fresh session", async () => {
+	mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+	const previousValue = process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+	process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = "10";
+	try {
+		const h = createHarness();
+		h.writeState(
+			makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+		);
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+		h.writeState({ ...h.readState()!, stop_requested: true });
+		mock.timers.tick(1_000);
+
+		assert.equal(h.readState()?.running, false);
+		assert.equal(h.readState()?.stop_reason, "manual_stop");
+		assert.equal(h.newSessionCalls, 0);
+		mock.timers.tick(9_000);
+		assert.equal(h.newSessionCalls, 0);
+	} finally {
+		mock.timers.reset();
+		if (previousValue === undefined) {
+			delete process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+		} else {
+			process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = previousValue;
+		}
+	}
+});
+
+test("large valid next-iteration delays do not overflow into an immediate session", async () => {
+	const previousValue = process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+	process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = "2147484";
+	try {
+		const h = createHarness();
+		h.writeState(
+			makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+		);
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		assert.equal(h.newSessionCalls, 0);
+		assert.equal(
+			lastNoticeText(h),
+			"Starting Ralph iteration 2/3 in 2147484 seconds…",
+		);
+		h.writeState({ ...h.readState()!, running: false });
+	} finally {
+		if (previousValue === undefined) {
+			delete process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS;
+		} else {
+			process.env.RALPH_NEXT_ITERATION_DELAY_SECONDS = previousValue;
+		}
+	}
 });
 
 test("agent_end refreshes stored command context after each new session", async () => {

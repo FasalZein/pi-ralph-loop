@@ -395,6 +395,42 @@ test("live pi RPC: NEXT advances and COMPLETE stops", {
 	}
 });
 
+test("live pi RPC: configured delay holds the next fresh iteration", {
+	skip: !SHOULD_RUN,
+}, async () => {
+	const h = createRpcHarness({
+		env: { RALPH_NEXT_ITERATION_DELAY_SECONDS: "3" },
+	});
+	try {
+		await h.waitForStartup();
+		h.sendPrompt(
+			'/ralph-loop "Reply with exactly <promise>NEXT</promise>. Do not use tools, code fences, or extra text." --max-iterations=2',
+		);
+
+		await h.waitForState(
+			/running:\s*true[\s\S]*iteration:\s*2[\s\S]*transitioning:\s*true/,
+		);
+		const sessionsAtHandoff = h.listSessions().length;
+		await new Promise((resolve) => setTimeout(resolve, 1_000));
+		assert.equal(
+			h.listSessions().length,
+			sessionsAtHandoff,
+			"the next fresh session must stay closed during the configured delay",
+		);
+
+		const state = await h.waitForFinalState(
+			/stop_reason:\s*"max_iterations"/,
+		);
+		assert.match(state, /iteration:\s*2/);
+		assert.ok(
+			h.listSessions().length >= sessionsAtHandoff + 1,
+			"the next fresh session must open after the delay",
+		);
+	} finally {
+		await h.stop();
+	}
+});
+
 // Plain mode (free-text prompt, no @bundle): bundle_mode must stay false across
 // the whole lifecycle. bundle_mode:false is the exact persisted input that makes
 // buildStatusView render the "iteration N/M" headline with a null suffix, vs
