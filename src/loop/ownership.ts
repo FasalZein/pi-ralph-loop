@@ -95,3 +95,11 @@ export function isLoopOwnerActive(
 		isFreshSessionFile(state.last_session_file)
 	);
 }
+
+export function isLoopOwnedByCurrentProcess(
+	state: RalphLoopState,
+	currentSessionId: string,
+): boolean {
+	if (state.owner_pid !== null) return state.owner_pid === process.pid;
+	return state.session_id === currentSessionId;
+}

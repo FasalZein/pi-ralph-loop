@@ -240,7 +240,7 @@ The prompt body lives below the frontmatter. `/ralph-resume` and `/ralph-restart
 
 ## Safety
 
-While a loop runs, the extension blocks `/resume`, `/new`, `/fork`, and `/tree` in that Pi instance. Open another Pi instance to inspect old iterations while Ralph keeps running.
+While a loop runs, the extension blocks `/resume`, `/new`, `/fork`, and `/tree` only in the Pi process that owns the loop. Open another Pi instance in the same workspace to resume old sessions, fork them, or inspect their trees while Ralph keeps running.
 
 Some third-party tools open custom human-input UIs and then wait forever until a person answers. Ralph cannot reliably recover after such a tool has already started, because Pi does not expose a generic "this tool is waiting for a human" signal and some custom UIs ignore abort. Prevent known blockers with a user-owned tool-name list:
 

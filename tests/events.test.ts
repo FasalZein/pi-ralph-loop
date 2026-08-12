@@ -110,9 +110,16 @@ test("registers input handler for human recovery cancellation", () => {
 	assert.equal(typeof h.handlers.get("input"), "function");
 });
 
-test("session_before_switch blocks resume while loop is running", async () => {
+test("session_before_switch blocks resume in the loop owner process", async () => {
 	const h = createEventsHarness();
-	writeState(h.cwd, makeEventsState(), "task");
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
 
 	const result = await h.handlers.get("session_before_switch")?.(
 		{ reason: "resume" },
@@ -125,6 +132,98 @@ test("session_before_switch blocks resume while loop is running", async () => {
 			"Ralph loop is running. /resume is blocked. Use another pi instance or /ralph-stop.",
 		type: "warning",
 	});
+});
+
+test("session_before_switch allows resume in a non-owner observer process", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const result = await h.handlers.get("session_before_switch")?.(
+		{ reason: "resume" },
+		h.ctx,
+	);
+
+	assert.equal(result, undefined);
+	assert.deepEqual(h.notifications, []);
+});
+
+test("session_before_switch allows new sessions in a non-owner observer process", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const result = await h.handlers.get("session_before_switch")?.(
+		{ reason: "new" },
+		h.ctx,
+	);
+
+	assert.equal(result, undefined);
+	assert.deepEqual(h.notifications, []);
+});
+
+test("session mutation remains blocked in the loop owner process", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const forkResult = await h.handlers.get("session_before_fork")?.({}, h.ctx);
+	const treeResult = await h.handlers.get("session_before_tree")?.({}, h.ctx);
+
+	assert.deepEqual(forkResult, { cancel: true });
+	assert.deepEqual(treeResult, { cancel: true });
+});
+
+test("session_before_fork allows forking in a non-owner observer process", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const result = await h.handlers.get("session_before_fork")?.({}, h.ctx);
+
+	assert.equal(result, undefined);
+	assert.deepEqual(h.notifications, []);
+});
+
+test("session_before_tree allows navigation in a non-owner observer process", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const result = await h.handlers.get("session_before_tree")?.({}, h.ctx);
+
+	assert.equal(result, undefined);
+	assert.deepEqual(h.notifications, []);
 });
 
 test("tool_call blocks configured tools while loop is running", async () => {

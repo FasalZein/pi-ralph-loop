@@ -6,6 +6,7 @@ import test, { mock } from "node:test";
 
 import {
 	getLoopOwnerFields,
+	isLoopOwnedByCurrentProcess,
 	isLoopOwnerActive,
 	LOOP_OWNER_STALE_AFTER_MS,
 	startLoopHeartbeat,
@@ -70,6 +71,34 @@ test("stale owner heartbeat marks a loop owner inactive", () => {
 	});
 
 	assert.equal(isLoopOwnerActive(state, "observer-session"), false);
+});
+
+test("current process ownership uses only the persisted pid identity", () => {
+	assert.equal(
+		isLoopOwnedByCurrentProcess(
+			makeState({ owner_pid: process.pid }),
+			"observer-session",
+		),
+		true,
+	);
+	assert.equal(
+		isLoopOwnedByCurrentProcess(
+			makeState({ owner_pid: process.pid + 1 }),
+			"owner-session",
+		),
+		false,
+	);
+	assert.equal(
+		isLoopOwnedByCurrentProcess(makeState({ owner_pid: null }), "owner-session"),
+		true,
+	);
+	assert.equal(
+		isLoopOwnedByCurrentProcess(
+			makeState({ owner_pid: null }),
+			"observer-session",
+		),
+		false,
+	);
 });
 
 test("legacy loop state uses recent session file activity only for a different startup session", () => {

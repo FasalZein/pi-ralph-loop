@@ -4,7 +4,10 @@ import type {
 	ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { finalizeLoop } from "./loop/finalize.js";
-import { isLoopOwnerActive } from "./loop/ownership.js";
+import {
+	isLoopOwnedByCurrentProcess,
+	isLoopOwnerActive,
+} from "./loop/ownership.js";
 import {
 	handleLoopAgentEnd,
 	handleLoopInput,
@@ -18,10 +21,6 @@ import {
 import { readState, updateState } from "./state.js";
 
 const BLOCKED_TOOLS_ENV = "RALPH_BLOCKED_TOOLS";
-
-function isLoopRunning(cwd: string): boolean {
-	return readState(cwd)?.running === true;
-}
 
 function getBlockedToolNames(): Set<string> {
 	return new Set(
@@ -51,7 +50,12 @@ function handleSessionBeforeSwitch(
 	ctx: ExtensionContext,
 ) {
 	const state = readState(ctx.cwd);
-	if (!state?.running) return;
+	if (
+		!state?.running ||
+		!isLoopOwnedByCurrentProcess(state, ctx.sessionManager.getSessionId())
+	) {
+		return;
+	}
 
 	if (event.reason === "resume") {
 		ctx.ui.notify(
@@ -74,7 +78,13 @@ function handleBlockedSessionMutation(
 	commandName: "fork" | "tree",
 	ctx: ExtensionContext,
 ) {
-	if (!isLoopRunning(ctx.cwd)) return;
+	const state = readState(ctx.cwd);
+	if (
+		!state?.running ||
+		!isLoopOwnedByCurrentProcess(state, ctx.sessionManager.getSessionId())
+	) {
+		return;
+	}
 
 	ctx.ui.notify(
 		`Ralph loop is running. /${commandName} is blocked. Use another pi instance or /ralph-stop.`,
@@ -84,7 +94,7 @@ function handleBlockedSessionMutation(
 }
 
 function handleBlockedToolCall(event: ToolCallEvent, ctx: ExtensionContext) {
-	if (!isLoopRunning(ctx.cwd)) return;
+	if (!readState(ctx.cwd)?.running) return;
 
 	const blockedToolNames = getBlockedToolNames();
 	if (!blockedToolNames.has(event.toolName)) return;
