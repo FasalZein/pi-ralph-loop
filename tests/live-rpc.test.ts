@@ -951,7 +951,7 @@ test("live pi RPC: WAIT is superseded when a result arrives before timeout", {
 	}
 });
 
-test("live pi RPC: resume sends a control-tag nudge when no promise was emitted yet", {
+test("live pi RPC: resume allows unfinished work before requiring a control tag", {
 	skip: !SHOULD_RUN,
 }, async () => {
 	const h = createScriptedHarness();
@@ -982,8 +982,13 @@ test("live pi RPC: resume sends a control-tag nudge when no promise was emitted 
 
 		assert.match(
 			after[before.length],
-			/without a control tag/,
-			"resume must send a control-tag nudge, not re-seed the prompt",
+			/continue that work in this iteration/,
+			"resume must allow unfinished work to continue without re-seeding the prompt",
+		);
+		assert.match(
+			after[before.length],
+			/end this resumed turn with exactly one control tag/,
+			"the resumed turn must still require a control tag",
 		);
 		assert.doesNotMatch(after[before.length], /<promise>STOP<\/promise>/);
 		assert.equal(

@@ -420,7 +420,15 @@ test("ralph-resume in same session does not re-seed when work is in progress", a
 
 	// No promise yet and the session already has turns: nudge, do not re-seed.
 	assert.equal(h.sentMessages.length, 1);
-	assert.match(h.sentMessages[0], /without a control tag/);
+	assert.match(h.sentMessages[0], /This Ralph turn ended without a control tag/);
+	assert.match(
+		h.sentMessages[0],
+		/If required work for the current Ralph item\/task remains unfinished, continue that work in this iteration/,
+	);
+	assert.match(
+		h.sentMessages[0],
+		/Whether you continue working first or not, end this resumed turn with exactly one control tag/,
+	);
 	assert.doesNotMatch(h.sentMessages[0], /<promise>STOP<\/promise>/);
 	assert.equal(h.getNewSessionCount(), 0);
 	const state = readState(h.cwd);

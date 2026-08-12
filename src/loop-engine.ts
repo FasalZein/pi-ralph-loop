@@ -67,6 +67,17 @@ const MISSING_PROMISE_NUDGE = [
 	"- <promise>NEXT</promise> if this iteration unit is fully done.",
 	"- <promise>COMPLETE</promise> if all items are fully done.",
 ].join("\n");
+const RESUME_ITERATION_NUDGE = [
+	"This Ralph turn ended without a control tag.",
+	"",
+	"If required work for the current Ralph item/task remains unfinished, continue that work in this iteration.",
+	"",
+	"Whether you continue working first or not, end this resumed turn with exactly one control tag on the last non-empty line:",
+	"",
+	"- <promise>WAIT</promise> if you are intentionally waiting for an async helper, background command, review, process alert, or future tool result before you can decide.",
+	"- <promise>NEXT</promise> if the current Ralph item/task is fully done.",
+	"- <promise>COMPLETE</promise> if all Ralph items/tasks are fully done.",
+].join("\n");
 const FINAL_PROMISE_WARNING_NUDGE = [
 	"FINAL WARNING: Ralph will stop with a resumable error after this if no valid control tag is emitted.",
 	"",
@@ -1024,7 +1035,8 @@ export async function runLoop(
  *                                        and open a fresh session.
  * - WAIT already emitted             -> park the same iteration again.
  * - no promise but the session has
- *   prior turns                      -> send a control-tag nudge.
+ *   prior turns                      -> continue unfinished work, then require
+ *                                       a control tag on the resumed turn.
  * - empty session (no prior turns)   -> seed the prompt once.
  *
  * Bundle promises validate against the pre-iteration snapshot preserved in
@@ -1089,7 +1101,7 @@ export async function resumeCurrentSession(
 	if (hasTurns) {
 		setLoopStatus(ctx, state.iteration, state.max_iterations);
 		pi.setSessionName(formatIterationSessionName(state));
-		sendWhenIdle(pi, ctx, MISSING_PROMISE_NUDGE);
+		sendWhenIdle(pi, ctx, RESUME_ITERATION_NUDGE);
 		return;
 	}
 

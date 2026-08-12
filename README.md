@@ -184,7 +184,7 @@ Start a loop. Default max iterations: `100`.
 
 Resume the saved loop from `.ralph/loop.md`. Use `--force` to resume a completed run.
 
-Resume adapts to where it runs. From the same Pi session that owns the saved iteration, it does not re-send the prompt. Instead it reads the last assistant turn: `COMPLETE` and `STOP` end the loop, `NEXT` advances to the next fresh iteration, and `WAIT` keeps the same iteration parked. If no promise was emitted yet, Ralph sends the same control-tag prompt it uses for missing promises. From any other session, it restarts the saved iteration in a fresh session.
+Resume adapts to where it runs. From the same Pi session that owns the saved iteration, Ralph first inspects the current session. If the session is empty, it sends the full saved prompt once. If the session already contains turns, it does not re-send the prompt: `COMPLETE` and `STOP` end the loop, `NEXT` advances to the next fresh iteration, and `WAIT` keeps the same iteration parked. If the last assistant turn has no promise, Ralph tells the agent to continue unfinished work for the current Ralph item or task, if any, and requires the resumed turn to end with a control tag. From any other session, it restarts the saved iteration in a fresh session and sends the full saved prompt.
 
 ### `/ralph-restart`
 

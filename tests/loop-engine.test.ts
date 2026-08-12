@@ -1495,6 +1495,7 @@ test("agent_end missing control promise queues a structured control-tag nudge", 
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	const prompt = h.sentMessages.at(-1) ?? "";
 	assert.match(prompt, /without a control tag/);
+	assert.doesNotMatch(prompt, /continue that work in this iteration/);
 	assert.match(prompt, /<promise>WAIT<\/promise>/);
 	assert.match(prompt, /<promise>NEXT<\/promise>/);
 	assert.match(prompt, /<promise>COMPLETE<\/promise>/);
