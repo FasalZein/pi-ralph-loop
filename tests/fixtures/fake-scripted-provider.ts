@@ -106,6 +106,14 @@ async function replyFor(context: Context): Promise<string> {
 	if (latest.includes("Iteration done")) {
 		return "Iteration done\n<promise>NEXT</promise>";
 	}
+	if (latest.includes("fenced resume seed")) {
+		return "```xml\n<promise>NEXT</promise>\n```";
+	}
+	if (latest.includes("fenced multi")) {
+		return currentIteration() < 3
+			? "```\n<promise>NEXT</promise>\n```"
+			: "```\n<promise>COMPLETE</promise>\n```";
+	}
 	if (latest.includes("<promise>NEXT</promise>")) {
 		await sleep(2_000);
 		await waitForHarnessBundleMutation();

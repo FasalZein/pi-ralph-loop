@@ -113,6 +113,8 @@ That is enough to Ralph. Bundle mode adds stronger runtime checks.
 
 Ralph reads the last non-empty line of the assistant response.
 
+A tag wrapped in inline code or a fenced code block is accepted, as long as no prose follows it. Prose after the tag still counts as the last line and is treated as a missing promise.
+
 | Tag | Meaning |
 | --- | --- |
 | `<promise>WAIT</promise>` | This iteration is intentionally waiting for an async helper, background command, review, process alert, or future tool result. Stay in the same session. |

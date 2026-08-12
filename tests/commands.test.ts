@@ -479,6 +479,30 @@ test("ralph-resume in same session advances iteration on a re-emitted NEXT", asy
 	assert.equal(h.getNewSessionCount(), 1);
 });
 
+test("ralph-resume in same session advances iteration on a re-emitted fenced NEXT", async () => {
+	const h = createCommandsHarness();
+	writeState(
+		h.cwd,
+		makeCommandsState({
+			iteration: 2,
+			max_iterations: 5,
+		}),
+		"the ralph prompt",
+	);
+	// Same promise as above, but wrapped in a fenced code block. Resume must
+	// route it through the same NEXT path as a plain tag.
+	h.pushAssistant("```\n<promise>NEXT</promise>\n```");
+
+	await h.commands.get("ralph-resume")?.handler("", h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.iteration, 3);
+	assert.equal(state?.transitioning, true);
+	assert.deepEqual(h.sentMessages, [], "fenced NEXT must not re-seed the prompt");
+	await new Promise((resolve) => setTimeout(resolve, 600));
+	assert.equal(h.getNewSessionCount(), 1);
+});
+
 test("ralph-resume in same session finalizes on a re-emitted COMPLETE", async () => {
 	const h = createCommandsHarness();
 	writeState(

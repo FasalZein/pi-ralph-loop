@@ -1052,3 +1052,64 @@ test("live pi RPC: accepted NEXT opens a fresh session even when a passing gate 
 		await h.stop();
 	}
 });
+
+// ── Fenced control-tag regression ─────────────────────────────────────
+// Models (e.g. zai/glm-5-turbo) often wrap the tag in a Markdown fenced code
+// block. The closing fence used to become the "last non-empty line", hiding the
+// tag from the loop. These drive the full Pi RPC chain with a scripted provider
+// that emits fenced tags, so advancement and resume are proven end-to-end.
+
+test("live pi RPC: fenced NEXT advances through fresh sessions and completes", {
+	skip: !SHOULD_RUN,
+}, async () => {
+	const h = createScriptedHarness();
+	try {
+		const sessionsBefore = h.listSessions().length;
+		h.sendPrompt('/ralph-loop "fenced multi" --max-iterations=4');
+
+		const state = await h.waitForFinalState(/stop_reason:\s*"complete"/);
+		assert.match(state, /iteration:\s*3/);
+		assert.ok(
+			h.listSessions().length >= sessionsBefore + 3,
+			"fenced NEXT must keep Ralph's fresh-session handoff across iterations",
+		);
+	} finally {
+		await h.stop();
+	}
+});
+
+test("live pi RPC: resume advances on an already-emitted fenced NEXT", {
+	skip: !SHOULD_RUN,
+}, async () => {
+	const h = createScriptedHarness();
+	try {
+		h.sendPrompt('/ralph-loop "fenced resume seed" --max-iterations=1');
+		const s = await h.waitForFinalState(/stop_reason:\s*"max_iterations"/);
+		const session = h.stateField(s, "last_session_file");
+		assert.ok(session);
+		const seedCount = h.userTexts(session).length;
+		const sessionsBefore = h.listSessions().length;
+
+		// The saved last assistant turn is a fenced NEXT. Resume must route it
+		// the same as a plain NEXT: advance and open a fresh session.
+		h.editState((t) => t.replace(/max_iterations:\s*1/, "max_iterations: 2"));
+		h.sendPrompt("/ralph-resume");
+		const s2 = await h.waitForState(
+			/running:\s*false[\s\S]*iteration:\s*2/,
+		);
+
+		assert.match(s2, /iteration:\s*2/);
+		assert.equal(
+			h.listSessions().length,
+			sessionsBefore + 1,
+			"fenced NEXT on resume must open a fresh session",
+		);
+		assert.equal(
+			h.userTexts(session).length,
+			seedCount,
+			"resume must not re-seed the original session",
+		);
+	} finally {
+		await h.stop();
+	}
+});

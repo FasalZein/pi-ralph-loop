@@ -1799,6 +1799,24 @@ test("agent_end accepts promise tag wrapped in markdown code", () => {
 	assert.equal(state?.stop_reason, "complete");
 });
 
+test("agent_end accepts a fenced NEXT tag and opens a fresh session", async () => {
+	const h = createHarness();
+	h.writeState(
+		makeBaseState({ iteration: 1, max_iterations: 3, transitioning: false }),
+	);
+	await continueLoop(h.pi, h.ctx);
+	h.sentMessages.length = 0;
+
+	h.simulateAgentEnd({
+		text: "```\n<promise>NEXT</promise>\n```",
+	});
+
+	assert.equal(h.readState()?.iteration, 2);
+	assert.equal(h.readState()?.transitioning, true);
+	await new Promise((resolve) => setTimeout(resolve, 600));
+	assert.equal(h.newSessionCalls, 1);
+});
+
 test("bundle COMPLETE accepts when every item passes", async () => {
 	const h = createHarness();
 	writeBundleItems(h.cwd, [true, false]);
