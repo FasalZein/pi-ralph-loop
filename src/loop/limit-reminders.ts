@@ -5,19 +5,19 @@ const LIMIT_REMINDERS = [
 		id: "75",
 		percent: 75,
 		message:
-			"This Pi session is getting long and approaching its context limit. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+			"Your context window in this Pi session is 75% full. Do not expand scope or begin optional work. Focus on completing the current iteration.",
 	},
 	{
 		id: "80",
 		percent: 80,
 		message:
-			"This Pi session has little context room left. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+			"Your context window in this Pi session is 80% full. Finish the current work now. Do not open new lines of work. Reserve the remaining context for concluding the iteration.",
 	},
 	{
 		id: "85",
 		percent: 85,
 		message:
-			"This Pi session is almost out of context room. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+			"Your context window in this Pi session is 85% full. Stop task work now. Perform only the end-of-iteration steps required by the original instructions, then emit <promise>NEXT</promise> if valid. Do not continue implementation to make it valid, and do not claim unfinished work.",
 	},
 ] as const;
 
@@ -47,11 +47,21 @@ export function selectLimitReminder(
 			.map((id) => id.trim())
 			.filter(Boolean),
 	);
-	const reminder = LIMIT_REMINDERS.find(
-		(candidate) => usagePercent >= candidate.percent && !sent.has(candidate.id),
-	);
+	let reminder: (typeof LIMIT_REMINDERS)[number] | undefined;
+	for (let index = LIMIT_REMINDERS.length - 1; index >= 0; index--) {
+		const candidate = LIMIT_REMINDERS[index];
+		if (usagePercent >= candidate.percent && !sent.has(candidate.id)) {
+			reminder = candidate;
+			break;
+		}
+	}
 	if (!reminder) return null;
 
-	sent.add(reminder.id);
-	return { message: reminder.message, sentCsv: Array.from(sent).join(",") };
+	for (const candidate of LIMIT_REMINDERS) {
+		if (candidate.percent <= reminder.percent) sent.add(candidate.id);
+	}
+	const updatedSentCsv = LIMIT_REMINDERS.filter((candidate) => sent.has(candidate.id))
+		.map((candidate) => candidate.id)
+		.join(",");
+	return { message: reminder.message, sentCsv: updatedSentCsv };
 }

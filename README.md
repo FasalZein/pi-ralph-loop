@@ -255,7 +255,7 @@ Ralph waits through Pi's provider retry handling and malformed terminal stops be
 
 If you launch Pi through RPC, an API wrapper, or a subprocess, keep that Pi process and its stdin open for the whole Ralph run. A one-shot wrapper that sends `/ralph-loop` and then closes stdin tells Pi to quit; Ralph may accept `<promise>NEXT</promise>` but the host can exit before the fresh-session handoff runs. If this happens, run `/ralph-resume` from a long-lived Pi session.
 
-When a running iteration reaches 75%, 80%, and 85% of the active model context window, Ralph sends a hidden `ralph_limit` Pi custom message reminding the agent to preserve the original instructions and use the existing `WAIT`, `NEXT`, or `COMPLETE` promise contract when appropriate. Set `RALPH_LIMIT_REMINDERS_DISABLED=1` to opt out.
+When a running iteration reaches 75%, 80%, and 85% of the active model context window, Ralph sends a hidden `ralph_limit` Pi custom message that progressively narrows the agent from focused work to end-of-iteration finalization. If usage crosses multiple thresholds at once, Ralph sends only the highest applicable reminder. Set `RALPH_LIMIT_REMINDERS_DISABLED=1` to opt out.
 
 ## Development
 

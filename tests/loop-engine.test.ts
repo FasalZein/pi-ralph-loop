@@ -842,7 +842,7 @@ test("turn_end at 75 percent sends hidden Ralph limit reminder", () => {
 	assert.equal(h.customMessages[0].options?.deliverAs, "steer");
 	assert.equal(
 		h.customMessages[0].content,
-		"This Pi session is getting long and approaching its context limit. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+		"Your context window in this Pi session is 75% full. Do not expand scope or begin optional work. Focus on completing the current iteration.",
 	);
 });
 
@@ -863,12 +863,28 @@ test("turn_end sends each Ralph limit reminder once", () => {
 	assert.equal(h.customMessages.length, 3);
 	assert.equal(
 		h.customMessages[1].content,
-		"This Pi session has little context room left. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+		"Your context window in this Pi session is 80% full. Finish the current work now. Do not open new lines of work. Reserve the remaining context for concluding the iteration.",
 	);
 	assert.equal(
 		h.customMessages[2].content,
-		"This Pi session is almost out of context room. Keep following the original instructions. When a valid promise is appropriate, use <promise>NEXT</promise> or <promise>COMPLETE</promise> according to those instructions.",
+		"Your context window in this Pi session is 85% full. Stop task work now. Perform only the end-of-iteration steps required by the original instructions, then emit <promise>NEXT</promise> if valid. Do not continue implementation to make it valid, and do not claim unfinished work.",
 	);
+});
+
+test("turn_end sends only the highest newly crossed Ralph limit reminder", () => {
+	const h = createHarness();
+	h.writeState(makeBaseState({ transitioning: false }));
+	h.setContextPercent(86);
+
+	handleLoopTurnEnd(h.pi, h.ctx);
+	handleLoopTurnEnd(h.pi, h.ctx);
+
+	assert.equal(h.customMessages.length, 1);
+	assert.equal(
+		h.customMessages[0].content,
+		"Your context window in this Pi session is 85% full. Stop task work now. Perform only the end-of-iteration steps required by the original instructions, then emit <promise>NEXT</promise> if valid. Do not continue implementation to make it valid, and do not claim unfinished work.",
+	);
+	assert.equal(h.readState()?.limit_reminders, "75,80,85");
 });
 
 test("turn_end respects Ralph limit reminder opt-out", () => {
