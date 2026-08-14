@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -183,6 +189,98 @@ function writeValidBundle(cwd: string): void {
 			2,
 		),
 	);
+}
+
+function initGitRepository(cwd: string): void {
+	execFileSync("git", ["init"], { cwd, stdio: "ignore" });
+	execFileSync("git", ["config", "user.email", "ralph@example.com"], { cwd });
+	execFileSync("git", ["config", "user.name", "Ralph Test"], { cwd });
+}
+
+function commitAll(cwd: string, message: string): void {
+	execFileSync("git", ["add", "."], { cwd });
+	execFileSync("git", ["commit", "-m", message], { cwd, stdio: "ignore" });
+}
+
+function passingGateScript(effect = ""): string {
+	return `let body = "";
+for await (const chunk of process.stdin) body += chunk;
+const input = JSON.parse(body);
+${effect}
+process.stdout.write(JSON.stringify({
+  version: 1,
+  phase: input.hook,
+  mode: "test",
+  selected_issue: null,
+  selected_title: null,
+  start_head: input.heads.start,
+  current_head: input.heads.current,
+  accepted_head: input.heads.accepted,
+  checks: [],
+  journal_phase: null,
+  linear_action: null,
+  exit_code: 0,
+  ok: true
+}));`;
+}
+
+function cleanupToggleGateScript(): string {
+	return `let body = "";
+for await (const chunk of process.stdin) body += chunk;
+const input = JSON.parse(body);
+const { existsSync } = await import("node:fs");
+const reject = input.hook === "cleanup" && existsSync("reject-cleanup");
+process.stdout.write(JSON.stringify({
+  version: 1,
+  phase: input.hook,
+  mode: "test",
+  selected_issue: null,
+  selected_title: null,
+  start_head: input.heads.start,
+  current_head: input.heads.current,
+  accepted_head: input.heads.accepted,
+  checks: [],
+  journal_phase: null,
+  linear_action: null,
+  exit_code: reject ? 7 : 0,
+  ok: !reject,
+  ...(reject ? { message: "cleanup rejected" } : {})
+}));`;
+}
+
+function rejectingGateScript(phase: string, effect = ""): string {
+	return `let body = "";
+for await (const chunk of process.stdin) body += chunk;
+const input = JSON.parse(body);
+${effect}
+const reject = input.hook === ${JSON.stringify(phase)};
+process.stdout.write(JSON.stringify({
+  version: 1,
+  phase: input.hook,
+  mode: "test",
+  selected_issue: null,
+  selected_title: null,
+  start_head: input.heads.start,
+  current_head: input.heads.current,
+  accepted_head: input.heads.accepted,
+  checks: [],
+  journal_phase: null,
+  linear_action: null,
+  exit_code: reject ? 7 : 0,
+  ok: !reject,
+  ...(reject ? { message: input.hook + " rejected" } : {})
+}));`;
+}
+
+function addExternalGate(cwd: string, script: string): void {
+	const itemsPath = join(cwd, ".ralph", "items.json");
+	const items = JSON.parse(readFileSync(itemsPath, "utf8"));
+	items.runtime_contract.external_gate = {
+		entrypoint: "guard.mjs",
+		timeout_ms: 500,
+	};
+	writeFileSync(itemsPath, JSON.stringify(items));
+	writeFileSync(join(cwd, "guard.mjs"), script);
 }
 
 test("registerCommands exposes the Ralph command set", () => {
@@ -673,3 +771,151 @@ test("ralph-stop updates persisted stop state", async () => {
 		type: "info",
 	});
 });
+
+test("ralph-loop external gate rejects the wrong exact iteration budget before state creation", async () => {
+	const h = createCommandsHarness();
+	writeValidBundle(h.cwd);
+	addExternalGate(h.cwd, passingGateScript());
+
+	await h.commands.get("ralph-loop")?.handler("@.ralph/prompt.md --max-iterations=5", h.ctx);
+
+	assert.equal(readState(h.cwd), null);
+	assert.equal(h.getNewSessionCount(), 0);
+	assert.match(h.notifications.at(-1)?.message ?? "", /requires --max-iterations=6/);
+});
+
+test("ralph-loop dry-run succeeds without loop or session state when the gate does not write", async () => {
+	const h = createCommandsHarness();
+	writeValidBundle(h.cwd);
+	addExternalGate(h.cwd, passingGateScript());
+
+	await h.commands.get("ralph-loop")?.handler(
+		"@.ralph/prompt.md --max-iterations=6 --dry-run",
+		h.ctx,
+	);
+
+	assert.equal(readState(h.cwd), null);
+	assert.equal(h.getNewSessionCount(), 0);
+	assert.deepEqual(h.sentMessages, []);
+	assert.equal(h.notifications.at(-1)?.type, "info");
+});
+
+for (const writtenPath of [".ralph/dry-run-write", "dry-run-untracked"]) {
+	test(`ralph-loop dry-run rejects observed write to ${writtenPath}`, async () => {
+		const h = createCommandsHarness();
+		writeValidBundle(h.cwd);
+		if (writtenPath === "dry-run-untracked") {
+			execFileSync("git", ["init"], { cwd: h.cwd, stdio: "ignore" });
+		}
+		addExternalGate(
+			h.cwd,
+			passingGateScript(
+				`await import("node:fs").then(({ writeFileSync }) => writeFileSync(${JSON.stringify(writtenPath)}, "changed"));`,
+			),
+		);
+
+		await h.commands.get("ralph-loop")?.handler(
+			"@.ralph/prompt.md --max-iterations=6 --dry-run",
+			h.ctx,
+		);
+
+		assert.equal(readState(h.cwd), null);
+		assert.equal(h.getNewSessionCount(), 0);
+		assert.equal(h.notifications.at(-1)?.type, "error");
+		assert.match(h.notifications.at(-1)?.message ?? "", /mutated protected state/);
+	});
+}
+
+test("launch rejection dispatches stop without loop state or cleanup", async () => {
+	const h = createCommandsHarness();
+	const hookLog = `${h.cwd}-launch-hooks.log`;
+	writeValidBundle(h.cwd);
+	addExternalGate(
+		h.cwd,
+		rejectingGateScript(
+			"launch",
+			`await import("node:fs").then(({ appendFileSync }) => appendFileSync(${JSON.stringify(hookLog)}, input.hook + "\\n"));`,
+		),
+	);
+
+	await h.commands.get("ralph-loop")?.handler(
+		"@.ralph/prompt.md --max-iterations=6",
+		h.ctx,
+	);
+
+	assert.equal(readState(h.cwd), null);
+	assert.equal(h.getNewSessionCount(), 0);
+	assert.match(h.notifications.at(-1)?.message ?? "", /launch rejected/);
+	assert.equal(readFileSync(hookLog, "utf8"), "launch\nstop\n");
+});
+
+test("new loop and restart cannot replace cleanup-pending state", async () => {
+	const h = createCommandsHarness();
+	writeValidBundle(h.cwd);
+	addExternalGate(h.cwd, cleanupToggleGateScript());
+	writeFileSync(join(h.cwd, "reject-cleanup"), "reject\n");
+	const snapshot = createBundleSnapshot(loadRalphBundle(h.cwd));
+	const original = makeCommandsState({
+		running: false,
+		stop_reason: "complete",
+		loop_token: "cleanup-token",
+		external_gate_cleanup_pending: true,
+		...snapshot,
+	});
+	writeState(h.cwd, original, "bundle prompt");
+
+	await h.commands.get("ralph-loop")?.handler(
+		"@.ralph/prompt.md --max-iterations=6",
+		h.ctx,
+	);
+	assert.equal(readState(h.cwd)?.loop_token, "cleanup-token");
+	assert.equal(readState(h.cwd)?.external_gate_cleanup_pending, true);
+
+	await h.commands.get("ralph-restart")?.handler("", h.ctx);
+	assert.equal(readState(h.cwd)?.loop_token, "cleanup-token");
+	assert.equal(h.getNewSessionCount(), 0);
+
+	rmSync(join(h.cwd, "reject-cleanup"));
+	await h.commands.get("ralph-loop")?.handler(
+		"@.ralph/prompt.md --max-iterations=6",
+		h.ctx,
+	);
+	assert.notEqual(readState(h.cwd)?.loop_token, "cleanup-token");
+	assert.equal(readState(h.cwd)?.running, true);
+});
+
+for (const mutation of ["untracked", "tracked", "ralph", "loop", "head"] as const) {
+	test(`launch rejects ${mutation} writes before state creation`, async () => {
+		const h = createCommandsHarness();
+		writeValidBundle(h.cwd);
+		if (mutation === "tracked") writeFileSync(join(h.cwd, "tracked.txt"), "before\n");
+		const effect =
+			mutation === "head"
+				? `await import("node:child_process").then(({ execFileSync }) => execFileSync("git", ["commit", "--allow-empty", "-m", "launch mutation"], { stdio: "ignore" }));`
+				: `await import("node:fs").then(({ writeFileSync }) => writeFileSync(${JSON.stringify(
+					mutation === "untracked"
+						? "launch-untracked"
+						: mutation === "tracked"
+							? "tracked.txt"
+							: mutation === "loop"
+								? ".ralph/loop.md"
+								: ".ralph/launch-write",
+				)}, "after\\n"));`;
+		addExternalGate(h.cwd, passingGateScript(effect));
+		if (mutation === "untracked") initGitRepository(h.cwd);
+		if (mutation === "tracked" || mutation === "head") {
+			initGitRepository(h.cwd);
+			commitAll(h.cwd, "baseline");
+		}
+
+		await h.commands.get("ralph-loop")?.handler(
+			"@.ralph/prompt.md --max-iterations=6",
+			h.ctx,
+		);
+
+		assert.equal(readState(h.cwd), null);
+		assert.equal(h.getNewSessionCount(), 0);
+		assert.equal(h.notifications.at(-1)?.type, "error");
+		assert.match(h.notifications.at(-1)?.message ?? "", /launch mutated protected state/);
+	});
+}

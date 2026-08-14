@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,8 +15,12 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+import {
+	createBundleSnapshot,
+	loadRalphBundle,
+} from "../src/bundle/index.ts";
 import { registerEventHandlers } from "../src/events.ts";
-import { readState, writeState } from "../src/state.ts";
+import { readState, updateState, writeState } from "../src/state.ts";
 import type { RalphLoopState } from "../src/types.ts";
 
 type EventHandler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -102,6 +112,46 @@ function createEventsHarness() {
 		sessionNames,
 		ctx,
 	};
+}
+
+function externalGateState(cwd: string, overrides: Partial<RalphLoopState> = {}): RalphLoopState {
+	mkdirSync(join(cwd, ".ralph"), { recursive: true });
+	writeFileSync(join(cwd, ".ralph", "plan.md"), "plan\n");
+	writeFileSync(join(cwd, ".ralph", "prompt.md"), "prompt\n");
+	writeFileSync(join(cwd, ".ralph", "progress.md"), "progress\n");
+	writeFileSync(
+		join(cwd, ".ralph", "items.json"),
+		JSON.stringify({
+			version: 1,
+			runtime_contract: { external_gate: { entrypoint: "guard.mjs" } },
+			items: [
+				{
+					category: "test",
+					description: "lifecycle",
+					steps: ["verify"],
+					passes: false,
+					regression_notes: "",
+				},
+			],
+		}),
+	);
+	writeFileSync(
+		join(cwd, "guard.mjs"),
+		`let body = ""; for await (const chunk of process.stdin) body += chunk; const input = JSON.parse(body); const { appendFileSync, existsSync } = await import("node:fs"); appendFileSync("gate.log", JSON.stringify(input) + "\\n"); const reject = input.hook === "stop" && existsSync("reject-stop"); process.stdout.write(JSON.stringify({ version: 1, phase: input.hook, mode: "test", selected_issue: null, selected_title: null, start_head: input.heads.start, current_head: input.heads.current, accepted_head: input.heads.accepted, checks: [], journal_phase: null, linear_action: null, exit_code: reject ? 7 : 0, ok: !reject, ...(reject ? { message: "stop rejected" } : {}) }));`,
+	);
+	return {
+		...makeEventsState(),
+		...createBundleSnapshot(loadRalphBundle(cwd)),
+		...overrides,
+	};
+}
+
+function gateEvents(cwd: string): Array<Record<string, any>> {
+	return readFileSync(join(cwd, "gate.log"), "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
 }
 
 test("registers input handler for human recovery cancellation", () => {
@@ -419,4 +469,64 @@ test("session_start on startup errors a crashed mid-iteration loop", () => {
 	assert.equal(state?.running, false);
 	// No committed handoff: a mid-iteration crash is still a fatal error.
 	assert.equal(state?.stop_reason, "error");
+});
+
+test("graceful process shutdown dispatches the external stop hook before cancellation", async () => {
+	const h = createEventsHarness();
+	writeState(h.cwd, externalGateState(h.cwd, { owner_pid: process.pid }), "task");
+
+	await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.running, true);
+	assert.equal(state?.cancel_requested, true);
+	assert.equal(state?.external_gate_stop_dispatched, true);
+	assert.deepEqual(gateEvents(h.cwd).map((event) => event.hook), ["stop"]);
+});
+
+test("startup recovers SIGKILL-style stale state through stop without cleanup", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		externalGateState(h.cwd, {
+			owner_pid: 123_456_789,
+			owner_heartbeat_at: new Date(Date.now() - 61_000).toISOString(),
+		}),
+		"task",
+	);
+
+	await h.handlers.get("session_start")?.({ reason: "startup" }, h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.running, false);
+	assert.equal(state?.stop_reason, "error");
+	assert.equal(state?.external_gate_cleanup_pending, false);
+	assert.deepEqual(gateEvents(h.cwd).map((event) => event.hook), ["stop"]);
+});
+
+test("crash recovery retries the first pending graceful stop reason", async () => {
+	const h = createEventsHarness();
+	writeState(h.cwd, externalGateState(h.cwd, { owner_pid: process.pid }), "task");
+	writeFileSync(join(h.cwd, "reject-stop"), "reject\n");
+
+	await h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+	assert.equal(readState(h.cwd)?.external_gate_stop_pending, true);
+	assert.equal(readState(h.cwd)?.external_gate_stop_reason, "user_cancelled");
+
+	rmSync(join(h.cwd, "reject-stop"));
+	updateState(h.cwd, {
+		owner_pid: 123_456_789,
+		owner_heartbeat_at: new Date(Date.now() - 61_000).toISOString(),
+	});
+	await h.handlers.get("session_start")?.({ reason: "startup" }, h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.running, false);
+	assert.equal(state?.external_gate_stop_pending, false);
+	assert.equal(state?.external_gate_stop_dispatched, true);
+	assert.equal(state?.external_gate_stop_reason, "user_cancelled");
+	assert.deepEqual(
+		gateEvents(h.cwd).map((event) => event.loop.stop_reason),
+		["user_cancelled", "user_cancelled"],
+	);
 });

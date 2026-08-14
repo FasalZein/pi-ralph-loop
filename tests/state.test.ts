@@ -44,6 +44,13 @@ function makeState(): RalphLoopState {
 		bundle_rejection_count: 0,
 		provider_recovery_fresh_fallback_used: false,
 		limit_reminders: null,
+		external_gate_entrypoint_digest: null,
+		immutable_bundle_digest: null,
+		external_gate_stop_dispatched: false,
+		external_gate_stop_pending: false,
+		external_gate_stop_reason: null,
+		external_gate_cleanup_pending: false,
+		external_gate_error: null,
 	};
 }
 
@@ -174,5 +181,12 @@ test("old state files parse with default bundle metadata", () => {
 	assert.equal(state?.git_head, null);
 	assert.equal(state?.bundle_rejection_count, 0);
 	assert.equal(state?.limit_reminders, null);
+	assert.equal(state?.external_gate_entrypoint_digest, null);
+	assert.equal(state?.immutable_bundle_digest, null);
+	assert.equal(state?.external_gate_stop_dispatched, false);
+	assert.equal(state?.external_gate_stop_pending, false);
+	assert.equal(state?.external_gate_stop_reason, null);
+	assert.equal(state?.external_gate_cleanup_pending, false);
+	assert.equal(state?.external_gate_error, null);
 	assert.equal(getTaskBody(cwd), "legacy task");
 });

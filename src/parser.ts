@@ -19,7 +19,8 @@ export function parseArgs(raw: string): ParsedArgs | null {
 	if (!trimmed) return null;
 
 	let maxIterations = DEFAULT_MAX_ITERATIONS;
-	let taskPart = trimmed;
+	const dryRun = /(?:^|\s)--dry-run(?:\s|$)/i.test(trimmed);
+	let taskPart = trimmed.replace(/(?:^|\s)--dry-run(?=\s|$)/i, " ").trim();
 
 	// Extract --max-iterations=N or --max-iterations N
 	const eqPattern = /--max-iterations=(\d+)/i;
@@ -50,5 +51,5 @@ export function parseArgs(raw: string): ParsedArgs | null {
 
 	if (maxIterations <= 0 || !Number.isFinite(maxIterations)) return null;
 
-	return { task: taskPart, maxIterations };
+	return { task: taskPart, maxIterations, dryRun };
 }

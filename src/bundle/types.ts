@@ -19,6 +19,11 @@ export type VerificationGate = {
 	command: string;
 };
 
+export type ExternalGateConfig = {
+	entrypoint: string;
+	timeout_ms?: number;
+};
+
 export type RuntimeContract = {
 	source_docs?: string[];
 	verification_gates?: VerificationGate[];
@@ -26,6 +31,7 @@ export type RuntimeContract = {
 	require_one_item_per_iteration?: boolean;
 	require_clean_source_docs?: boolean;
 	require_commit?: boolean;
+	external_gate?: ExternalGateConfig;
 };
 
 export type BundleItemsFile = {
@@ -50,6 +56,8 @@ export type BundleSnapshot = {
 	source_doc_hashes: string;
 	bundle_items_snapshot: string;
 	git_head: string | null;
+	external_gate_entrypoint_digest: string | null;
+	immutable_bundle_digest: string | null;
 };
 
 export type BundleFileGateSnapshot = {

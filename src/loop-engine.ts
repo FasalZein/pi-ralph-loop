@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import {
+	createExternalGateDigests,
+	loadRalphBundle,
+} from "./bundle/index.js";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -11,6 +15,17 @@ import {
 import { rejectBundlePromise } from "./loop/bundle-rejections.js";
 import { getCommandCtx, setCommandCtx } from "./loop/command-context.js";
 import { extractControlPromise } from "./loop/control-promise.js";
+import {
+	dispatchExternalStopInMemory,
+	invokeExternalGate,
+	reconcileExternalStop,
+	resetExternalTerminalState,
+	validateExternalGateDigests,
+} from "./loop/external-gate.js";
+import {
+	captureDryRunSnapshot,
+	compareDryRunSnapshots,
+} from "./loop/dry-run.js";
 import { finalizeLoop } from "./loop/finalize.js";
 import { sendWhenIdle } from "./loop/idle.js";
 import {
@@ -471,6 +486,13 @@ function handleCompletePromise(
 		rejectBundlePromise(pi, ctx, state, "COMPLETE", rejection, finalizeLoop);
 		return;
 	}
+	const gateFailure = state.external_gate_entrypoint_digest
+		? invokeExternalGate(ctx.cwd, state, "promise", { promise: "COMPLETE" })
+		: null;
+	if (gateFailure) {
+		rejectBundlePromise(pi, ctx, state, "COMPLETE", gateFailure, finalizeLoop);
+		return;
+	}
 
 	showLoopNotice(
 		ctx,
@@ -516,8 +538,11 @@ function formatIterationSessionName(state: RalphLoopState): string {
 function markIterationStarted(
 	ctx: ExtensionContext,
 	state: RalphLoopState,
-	options: { snapshotBundle?: boolean } = {},
-): void {
+	options: {
+		snapshotBundle?: boolean;
+		resume?: { same_token: boolean; same_session: boolean };
+	} = {},
+): boolean {
 	resetIterationCounters();
 	// Start each iteration with a clean notice surface: any leftover banner
 	// from the previous iteration (provider-error warning, nudge, etc.) must
@@ -531,9 +556,21 @@ function markIterationStarted(
 		...getLoopOwnerFields(),
 	});
 	startLoopHeartbeat(ctx.cwd, state.loop_token);
-	if ((options.snapshotBundle ?? true) && state.bundle_mode) {
-		snapshotBundleIteration(ctx.cwd, state);
+	const latest = readState(ctx.cwd) ?? state;
+	const gateFailure = latest.external_gate_entrypoint_digest
+		? invokeExternalGate(ctx.cwd, latest, "iteration-start", {
+				resume: options.resume,
+			})
+		: null;
+	if (gateFailure) {
+		showLoopNotice(ctx, gateFailure, "error");
+		finalizeLoop(ctx, ctx.cwd, "error", latest.error_count);
+		return false;
 	}
+	if ((options.snapshotBundle ?? true) && latest.bundle_mode) {
+		snapshotBundleIteration(ctx.cwd, latest);
+	}
+	return true;
 }
 
 function startCurrentIteration(
@@ -542,7 +579,7 @@ function startCurrentIteration(
 	state: RalphLoopState,
 	task: string,
 ): void {
-	markIterationStarted(ctx, state);
+	if (!markIterationStarted(ctx, state)) return;
 	pi.setSessionName(formatIterationSessionName(state));
 	pi.sendUserMessage(task);
 }
@@ -568,7 +605,10 @@ function scheduleReplacementPrompt(
 async function openFreshIterationSession(
 	ctx: ExtensionCommandContext,
 	errorCount: number,
-	options: { snapshotBundle?: boolean } = {},
+	options: {
+		snapshotBundle?: boolean;
+		resume?: { same_token: boolean; same_session: boolean };
+	} = {},
 ): Promise<void> {
 	const cwd = ctx.cwd;
 	const state = readState(cwd);
@@ -614,9 +654,14 @@ async function openFreshIterationSession(
 					return;
 				}
 
-				markIterationStarted(nextCtx, latest, {
-					snapshotBundle: options.snapshotBundle,
-				});
+				if (
+					!markIterationStarted(nextCtx, latest, {
+						snapshotBundle: options.snapshotBundle,
+						resume: options.resume,
+					})
+				) {
+					return;
+				}
 				scheduleReplacementPrompt(nextCtx, task, latest.error_count);
 			},
 		});
@@ -631,9 +676,12 @@ async function openFreshIterationSession(
 function scheduleFreshIterationSession(
 	ctx: ExtensionCommandContext,
 	errorCount: number,
+	options: {
+		resume?: { same_token: boolean; same_session: boolean };
+	} = {},
 ): void {
 	setTimeout(() => {
-		void openFreshIterationSession(ctx, errorCount);
+		void openFreshIterationSession(ctx, errorCount, options);
 	}, 0);
 }
 
@@ -729,6 +777,13 @@ function handleNextPromise(
 		rejectBundlePromise(pi, ctx, state, "NEXT", rejection, finalizeLoop);
 		return;
 	}
+	const promiseFailure = state.external_gate_entrypoint_digest
+		? invokeExternalGate(ctx.cwd, state, "promise", { promise: "NEXT" })
+		: null;
+	if (promiseFailure) {
+		rejectBundlePromise(pi, ctx, state, "NEXT", promiseFailure, finalizeLoop);
+		return;
+	}
 
 	if (state.iteration >= state.max_iterations) {
 		showLoopNotice(
@@ -737,6 +792,14 @@ function handleNextPromise(
 			"warning",
 		);
 		finalizeLoop(ctx, ctx.cwd, "max_iterations", state.error_count);
+		return;
+	}
+
+	const transitionFailure = state.external_gate_entrypoint_digest
+		? invokeExternalGate(ctx.cwd, state, "transition", { promise: "NEXT" })
+		: null;
+	if (transitionFailure) {
+		rejectBundlePromise(pi, ctx, state, "NEXT", transitionFailure, finalizeLoop);
 		return;
 	}
 
@@ -959,6 +1022,46 @@ export async function runLoop(
 		options.forceFreshSession !== true && !readSessionTurns(ctx).hasTurns;
 	const initialModelState =
 		options.initialModelState ?? readCurrentLoopModelState(pi, ctx);
+	const existingState = readState(cwd);
+	if (existingState?.external_gate_cleanup_pending) {
+		showLoopNotice(ctx, "Ralph terminal cleanup must succeed before starting a loop", "error");
+		return;
+	}
+	if (existingState?.external_gate_stop_pending) {
+		const stopFailure = reconcileExternalStop(cwd);
+		if (stopFailure) {
+			showLoopNotice(ctx, stopFailure, "error");
+			return;
+		}
+	}
+	const loopToken = options.resumeState?.loop_token ?? randomUUID();
+	let launchDigests: ReturnType<typeof createExternalGateDigests> = null;
+
+	if (bundleMode) {
+		try {
+			const bundle = loadRalphBundle(cwd);
+			if (bundle.items.runtime_contract?.external_gate) {
+				if (options.resumeState) {
+					const drift = validateExternalGateDigests(cwd, options.resumeState);
+					if (drift) throw new Error(drift);
+				}
+				const expected = 2 * bundle.items.items.length + 4;
+				if (maxIterations !== expected) {
+					throw new Error(
+						`Invalid Ralph bundle: external gate requires --max-iterations=${expected}`,
+					);
+				}
+				launchDigests = createExternalGateDigests(bundle);
+			}
+		} catch (error) {
+			showLoopNotice(
+				ctx,
+				error instanceof Error ? error.message : String(error),
+				"error",
+			);
+			return;
+		}
+	}
 
 	const initialState: RalphLoopState = {
 		running: true,
@@ -975,7 +1078,7 @@ export async function runLoop(
 		cancel_requested: false,
 		stop_requested: false,
 		bundle_mode: bundleMode,
-		loop_token: randomUUID(),
+		loop_token: loopToken,
 		...initialModelState,
 		bundle_snapshot_hash: null,
 		items_snapshot_hash: null,
@@ -988,12 +1091,52 @@ export async function runLoop(
 		bundle_rejection_count: 0,
 		provider_recovery_fresh_fallback_used: false,
 		limit_reminders: null,
+		external_gate_entrypoint_digest:
+			options.resumeState?.external_gate_entrypoint_digest ??
+			launchDigests?.entrypoint ??
+			null,
+		immutable_bundle_digest:
+			options.resumeState?.immutable_bundle_digest ??
+			launchDigests?.immutable_bundle ??
+			null,
+		external_gate_stop_dispatched: false,
+		external_gate_stop_pending: false,
+		external_gate_stop_reason: null,
+		external_gate_cleanup_pending: false,
+		external_gate_error: null,
 	};
+
+	if (!options.resumeState && launchDigests) {
+		const beforeLaunch = captureDryRunSnapshot(ctx);
+		const gateFailure = invokeExternalGate(cwd, initialState, "launch");
+		const mutationFailure = compareDryRunSnapshots(
+			beforeLaunch,
+			captureDryRunSnapshot(ctx),
+			"launch",
+		);
+		const launchFailure = gateFailure ?? mutationFailure;
+		if (launchFailure) {
+			const stopFailure = dispatchExternalStopInMemory(
+				cwd,
+				initialState,
+				"error",
+			);
+			showLoopNotice(
+				ctx,
+				stopFailure
+					? `${launchFailure}; external gate stop failed: ${stopFailure}`
+					: launchFailure,
+				"error",
+			);
+			return;
+		}
+	}
 
 	writeState(cwd, initialState, task);
 	if (bundleMode) {
 		snapshotBundleIteration(cwd, initialState);
 	}
+	const persistedState = readState(cwd) ?? initialState;
 
 	setCommandCtx(ctx);
 	claimLoopOwnership(ctx.cwd);
@@ -1004,11 +1147,15 @@ export async function runLoop(
 	});
 
 	if (useCurrentSession) {
-		startCurrentIteration(pi, ctx, initialState, task);
+		startCurrentIteration(pi, ctx, persistedState, task);
 		return;
 	}
 
-	scheduleFreshIterationSession(ctx, initialErrorCount);
+	scheduleFreshIterationSession(ctx, initialErrorCount, {
+		resume: options.resumeState
+			? { same_token: true, same_session: false }
+			: undefined,
+	});
 }
 
 /**
@@ -1046,6 +1193,17 @@ export async function resumeCurrentSession(
 		return;
 	}
 
+	if (saved.external_gate_cleanup_pending) {
+		showLoopNotice(ctx, "Ralph terminal cleanup must succeed before resume", "error");
+		return;
+	}
+	const stopFailure = reconcileExternalStop(ctx.cwd);
+	if (stopFailure) {
+		showLoopNotice(ctx, stopFailure, "error");
+		return;
+	}
+	resetExternalTerminalState(ctx.cwd);
+
 	setCommandCtx(ctx);
 	resetIterationCounters();
 	clearLoopNotice(ctx, { includeInfo: true });
@@ -1064,6 +1222,16 @@ export async function resumeCurrentSession(
 	claimLoopOwnership(ctx.cwd);
 	const state = readState(ctx.cwd);
 	if (!state) return;
+	if (state.external_gate_entrypoint_digest) {
+		const gateFailure = invokeExternalGate(ctx.cwd, state, "iteration-start", {
+			resume: { same_token: true, same_session: true },
+		});
+		if (gateFailure) {
+			showLoopNotice(ctx, gateFailure, "error");
+			finalizeLoop(ctx, ctx.cwd, "error", state.error_count);
+			return;
+		}
+	}
 
 	const { lastAssistant, hasTurns } = readSessionTurns(ctx);
 	const promise = extractControlPromise(lastAssistant);
@@ -1093,7 +1261,9 @@ export async function resumeCurrentSession(
 		return;
 	}
 
-	startCurrentIteration(pi, ctx, state, task);
+	setLoopStatus(ctx, state.iteration, state.max_iterations);
+	pi.setSessionName(formatIterationSessionName(state));
+	pi.sendUserMessage(task);
 }
 
 /**

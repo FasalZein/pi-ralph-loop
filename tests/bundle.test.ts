@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
 	mkdirSync,
 	mkdtempSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -203,7 +204,7 @@ test("loadRalphBundle validates all required files", () => {
 		writeBundle(root);
 		const bundle = loadRalphBundle(root);
 
-		assert.equal(bundle.root, root);
+		assert.equal(bundle.root, realpathSync(root));
 		assert.equal(bundle.items.items[0].category, "bundle-contract");
 		assert.match(bundle.files[".ralph/prompt.md"], /\.ralph\/prompt\.md$/);
 	});

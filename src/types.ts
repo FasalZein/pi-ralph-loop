@@ -39,12 +39,20 @@ export interface RalphLoopState {
 	bundle_rejection_count: number;
 	provider_recovery_fresh_fallback_used: boolean;
 	limit_reminders: string | null;
+	external_gate_entrypoint_digest?: string | null;
+	immutable_bundle_digest?: string | null;
+	external_gate_stop_dispatched?: boolean;
+	external_gate_stop_pending?: boolean;
+	external_gate_stop_reason?: string | null;
+	external_gate_cleanup_pending?: boolean;
+	external_gate_error?: string | null;
 }
 
 /** Parsed arguments from /ralph-loop command */
 export interface ParsedArgs {
 	task: string;
 	maxIterations: number;
+	dryRun: boolean;
 }
 
 /** Options for starting or resuming a Ralph loop run */
@@ -58,4 +66,5 @@ export interface RunLoopOptions {
 		RalphLoopState,
 		"model_provider" | "model_id" | "thinking_level"
 	>;
+	resumeState?: RalphLoopState;
 }

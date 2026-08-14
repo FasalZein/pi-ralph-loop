@@ -168,7 +168,8 @@ test("ralph-loop rejects invalid args", async () => {
 	await h.commands.get("ralph-loop")?.handler("", h.commandCtx);
 
 	assert.deepEqual(h.notifications.at(-1), {
-		message: 'Usage: /ralph-loop "task text" [--max-iterations=N]',
+		message:
+			'Usage: /ralph-loop "task text" [--max-iterations=N] [--dry-run]',
 		type: "error",
 	});
 });

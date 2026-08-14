@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+import { createExternalGateDigests } from "./external-gate.js";
 import { resolveWorkspacePath } from "./paths.js";
 import type { BundleItem, BundleSnapshot, RalphBundle } from "./types.js";
 
@@ -84,6 +85,7 @@ export function createBundleSnapshot(bundle: RalphBundle): BundleSnapshot {
 	);
 	const gitHead = readGitHead(bundle.root);
 	const progressSize = statSync(bundle.files[".ralph/progress.md"]).size;
+	const externalGateDigests = createExternalGateDigests(bundle);
 
 	return {
 		bundle_snapshot_hash: hashJson({
@@ -99,5 +101,9 @@ export function createBundleSnapshot(bundle: RalphBundle): BundleSnapshot {
 		source_doc_hashes: JSON.stringify(sourceHashes),
 		bundle_items_snapshot: JSON.stringify(immutableItems),
 		git_head: gitHead,
+		external_gate_entrypoint_digest:
+			externalGateDigests?.entrypoint ?? null,
+		immutable_bundle_digest:
+			externalGateDigests?.immutable_bundle ?? null,
 	};
 }

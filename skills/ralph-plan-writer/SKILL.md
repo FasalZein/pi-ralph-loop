@@ -210,6 +210,8 @@ Rules:
 - Set `require_commit` to `true` for normal implementation loops.
 - Use `require_commit: false` for read-only, audit, reporting loops, or any bundle where commits would be wrong or no git repo should be required.
 - Do not write `commit_policy` or `git_root`. Ralph checks whether git HEAD changed in the Ralph workspace root. It does not count commits.
+- Add `external_gate` only when the user or repository provides an existing workspace-relative `.mjs` lifecycle gate. Do not invent one during planning.
+- When `external_gate` is present, set `--max-iterations` to exactly `2 × item count + 4`.
 - For greenfield loops with `require_commit: true`, tell the runtime agent to initialize git in the Ralph workspace root during the first iteration.
 - Do not delete items after creation.
 - Do not rewrite `description` or `steps` after creation.
@@ -287,6 +289,8 @@ Ban bypasses in the runtime prompt: no skipped checks, weakened tests, `--no-ver
 ## Runtime enforcement to account for
 
 The extension rejects NEXT if zero or multiple items move from `passes:false` to `passes:true`, immutable item fields change, progress append checks fail, listed source docs change when `source_docs` is non-empty, or `require_commit: true` is set and git HEAD did not change in the Ralph workspace root.
+
+When `runtime_contract.external_gate` is present, Ralph validates its `.mjs` entrypoint and exact iteration budget before state creation. Ralph runs launch before writing loop state and rejects protected-state writes. Launch failure runs one bounded stop attempt without loop state or cleanup. Ralph runs lifecycle hooks for dry-run, launch, iteration start, accepted promises, transition, stop, and cleanup. Built-in promise gates run before the external promise hook. Transition must pass before Ralph accepts NEXT or creates a fresh session. Entrypoint or immutable-bundle digest drift fails closed on hooks and resume. Stop preserves claim state, keeps the first pending reason, and retries after failure. Cleanup runs only after durable COMPLETE. Cleanup-pending state must reconcile before a new loop or restart. Dry-run fails when local Git state, untracked files, `.ralph/`, or loop/session identity changes.
 
 The extension rejects COMPLETE if any item has `passes:false`, immutable item fields change, progress checks fail, listed source docs change when `source_docs` is non-empty, or `require_commit: true` is set and git HEAD did not change in the Ralph workspace root.
 

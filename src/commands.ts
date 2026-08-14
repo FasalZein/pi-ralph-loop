@@ -5,7 +5,21 @@ import type {
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { loadRalphBundle } from "./bundle/index.js";
+import {
+	createExternalGateDigests,
+	loadRalphBundle,
+} from "./bundle/index.js";
+import {
+	invokeExternalGate,
+	reconcileExternalStop,
+	resetExternalTerminalState,
+	retryTerminalCleanup,
+	validateExternalGateDigests,
+} from "./loop/external-gate.js";
+import {
+	captureDryRunSnapshot,
+	compareDryRunSnapshots,
+} from "./loop/dry-run.js";
 import { finalizeLoop } from "./loop/finalize.js";
 import { isLoopOwnerActive } from "./loop/ownership.js";
 import { resumeCurrentSession, runLoop } from "./loop-engine.js";
@@ -52,6 +66,24 @@ function ensureLoopNotRunning(ctx: ExtensionCommandContext): boolean {
 
 	notifyLoopAlreadyRunning(ctx);
 	return false;
+}
+
+function reconcileTerminalBeforeNewToken(
+	ctx: ExtensionCommandContext,
+): boolean {
+	const stopFailure = reconcileExternalStop(ctx.cwd);
+	if (stopFailure) {
+		ctx.ui.notify(stopFailure, "error");
+		return false;
+	}
+	const state = readState(ctx.cwd);
+	if (!state?.external_gate_cleanup_pending) return true;
+	const cleanupFailure = retryTerminalCleanup(ctx.cwd);
+	ctx.ui.notify(
+		cleanupFailure ?? "Ralph external gate terminal cleanup recovered",
+		cleanupFailure ? "error" : "info",
+	);
+	return cleanupFailure === null;
 }
 
 function normalizeBundlePromptReference(task: string): string | null {
@@ -121,27 +153,65 @@ async function handleLoopCommand(
 	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	if (!ensureLoopNotRunning(ctx)) return;
-
 	const parsed = parseArgs(args);
 	if (!parsed) {
 		ctx.ui.notify(
-			'Usage: /ralph-loop "task text" [--max-iterations=N]',
+			'Usage: /ralph-loop "task text" [--max-iterations=N] [--dry-run]',
 			"error",
 		);
+		return;
+	}
+	if (parsed.dryRun) {
+		if (isLoopRunning(ctx.cwd)) {
+			notifyLoopAlreadyRunning(ctx);
+			return;
+		}
+	} else if (!ensureLoopNotRunning(ctx) || !reconcileTerminalBeforeNewToken(ctx)) {
 		return;
 	}
 
 	let task = parsed.task;
 	const bundleMode = normalizeBundlePromptReference(task) !== null;
+	let bundle: ReturnType<typeof loadRalphBundle> | null = null;
 	if (bundleMode) {
 		try {
-			const bundle = loadRalphBundle(ctx.cwd);
+			bundle = loadRalphBundle(ctx.cwd);
 			task = readFileSync(bundle.files[".ralph/prompt.md"], "utf8");
+			if (bundle.items.runtime_contract?.external_gate) {
+				if (parsed.maxIterations !== 2 * bundle.items.items.length + 4) {
+					throw new Error(
+						`Invalid Ralph bundle: external gate requires --max-iterations=${2 * bundle.items.items.length + 4}`,
+					);
+				}
+				createExternalGateDigests(bundle);
+			}
 		} catch (err) {
 			ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			return;
 		}
+	}
+
+	if (parsed.dryRun) {
+		if (!bundle?.items.runtime_contract?.external_gate) {
+			ctx.ui.notify("Ralph dry-run requires a bundle external_gate", "error");
+			return;
+		}
+		if (readState(ctx.cwd)?.external_gate_cleanup_pending) {
+			ctx.ui.notify("Ralph terminal cleanup is pending", "error");
+			return;
+		}
+		const before = captureDryRunSnapshot(ctx);
+		const gateFailure = invokeExternalGate(ctx.cwd, null, "dry-run");
+		const mutationFailure = compareDryRunSnapshots(
+			before,
+			captureDryRunSnapshot(ctx),
+		);
+		const failure = gateFailure ?? mutationFailure;
+		ctx.ui.notify(
+			failure ?? "Ralph external gate dry-run passed",
+			failure ? "error" : "info",
+		);
+		return;
 	}
 
 	await runLoop(pi, ctx, task, parsed.maxIterations, { bundleMode });
@@ -174,6 +244,30 @@ async function handleResumeCommand(
 		ctx.ui.notify("Ralph loop state is invalid and cannot be resumed", "error");
 		return;
 	}
+
+	if (state.external_gate_entrypoint_digest) {
+		const drift = validateExternalGateDigests(ctx.cwd, state);
+		if (drift) {
+			ctx.ui.notify(drift, "error");
+			return;
+		}
+	}
+
+	if (state.external_gate_cleanup_pending) {
+		const failure = retryTerminalCleanup(ctx.cwd);
+		ctx.ui.notify(
+			failure ?? "Ralph external gate terminal cleanup recovered",
+			failure ? "error" : "info",
+		);
+		if (failure) return;
+	}
+
+	const stopFailure = reconcileExternalStop(ctx.cwd);
+	if (stopFailure) {
+		ctx.ui.notify(stopFailure, "error");
+		return;
+	}
+	resetExternalTerminalState(ctx.cwd);
 
 	if (state.stop_reason === "complete" && !parsedArgs.force) {
 		ctx.ui.notify(
@@ -208,6 +302,7 @@ async function handleResumeCommand(
 		bundleMode: state.bundle_mode,
 		forceFreshSession: true,
 		initialModelState: getSavedModelState(state),
+		resumeState: state,
 	});
 }
 
@@ -216,7 +311,7 @@ async function handleRestartCommand(
 	_args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	if (!ensureLoopNotRunning(ctx)) return;
+	if (!ensureLoopNotRunning(ctx) || !reconcileTerminalBeforeNewToken(ctx)) return;
 
 	const savedLoop = readSavedLoop(ctx.cwd);
 	if (!savedLoop) {
@@ -290,7 +385,7 @@ function handleStatusCommand(
 export function registerCommands(pi: ExtensionAPI): void {
 	pi.registerCommand("ralph-loop", {
 		description:
-			'Start a Ralph loop — run a task iteratively in fresh sessions until <promise>COMPLETE</promise> or max iterations. Usage: /ralph-loop "task" [--max-iterations=N]',
+			'Start a Ralph loop — run a task iteratively in fresh sessions until <promise>COMPLETE</promise> or max iterations. Usage: /ralph-loop "task" [--max-iterations=N] [--dry-run]',
 		getArgumentCompletions: getLoopArgumentCompletions,
 		handler: handleLoopCommand.bind(null, pi),
 	});

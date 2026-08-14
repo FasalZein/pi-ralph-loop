@@ -15,7 +15,11 @@ export function snapshotBundleIteration(
 	state: RalphLoopState,
 ): void {
 	const bundle = loadRalphBundle(cwd);
-	const snapshot = createBundleSnapshot(bundle);
+	const {
+		external_gate_entrypoint_digest: _entrypointDigest,
+		immutable_bundle_digest: _immutableBundleDigest,
+		...snapshot
+	} = createBundleSnapshot(bundle);
 	recordSnapshot(cwd, state, snapshot);
 	updateState(cwd, snapshot);
 }

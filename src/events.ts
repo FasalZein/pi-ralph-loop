@@ -3,6 +3,7 @@ import type {
 	ExtensionContext,
 	ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
+import { dispatchExternalStop } from "./loop/external-gate.js";
 import { finalizeLoop } from "./loop/finalize.js";
 import { isLoopOwnerActive } from "./loop/ownership.js";
 import {
@@ -122,7 +123,14 @@ function handleSessionShutdown(
 		return;
 	}
 
-	updateState(cwd, { cancel_requested: true });
+	const stopFailure =
+		event.reason === "quit" || event.reason === "reload"
+			? dispatchExternalStop(cwd, state, "user_cancelled")
+			: null;
+	updateState(cwd, {
+		cancel_requested: true,
+		...(stopFailure ? { external_gate_error: stopFailure } : {}),
+	});
 }
 
 function handleSessionStart(

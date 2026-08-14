@@ -155,7 +155,11 @@ Add `runtime_contract` when you want stricter gates:
     ],
     "require_progress_append": true,
     "require_one_item_per_iteration": true,
-    "require_commit": true
+    "require_commit": true,
+    "external_gate": {
+      "entrypoint": "tools/ralph-gate.mjs",
+      "timeout_ms": 30000
+    }
   }
 }
 ```
@@ -169,6 +173,43 @@ Useful `runtime_contract` fields:
 | `require_one_item_per_iteration` | `NEXT` requires exactly one item to move from `passes:false` to `passes:true`. |
 | `require_commit` | When `true`, `NEXT` and `COMPLETE` require git HEAD to change during the iteration. Omit or set `false` when commits are not required. |
 | `source_docs` + `require_clean_source_docs` | Optional file-protection gate. Omit unless you want Ralph to reject edits to listed files. |
+| `external_gate` | Optional repository-owned lifecycle gate. Set one workspace-relative `.mjs` `entrypoint`. `timeout_ms` defaults to 30000. |
+
+Ralph runs an external gate directly as `[process.execPath, resolvedEntrypoint]`. Ralph does not use a shell or search `PATH`. The gate reads one JSON document from stdin and writes one JSON document to stdout:
+
+```json
+{
+  "version": 1,
+  "phase": "launch",
+  "mode": "linear-live",
+  "selected_issue": null,
+  "selected_title": null,
+  "start_head": "0123456789abcdef",
+  "current_head": "0123456789abcdef",
+  "accepted_head": null,
+  "checks": [
+    { "name": "bundle", "status": "pass", "detail": "valid" }
+  ],
+  "journal_phase": null,
+  "linear_action": null,
+  "exit_code": 0,
+  "ok": true
+}
+```
+
+The response phase must match the requested hook. `selected_issue`, `selected_title`, HEAD fields, `journal_phase`, and `linear_action` accept explicit nulls. Check status is `pass`, `fail`, or `skip`. Stable exit codes are `0`, `2`, `3`, `4`, `5`, `6`, and `7`; `ok` is true only for exit code `0`. The output may include a string `message`. Any other output field is invalid. Ralph fails closed on timeout, signal, malformed output, non-zero process exit, protocol mismatch, or `ok: false`.
+
+The input includes `version: 1`, the lifecycle `hook`, `workspace_root`, immutable digests, and trusted loop metadata. Hooks are `dry-run`, `launch`, `iteration-start`, `promise`, `transition`, `stop`, and `cleanup`. Promise events include `NEXT` or `COMPLETE`. Resume events include same-token and same-session metadata.
+
+External-gate bundles require `--max-iterations` to equal `2 × item count + 4`. Ralph validates this budget before creating loop state. Ralph hashes the gate entrypoint and canonical immutable bundle. The immutable digest covers plan, prompt, runtime contract, and every immutable item field. It excludes only `passes`, `regression_notes`, append-only progress, and generated loop state. Ralph pins both digests at launch and never replaces them during iteration snapshots.
+
+Ralph runs `launch` with an in-memory token and digests before writing `.ralph/loop.md`. Ralph rejects launch changes to protected Git, `.ralph/`, loop, or session state. A rejected or failed launch dispatches one bounded stop attempt with the in-memory token, leaves no loop state, and never runs cleanup. Ralph runs `cleanup` only after COMPLETE is durable. Other terminal paths run the retryable stop hook and preserve repository claim state. The first pending stop reason remains fixed until the stop succeeds. A cleanup-pending run must reconcile before a new loop or restart can replace its token.
+
+Use dry-run to validate the bundle and invoke only the read-only hook. It creates no loop state or Pi session. Ralph rejects changes to local Git HEAD/status, untracked files, the complete `.ralph/` tree, or current loop/session identity:
+
+```text
+/ralph-loop "@.ralph/prompt.md" --max-iterations=6 --dry-run
+```
 
 `WAIT` means the selected item is still in progress because the agent expects an async result to arrive later. `NEXT` means one item passed and the required checks passed, so Ralph can move to the next loop iteration. `COMPLETE` means every item passed and all required checks passed. Rejected promises stay in the same session with a corrective prompt.
 
@@ -235,6 +276,9 @@ Ralph writes `.ralph/loop.md`. The YAML frontmatter is runtime state, not a user
 | `bundle_*`, `items_*`, `progress_*`, `source_doc_hashes`, `git_head` | Bundle snapshots used to validate promises. |
 | `bundle_rejection_count` | Rejected bundle promises in the current iteration. |
 | `limit_reminders` | Context-limit reminder thresholds already sent in the current iteration. |
+| `external_gate_entrypoint_digest`, `immutable_bundle_digest` | Saved guard identities checked at every hook and resume. |
+| `external_gate_stop_dispatched`, `external_gate_stop_pending`, `external_gate_stop_reason`, `external_gate_error` | Retryable stop intent, result, and recovery state. Successful same-token resume resets the terminal event before later work. |
+| `external_gate_cleanup_pending` | Failed COMPLETE-only cleanup. New loop and restart admission reconcile it before replacing the token. |
 
 The prompt body lives below the frontmatter. `/ralph-resume` and `/ralph-restart` reuse it.
 

@@ -9,6 +9,17 @@ export {
 	evaluateBundleFileGate,
 } from "./file-gates.js";
 export { evaluateCompleteGate, evaluateNextGate } from "./item-gates.js";
+export {
+	createExternalGateDigests,
+	resolveExternalGateEntrypoint,
+	runExternalGate,
+} from "./external-gate.js";
+export type {
+	ExternalGateDigests,
+	ExternalGateHook,
+	ExternalGateInput,
+	ExternalGateResponse,
+} from "./external-gate.js";
 export { parseBundleItemsJson } from "./schema.js";
 export { createBundleSnapshot } from "./snapshot.js";
 export { evaluateVerificationGates } from "./verification-gates.js";

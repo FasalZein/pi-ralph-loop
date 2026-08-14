@@ -61,6 +61,13 @@ const STATE_SCHEMA = [
 	["bundle_rejection_count", "int"],
 	["provider_recovery_fresh_fallback_used", "bool"],
 	["limit_reminders", "stringNull"],
+	["external_gate_entrypoint_digest", "stringNull"],
+	["immutable_bundle_digest", "stringNull"],
+	["external_gate_stop_dispatched", "bool"],
+	["external_gate_stop_pending", "bool"],
+	["external_gate_stop_reason", "stringNull"],
+	["external_gate_cleanup_pending", "bool"],
+	["external_gate_error", "stringNull"],
 ] as const satisfies ReadonlyArray<readonly [keyof RalphLoopState, FieldKind]>;
 
 // Compile-time proof that the descriptor names every RalphLoopState field.

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
@@ -22,7 +28,11 @@ import {
 	runLoop,
 	WAIT_PARK_TIMEOUT_MS,
 } from "../src/loop-engine.ts";
-import { readState, writeState } from "../src/state.ts";
+import {
+	dispatchExternalStop,
+	retryTerminalCleanup,
+} from "../src/loop/external-gate.ts";
+import { readState, updateState, writeState } from "../src/state.ts";
 import type { RalphLoopState } from "../src/types.ts";
 
 type ScriptedResponse = {
@@ -183,6 +193,49 @@ function writeBundleItems(
 			2,
 		),
 	);
+}
+
+function addLifecycleGate(cwd: string): void {
+	const itemsPath = join(cwd, ".ralph", "items.json");
+	const items = JSON.parse(readFileSync(itemsPath, "utf8"));
+	items.runtime_contract = {
+		...(items.runtime_contract ?? {}),
+		external_gate: { entrypoint: "guard.mjs", timeout_ms: 500 },
+	};
+	writeFileSync(itemsPath, JSON.stringify(items));
+	writeFileSync(
+		join(cwd, "guard.mjs"),
+		`let body = "";
+for await (const chunk of process.stdin) body += chunk;
+const input = JSON.parse(body);
+const { appendFileSync, existsSync } = await import("node:fs");
+appendFileSync("gate.log", JSON.stringify(input) + "\\n");
+const reject = existsSync("reject-" + input.hook);
+process.stdout.write(JSON.stringify({
+  version: 1,
+  phase: input.hook,
+  mode: "test",
+  selected_issue: null,
+  selected_title: null,
+  start_head: input.heads.start,
+  current_head: input.heads.current,
+  accepted_head: input.heads.accepted,
+  checks: [],
+  journal_phase: null,
+  linear_action: null,
+  exit_code: reject ? 7 : 0,
+  ok: !reject,
+  ...(reject ? { message: input.hook + " rejected" } : {})
+}));`,
+	);
+}
+
+function gateInputs(cwd: string): Array<Record<string, any>> {
+	return readFileSync(join(cwd, "gate.log"), "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
 }
 
 function createHarness(): Harness {
@@ -1998,4 +2051,163 @@ test("continueLoop sends task and sets up iteration", async () => {
 	const state = h.readState();
 	assert.equal(state?.session_id, "session-3");
 	assert.equal(state?.transitioning, false);
+});
+
+test("external lifecycle runs built-in gates before promise and transition before NEXT session", async () => {
+	const h = createHarness();
+	writeBundleItems(h.cwd, [false]);
+	addLifecycleGate(h.cwd);
+	await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+
+	h.simulateAgentEnd({ text: "not done\n<promise>NEXT</promise>" });
+	assert.deepEqual(gateInputs(h.cwd).map((entry) => entry.hook), ["launch", "iteration-start"]);
+	assert.equal(h.readState()?.iteration, 1);
+
+	writeBundleItems(h.cwd, [true], { external_gate: { entrypoint: "guard.mjs", timeout_ms: 500 } });
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+	assert.deepEqual(gateInputs(h.cwd).map((entry) => entry.hook), [
+		"launch",
+		"iteration-start",
+		"promise",
+		"transition",
+	]);
+	assert.equal(h.readState()?.iteration, 2);
+	assert.equal(h.newSessionCalls, 0);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(h.newSessionCalls, 1);
+	assert.equal(gateInputs(h.cwd).at(-1)?.hook, "iteration-start");
+});
+
+test("COMPLETE is durable before cleanup and failed cleanup remains recoverable", async () => {
+	const h = createHarness();
+	writeBundleItems(h.cwd, [true]);
+	addLifecycleGate(h.cwd);
+	writeFileSync(join(h.cwd, "reject-cleanup"), "reject\n");
+	await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+
+	h.simulateAgentEnd({ text: "done\n<promise>COMPLETE</promise>" });
+	const stopped = h.readState();
+	assert.equal(stopped?.running, false);
+	assert.equal(stopped?.stop_reason, "complete");
+	assert.equal(stopped?.external_gate_cleanup_pending, true);
+	assert.match(stopped?.external_gate_error ?? "", /cleanup rejected/);
+	assert.deepEqual(gateInputs(h.cwd).slice(-2).map((entry) => entry.hook), [
+		"promise",
+		"cleanup",
+	]);
+
+	rmSync(join(h.cwd, "reject-cleanup"));
+	assert.equal(retryTerminalCleanup(h.cwd), null);
+	assert.equal(h.readState()?.external_gate_cleanup_pending, false);
+});
+
+test("same-session resume sends same-token lifecycle metadata", async () => {
+	const h = createHarness();
+	writeBundleItems(h.cwd, [false]);
+	addLifecycleGate(h.cwd);
+	await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+	const token = h.readState()?.loop_token;
+	assert.ok(token);
+	writeState(h.cwd, { ...h.readState()!, running: false }, "task");
+
+	await resumeCurrentSession(h.pi, h.ctx);
+	const resumed = gateInputs(h.cwd).at(-1);
+	assert.ok(resumed);
+	assert.equal(resumed.hook, "iteration-start");
+	assert.deepEqual(resumed.resume, { same_token: true, same_session: true });
+	assert.equal(resumed.loop.token, token);
+});
+
+for (const mutation of ["entrypoint drift", "external gate removal"] as const) {
+	test(`iteration-start rejects ${mutation} after transition without repinning launch digests`, async () => {
+		const h = createHarness();
+		writeBundleItems(h.cwd, [false]);
+		addLifecycleGate(h.cwd);
+		await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+		const launchPins = {
+			entrypoint: h.readState()?.external_gate_entrypoint_digest,
+			bundle: h.readState()?.immutable_bundle_digest,
+		};
+
+		writeBundleItems(h.cwd, [true], {
+			external_gate: { entrypoint: "guard.mjs", timeout_ms: 500 },
+		});
+		h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+		assert.equal(h.readState()?.iteration, 2);
+
+		if (mutation === "entrypoint drift") {
+			writeFileSync(join(h.cwd, "guard.mjs"), `${readFileSync(join(h.cwd, "guard.mjs"), "utf8")}\n// drift\n`);
+		} else {
+			const itemsPath = join(h.cwd, ".ralph", "items.json");
+			const items = JSON.parse(readFileSync(itemsPath, "utf8"));
+			delete items.runtime_contract.external_gate;
+			writeFileSync(itemsPath, JSON.stringify(items));
+		}
+
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		const stopped = h.readState();
+		assert.equal(stopped?.running, false);
+		assert.equal(stopped?.stop_reason, "error");
+		assert.equal(stopped?.external_gate_entrypoint_digest, launchPins.entrypoint);
+		assert.equal(stopped?.immutable_bundle_digest, launchPins.bundle);
+		assert.match(
+			stopped?.external_gate_error ?? "",
+			mutation === "entrypoint drift" ? /entrypoint digest drift/ : /configuration was removed/,
+		);
+	});
+}
+
+test("failed stop remains pending, retries on resume, resets, and dispatches a later stop", async () => {
+	const h = createHarness();
+	writeBundleItems(h.cwd, [false]);
+	addLifecycleGate(h.cwd);
+	writeFileSync(join(h.cwd, "reject-stop"), "reject\n");
+	await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+	const active = h.readState();
+	assert.ok(active);
+
+	assert.match(dispatchExternalStop(h.cwd, active, "manual_stop") ?? "", /stop rejected/);
+	assert.equal(h.readState()?.external_gate_stop_pending, true);
+	assert.equal(h.readState()?.external_gate_stop_dispatched, false);
+
+	updateState(h.cwd, {
+		running: false,
+		stop_reason: "manual_stop",
+		session_id: "stopped-session",
+	});
+	const stopped = h.readState();
+	assert.ok(stopped);
+	const token = stopped.loop_token;
+	rmSync(join(h.cwd, "reject-stop"));
+	await runLoop(h.pi, h.ctx, "task", 6, {
+		bundleMode: true,
+		forceFreshSession: true,
+		resumeState: stopped,
+	});
+	assert.equal(h.readState()?.loop_token, token);
+	assert.equal(h.readState()?.external_gate_stop_pending, false);
+	assert.equal(h.readState()?.external_gate_stop_dispatched, false);
+
+	assert.equal(dispatchExternalStop(h.cwd, h.readState()!, "manual_stop"), null);
+	assert.equal(h.readState()?.external_gate_stop_dispatched, true);
+	assert.deepEqual(
+		gateInputs(h.cwd).filter((entry) => entry.hook === "stop").length,
+		3,
+	);
+});
+
+test("STOP preserves claim state and never runs cleanup", async () => {
+	const h = createHarness();
+	writeBundleItems(h.cwd, [false]);
+	addLifecycleGate(h.cwd);
+	await runLoop(h.pi, h.ctx, "task", 6, { bundleMode: true });
+
+	h.simulateAgentEnd({ text: "stop\n<promise>STOP</promise>" });
+	assert.equal(h.readState()?.stop_reason, "manual_stop");
+	assert.equal(h.readState()?.external_gate_cleanup_pending, false);
+	assert.deepEqual(gateInputs(h.cwd).map((entry) => entry.hook), [
+		"launch",
+		"iteration-start",
+		"stop",
+	]);
 });

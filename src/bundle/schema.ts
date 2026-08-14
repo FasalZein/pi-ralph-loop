@@ -48,6 +48,36 @@ function validateRuntimeContract(value: unknown): RuntimeContract {
 		contract.require_commit = value.require_commit;
 	}
 
+	if (value.external_gate !== undefined) {
+		if (!isRecord(value.external_gate)) {
+			fail("runtime_contract.external_gate must be an object");
+		}
+		const keys = Object.keys(value.external_gate);
+		if (keys.some((key) => !["entrypoint", "timeout_ms"].includes(key))) {
+			fail("runtime_contract.external_gate contains unknown fields");
+		}
+		if (
+			typeof value.external_gate.entrypoint !== "string" ||
+			!value.external_gate.entrypoint
+		) {
+			fail("runtime_contract.external_gate.entrypoint must be a non-empty string");
+		}
+		if (
+			value.external_gate.timeout_ms !== undefined &&
+			(!Number.isSafeInteger(value.external_gate.timeout_ms) ||
+				(value.external_gate.timeout_ms as number) <= 0 ||
+				(value.external_gate.timeout_ms as number) > 2_147_483_647)
+		) {
+			fail("runtime_contract.external_gate.timeout_ms must be a positive integer");
+		}
+		contract.external_gate = {
+			entrypoint: value.external_gate.entrypoint,
+			...(value.external_gate.timeout_ms === undefined
+				? {}
+				: { timeout_ms: value.external_gate.timeout_ms as number }),
+		};
+	}
+
 	if (value.commit_policy !== undefined) {
 		fail(
 			"runtime_contract.commit_policy is no longer supported; use require_commit instead",
