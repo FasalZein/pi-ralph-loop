@@ -31,6 +31,7 @@ function buildInput(
 		promise?: "NEXT" | "COMPLETE";
 		resume?: { same_token: boolean; same_session: boolean };
 		stopReason?: RalphLoopState["stop_reason"];
+		maxIterations?: number;
 	} = {},
 ) {
 	const current = currentHead(bundleRoot);
@@ -50,7 +51,7 @@ function buildInput(
 		loop: {
 			token: state?.loop_token ?? null,
 			iteration: state?.iteration ?? 0,
-			max_iterations: state?.max_iterations ?? 0,
+			max_iterations: extra.maxIterations ?? state?.max_iterations ?? 0,
 			started_at: state?.started_at ?? null,
 			session_id: state?.session_id || null,
 			stop_reason: extra.stopReason ?? state?.stop_reason ?? null,
@@ -87,6 +88,7 @@ export function invokeExternalGate(
 		promise?: "NEXT" | "COMPLETE";
 		resume?: { same_token: boolean; same_session: boolean };
 		stopReason?: RalphLoopState["stop_reason"];
+		maxIterations?: number;
 	} = {},
 ): string | null {
 	try {

@@ -201,7 +201,9 @@ async function handleLoopCommand(
 			return;
 		}
 		const before = captureDryRunSnapshot(ctx);
-		const gateFailure = invokeExternalGate(ctx.cwd, null, "dry-run");
+		const gateFailure = invokeExternalGate(ctx.cwd, null, "dry-run", {
+			maxIterations: parsed.maxIterations,
+		});
 		const mutationFailure = compareDryRunSnapshots(
 			before,
 			captureDryRunSnapshot(ctx),

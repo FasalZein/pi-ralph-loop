@@ -787,7 +787,12 @@ test("ralph-loop external gate rejects the wrong exact iteration budget before s
 test("ralph-loop dry-run succeeds without loop or session state when the gate does not write", async () => {
 	const h = createCommandsHarness();
 	writeValidBundle(h.cwd);
-	addExternalGate(h.cwd, passingGateScript());
+	addExternalGate(
+		h.cwd,
+		passingGateScript(
+			'if (input.loop.max_iterations !== 6) throw new Error(`expected max_iterations=6, received ${input.loop.max_iterations}`);',
+		),
+	);
 
 	await h.commands.get("ralph-loop")?.handler(
 		"@.ralph/prompt.md --max-iterations=6 --dry-run",
