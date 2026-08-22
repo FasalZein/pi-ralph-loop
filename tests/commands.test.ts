@@ -137,6 +137,9 @@ function createCommandsHarness() {
 		setIdle: (value: boolean) => {
 			idle = value;
 		},
+		setMode: (value: string | undefined) => {
+			(ctx as { mode?: string }).mode = value;
+		},
 		pushAssistant: (text: string) => {
 			branch.push({
 				type: "message",
@@ -196,6 +199,37 @@ test("registerCommands exposes the Ralph command set", () => {
 	]) {
 		assert.ok(h.commands.has(name));
 	}
+});
+
+test("loop commands refuse to start under a one-shot print-mode host", async () => {
+	const h = createCommandsHarness();
+	h.setMode("print");
+
+	await h.commands.get("ralph-loop")?.handler('"task"', h.ctx);
+	await h.commands.get("ralph-resume")?.handler("", h.ctx);
+	await h.commands.get("ralph-restart")?.handler("", h.ctx);
+
+	assert.equal(h.notifications.length, 3);
+	for (const notification of h.notifications) {
+		assert.equal(notification.type, "error");
+		assert.match(notification.message, /not supported in print mode/);
+	}
+	assert.equal(readState(h.cwd)?.running ?? false, false);
+	assert.equal(h.getNewSessionCount(), 0);
+	assert.equal(h.sentMessages.length, 0);
+});
+
+test("loop commands run under an interactive host", async () => {
+	const h = createCommandsHarness();
+	h.setMode("tui");
+
+	await h.commands.get("ralph-loop")?.handler('"task" --max-iterations=2', h.ctx);
+
+	assert.equal(
+		h.notifications.filter((n) => n.type === "error").length,
+		0,
+	);
+	assert.equal(readState(h.cwd)?.running, true);
 });
 
 test("ralph-loop starts bundle mode for @.ralph/prompt.md", async () => {

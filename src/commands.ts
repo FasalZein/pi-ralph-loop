@@ -15,6 +15,12 @@ import { getTaskBody, readState, updateState } from "./state.js";
 const MAX_ITERATION_SUGGESTIONS = [5, 10, 20, 50, 100] as const;
 const MS_PER_SECOND = 1000;
 
+// One-shot hosts dispose the session as soon as the command handler returns,
+// tearing down the loop's sessions mid-flight. Long-lived hosts (tui, rpc)
+// keep the process alive across iterations. Deny-listed by exact mode string
+// so older hosts that do not expose a mode keep working.
+const UNSUPPORTED_HOST_MODES = new Set(["print", "json"]);
+
 type SavedLoop = {
 	state: NonNullable<ReturnType<typeof readState>>;
 	task: string;
@@ -33,6 +39,20 @@ function isLoopRunning(cwd: string): boolean {
 
 function notifyLoopAlreadyRunning(ctx: ExtensionCommandContext): void {
 	ctx.ui.notify("A Ralph loop is already running", "error");
+}
+
+function ensureHostSupportsLoops(ctx: ExtensionCommandContext): boolean {
+	const mode = (ctx as { mode?: unknown }).mode;
+	if (typeof mode !== "string" || !UNSUPPORTED_HOST_MODES.has(mode)) {
+		return true;
+	}
+	const message =
+		"Ralph loops need a long-lived pi session and are not supported in print mode (pi -p / --mode json): the host exits after the command returns. Run /ralph-loop in an interactive pi session or over RPC instead.";
+	ctx.ui.notify(message, "error");
+	// One-shot hosts do not render ui.notify; stderr is the only channel the
+	// user will actually see there.
+	console.error(message);
+	return false;
 }
 
 function ensureLoopNotRunning(ctx: ExtensionCommandContext): boolean {
@@ -121,6 +141,7 @@ async function handleLoopCommand(
 	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
+	if (!ensureHostSupportsLoops(ctx)) return;
 	if (!ensureLoopNotRunning(ctx)) return;
 
 	const parsed = parseArgs(args);
@@ -152,6 +173,7 @@ async function handleResumeCommand(
 	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
+	if (!ensureHostSupportsLoops(ctx)) return;
 	if (!ensureLoopNotRunning(ctx)) return;
 
 	const parsedArgs = parseResumeArgs(args);
@@ -216,6 +238,7 @@ async function handleRestartCommand(
 	_args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
+	if (!ensureHostSupportsLoops(ctx)) return;
 	if (!ensureLoopNotRunning(ctx)) return;
 
 	const savedLoop = readSavedLoop(ctx.cwd);
