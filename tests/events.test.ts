@@ -10,6 +10,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { registerEventHandlers } from "../src/events.ts";
+import {
+	beginReplacement,
+	endReplacement,
+} from "../src/loop/session-transition.ts";
 import { readState, writeState } from "../src/state.ts";
 import type { RalphLoopState } from "../src/types.ts";
 
@@ -172,6 +176,54 @@ test("session_before_switch allows new sessions in a non-owner observer process"
 
 	assert.equal(result, undefined);
 	assert.deepEqual(h.notifications, []);
+});
+
+test("session_before_switch blocks manual /new in the owner process even while transitioning", async () => {
+	// `transitioning` alone must not authorize /new: while a replacement is
+	// parked waiting for the settle boundary, a manual /new would invalidate
+	// the ctx under the very drain we are waiting for.
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			transitioning: true,
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	const result = await h.handlers.get("session_before_switch")?.(
+		{ reason: "new" },
+		h.ctx,
+	);
+
+	assert.deepEqual(result, { cancel: true });
+});
+
+test("session_before_switch allows /new while a Ralph replacement is in flight", async () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			transitioning: true,
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	beginReplacement();
+	try {
+		const result = await h.handlers.get("session_before_switch")?.(
+			{ reason: "new" },
+			h.ctx,
+		);
+		assert.equal(result, undefined);
+		assert.deepEqual(h.notifications, []);
+	} finally {
+		endReplacement();
+	}
 });
 
 test("session mutation remains blocked in the loop owner process", async () => {
@@ -398,6 +450,37 @@ test("session_shutdown preserves Ralph-managed new-session transitions", () => {
 	assert.equal(state?.stop_reason, null);
 });
 
+test("session_shutdown holds an authorized replacement for the grace period", async () => {
+	const previous = process.env.RALPH_TEST_SESSION_SHUTDOWN_GRACE_MS;
+	process.env.RALPH_TEST_SESSION_SHUTDOWN_GRACE_MS = "80";
+	try {
+		const h = createEventsHarness();
+		writeState(h.cwd, makeEventsState({ transitioning: true }), "task");
+
+		beginReplacement();
+		try {
+			const started = Date.now();
+			await h.handlers.get("session_shutdown")?.(
+				{ reason: "new" },
+				h.ctx,
+			);
+			assert.ok(Date.now() - started >= 75);
+		} finally {
+			endReplacement();
+		}
+
+		const state = readState(h.cwd);
+		assert.equal(state?.running, true);
+		assert.equal(state?.transitioning, true);
+		assert.equal(state?.cancel_requested, false);
+	} finally {
+		if (previous === undefined) {
+			delete process.env.RALPH_TEST_SESSION_SHUTDOWN_GRACE_MS;
+		} else {
+			process.env.RALPH_TEST_SESSION_SHUTDOWN_GRACE_MS = previous;
+		}
+	}
+});
 test("model and thinking selection update the active owner loop state", () => {
 	const h = createEventsHarness();
 	writeState(h.cwd, makeEventsState({ session_id: "session-2" }), "task");

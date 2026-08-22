@@ -4,6 +4,7 @@ import { updateState } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { clearCommandCtx, getCommandCtx } from "./command-context.js";
 import { stopLoopHeartbeat } from "./ownership.js";
+import { clearPendingSessionReplacement } from "./session-transition.js";
 import { clearLoopStatus } from "./status.js";
 
 export function finalizeLoop(
@@ -25,6 +26,7 @@ export function finalizeLoop(
 	});
 	stopLoopHeartbeat(cwd);
 	clearLoopStatus(ctx);
+	clearPendingSessionReplacement();
 	if (getCommandCtx()?.cwd === cwd) {
 		clearCommandCtx();
 	}

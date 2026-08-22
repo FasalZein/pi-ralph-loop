@@ -314,7 +314,6 @@ function createHarness(): Harness {
 			},
 			waitForIdle: async () => {
 				idleWaits++;
-				idle = true;
 			},
 			newSession: async (options?: {
 				setup?: (sessionManager: {
@@ -466,6 +465,147 @@ test("accepted NEXT replays saved model and thinking before the fresh iteration 
 	assert.deepEqual(h.setModelCalls, ["anthropic/claude-sonnet"]);
 	assert.deepEqual(h.setThinkingLevelCalls, ["high"]);
 	assert.equal(h.sentMessages.at(-1), "task");
+});
+
+test("accepted NEXT waits for the idle boundary before replacing the session", async () => {
+	const h = createHarness();
+	const gate: { release: () => void } = { release: () => {} };
+	h.ctx.waitForIdle = () =>
+		new Promise<void>((resolve) => {
+			gate.release = resolve;
+		});
+
+	await runLoop(h.pi, h.ctx, "task", 3);
+	h.sentMessages.length = 0;
+	h.writeState(
+		makeBaseState({
+			iteration: 1,
+			max_iterations: 3,
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal(h.newSessionCalls, 0);
+
+	// The captured idle promise stands in for Pi's settle drain: until it
+	// resolves, the replacement stays parked even though it is due.
+	gate.release();
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(h.newSessionCalls, 1);
+	assert.equal(h.sentMessages.at(-1), "task");
+});
+
+test("later agent_end in the same cascade does not double-advance the iteration", async () => {
+	const h = createHarness();
+	await runLoop(h.pi, h.ctx, "task", 3);
+	h.writeState(
+		makeBaseState({
+			iteration: 1,
+			max_iterations: 3,
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+	assert.equal(h.readState()?.iteration, 2);
+	assert.equal(h.readState()?.transitioning, true);
+
+	// A queued continuation lands in the same settle cascade: its agent_end
+	// must not advance the iteration again or schedule a second replacement.
+	h.simulateAgentEnd({ text: "more work\n<promise>NEXT</promise>" });
+	assert.equal(h.readState()?.iteration, 2);
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(h.newSessionCalls, 1);
+});
+
+test("stop requested while the replacement is parked wins at dispatch time", async () => {
+	const h = createHarness();
+	const gate: { release: () => void } = { release: () => {} };
+	h.ctx.waitForIdle = () =>
+		new Promise<void>((resolve) => {
+			gate.release = resolve;
+		});
+
+	await runLoop(h.pi, h.ctx, "task", 3);
+	h.writeState(
+		makeBaseState({
+			iteration: 1,
+			max_iterations: 3,
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+	// /ralph-stop lands while the replacement is parked on the settle boundary.
+	h.writeState(
+		makeBaseState({
+			iteration: 2,
+			transitioning: true,
+			stop_requested: true,
+		}),
+	);
+
+	gate.release();
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(h.newSessionCalls, 0);
+	assert.equal(h.readState()?.running, false);
+	assert.equal(h.readState()?.stop_reason, "manual_stop");
+});
+
+test("a replacement armed for an older iteration never dispatches after the loop moved on", async () => {
+	const h = createHarness();
+	const gate: { release: () => void } = { release: () => {} };
+	h.ctx.waitForIdle = () =>
+		new Promise<void>((resolve) => {
+			gate.release = resolve;
+		});
+
+	await runLoop(h.pi, h.ctx, "task", 3);
+	h.writeState(
+		makeBaseState({
+			iteration: 1,
+			max_iterations: 3,
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+	// A new loop takes over the workspace before the parked replacement runs.
+	h.writeState(
+		makeBaseState({
+			iteration: 5,
+			loop_token: "token-new",
+			transitioning: false,
+		}),
+	);
+
+	gate.release();
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(h.newSessionCalls, 0);
+});
+
+test("replacement without a captured idle boundary dispatches on due time alone", async () => {
+	const h = createHarness();
+	// waitForIdle throws on this stale ctx: no boundary available (e.g. very
+	// old pi), the replacement must still proceed when due.
+	h.ctx.waitForIdle = () => {
+		throw new Error("stale ctx");
+	}
+	await runLoop(h.pi, h.ctx, "task", 3);
+	h.writeState(
+		makeBaseState({
+			iteration: 1,
+			max_iterations: 3,
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(h.newSessionCalls, 1);
 });
 
 test("bundle NEXT accepts exactly one completed item", async () => {
@@ -1189,9 +1329,9 @@ test("provider recovery sends five actual nudges before one fresh fallback", asy
 		h.simulateAgentEnd({ stopReason: "error", text: "provider failed after final nudge" });
 		mock.timers.tick(PROVIDER_ERROR_MAX_WAIT_MS);
 		mock.timers.tick(300_000);
-		await Promise.resolve();
+		await new Promise((resolve) => setImmediate(resolve));
 		mock.timers.tick(0);
-		await Promise.resolve();
+		await new Promise((resolve) => setImmediate(resolve));
 
 		assert.equal(h.newSessionCalls, 1);
 		assert.equal(h.readState()?.provider_recovery_fresh_fallback_used, true);
@@ -1606,6 +1746,9 @@ test("accepted NEXT delays the fresh iteration with a visible seconds countdown"
 		);
 
 		mock.timers.tick(1_000);
+		// Dispatch rides a microtask (captured idle promise) after the fake
+		// timer fires; drain it before asserting.
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(h.newSessionCalls, 1);
 	} finally {
 		mock.timers.reset();
@@ -1637,6 +1780,7 @@ test("next-iteration delay floors decimal seconds", async () => {
 		mock.timers.tick(1_999);
 		assert.equal(h.newSessionCalls, 0);
 		mock.timers.tick(1);
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(h.newSessionCalls, 1);
 	} finally {
 		mock.timers.reset();
@@ -1662,6 +1806,7 @@ test("alphanumeric next-iteration delay is invalid and applies no delay", async 
 		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
 		assert.equal(h.newSessionCalls, 0);
 		mock.timers.tick(0);
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(h.newSessionCalls, 1);
 	} finally {
 		mock.timers.reset();

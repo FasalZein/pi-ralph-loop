@@ -18,6 +18,10 @@ import {
 	updateLoopSelectedModel,
 	updateLoopThinkingLevel,
 } from "./loop/model-state.js";
+import {
+	getSessionShutdownGraceMs,
+	isReplacementInFlight,
+} from "./loop/session-transition.js";
 import { readState, updateState } from "./state.js";
 
 const BLOCKED_TOOLS_ENV = "RALPH_BLOCKED_TOOLS";
@@ -65,7 +69,12 @@ function handleSessionBeforeSwitch(
 		return { cancel: true };
 	}
 
-	if (event.reason === "new" && !state.transitioning) {
+	// A "new" switch is only authorized while Ralph's own replacement is in
+	// flight. `transitioning` alone is not enough: it stays true while a
+	// replacement is parked waiting for the settle boundary, and a manual /new
+	// in that window would invalidate the ctx under the drain we are waiting
+	// for.
+	if (event.reason === "new" && !isReplacementInFlight()) {
 		ctx.ui.notify(
 			"Ralph loop is running. /new is blocked. Use another pi instance or /ralph-stop.",
 			"warning",
@@ -104,7 +113,7 @@ function handleBlockedToolCall(event: ToolCallEvent, ctx: ExtensionContext) {
 	return { block: true, reason };
 }
 
-function handleSessionShutdown(
+async function handleSessionShutdown(
 	event: { reason?: "quit" | "reload" | "new" | "resume" | "fork" },
 	ctx: ExtensionContext,
 ) {
@@ -120,14 +129,29 @@ function handleSessionShutdown(
 	// on session_start, so do not treat pid alone as a liveness proof.
 	if (state.owner_pid !== null && state.owner_pid !== process.pid) return;
 
-	if (state.transitioning) {
+	// During an authorized fresh-session replacement, hold the outgoing ctx
+	// alive briefly: other extensions may finish short deferred work from
+	// their agent_settled handlers, and this grace lets that work land on a
+	// live context before invalidation.
+	if (event.reason === "new" && isReplacementInFlight()) {
+		await new Promise((resolve) =>
+			setTimeout(resolve, getSessionShutdownGraceMs()),
+		);
+	}
+
+	if (event.reason === "new" && isReplacementInFlight()) return;
+
+	// Re-read after any grace sleep: the loop may have finalized meanwhile.
+	const latest = readState(cwd);
+	if (!latest?.running) return;
+	if (latest.transitioning) {
 		if (event.reason === "quit" || event.reason === "reload") {
 			// A NEXT was already accepted and the iteration advanced, but the
 			// fresh-session handoff was cut off by host/stdin shutdown. This is a
 			// committed handoff, not a loop failure: mark it resumable so
 			// /ralph-resume continues the saved iteration instead of treating a
 			// valid promise as an unrecoverable error.
-			finalizeLoop(ctx, cwd, "interrupted", state.error_count);
+			finalizeLoop(ctx, cwd, "interrupted", latest.error_count);
 		}
 		return;
 	}

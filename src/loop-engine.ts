@@ -29,6 +29,13 @@ import {
 	startLoopHeartbeat,
 } from "./loop/ownership.js";
 import {
+	armSessionReplacement,
+	beginReplacement,
+	clearPendingSessionReplacement,
+	endReplacement,
+	markReplacementDue,
+} from "./loop/session-transition.js";
+import {
 	armProviderWait,
 	isProviderWaitCurrent,
 	supersedeProviderWait,
@@ -149,6 +156,24 @@ function getNextIterationDelaySeconds(): number {
 	if (!raw || !/^\d+(?:\.\d+)?$/.test(raw)) return 0;
 	const parsed = Number(raw);
 	return Number.isFinite(parsed) ? Math.floor(parsed) : 0;
+}
+
+/**
+ * Capture Pi's idle boundary for the run that is settling. Must be called
+ * synchronously while handling agent_end: once the settle drain starts, the
+ * session already reports idle and the boundary is lost. Returns null when
+ * the ctx offers no usable waitForIdle (or is already stale); the executor
+ * re-validates state either way.
+ */
+function captureIdle(ctx: ExtensionContext): Promise<void> | null {
+	try {
+		const waitForIdle = (
+			ctx as unknown as { waitForIdle?: () => Promise<void> }
+		).waitForIdle;
+		return typeof waitForIdle === "function" ? waitForIdle.call(ctx) : null;
+	} catch {
+		return null;
+	}
 }
 
 function shouldStop(cwd: string): boolean {
@@ -353,9 +378,18 @@ function scheduleProviderRecoveryFreshFallback(
 				provider_recovery_fresh_fallback_used: true,
 			});
 			resetProviderRecoveryChain();
-			void openFreshIterationSession(cmdCtx, latest.error_count, {
-				snapshotBundle: false,
-			});
+			armSessionReplacement(
+				() =>
+					void openFreshIterationSession(cmdCtx, latest.error_count, {
+						snapshotBundle: false,
+						expect: {
+							loopToken: latest.loop_token,
+							iteration: latest.iteration,
+						},
+					}),
+				{ idle: captureIdle(cmdCtx) },
+			);
+			markReplacementDue();
 		},
 	);
 }
@@ -530,6 +564,9 @@ function markIterationStarted(
 	options: { snapshotBundle?: boolean } = {},
 ): void {
 	resetIterationCounters();
+	// The fresh session owns the loop now: any replacement still parked from
+	// the outgoing session is obsolete.
+	clearPendingSessionReplacement();
 	// Start each iteration with a clean notice surface: any leftover banner
 	// from the previous iteration (provider-error warning, nudge, etc.) must
 	// not bleed into the fresh session.
@@ -579,18 +616,36 @@ function scheduleReplacementPrompt(
 async function openFreshIterationSession(
 	ctx: ExtensionCommandContext,
 	errorCount: number,
-	options: { snapshotBundle?: boolean } = {},
+	options: {
+		snapshotBundle?: boolean;
+		expect?: { loopToken: string; iteration: number };
+	} = {},
 ): Promise<void> {
 	const cwd = ctx.cwd;
 	const state = readState(cwd);
 	const task = getTaskBody(cwd);
 	if (!state?.running) return;
+	// Executor-time revalidation: the replacement may have been parked across
+	// the settle boundary while the loop state moved on (stop requested, a
+	// newer iteration or loop token took over). Never act on obsolete state.
+	if (
+		options.expect &&
+		(state.loop_token !== options.expect.loopToken ||
+			state.iteration !== options.expect.iteration)
+	) {
+		return;
+	}
+	if (shouldStop(cwd)) {
+		handleRequestedStop(ctx, state);
+		return;
+	}
 	if (!task) {
 		finalizeLoop(ctx, cwd, "error", errorCount);
 		return;
 	}
 
 	let replacementCtx: ReplacementSessionContext | null = null;
+	beginReplacement();
 	try {
 		const result = await ctx.newSession({
 			setup: async (sessionManager) => {
@@ -636,6 +691,8 @@ async function openFreshIterationSession(
 		}
 	} catch {
 		finalizeLoop(replacementCtx ?? ctx, cwd, "error", errorCount);
+	} finally {
+		endReplacement();
 	}
 }
 
@@ -644,13 +701,17 @@ function scheduleFreshIterationSession(
 	errorCount: number,
 ): void {
 	setTimeout(() => {
-		void openFreshIterationSession(ctx, errorCount);
+		armSessionReplacement(() => void openFreshIterationSession(ctx, errorCount), {
+			idle: captureIdle(ctx),
+		});
+		markReplacementDue();
 	}, 0);
 }
 
 function scheduleNextIteration(
 	ctx: ExtensionContext,
 	state: RalphLoopState,
+	idle: Promise<void> | null,
 ): void {
 	const delaySeconds = getNextIterationDelaySeconds();
 	const nextIteration = state.iteration + 1;
@@ -679,7 +740,14 @@ function scheduleNextIteration(
 			finalizeLoop(ctx, ctx.cwd, "error", state.error_count);
 			return;
 		}
-		void openFreshIterationSession(cmdCtx, state.error_count);
+		armSessionReplacement(
+			() =>
+				void openFreshIterationSession(cmdCtx, state.error_count, {
+					expect: { loopToken: state.loop_token, iteration: nextIteration },
+				}),
+			{ idle },
+		);
+		markReplacementDue();
 	};
 
 	if (delaySeconds === 0) {
@@ -734,6 +802,7 @@ function handleNextPromise(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	state: RalphLoopState,
+	idle: Promise<void> | null,
 ): void {
 	const rejection = validateBundlePromise(ctx.cwd, state, "NEXT");
 	if (rejection) {
@@ -759,7 +828,7 @@ function handleNextPromise(
 		provider_recovery_fresh_fallback_used: false,
 		limit_reminders: null,
 	});
-	scheduleNextIteration(ctx, state);
+	scheduleNextIteration(ctx, state, idle);
 }
 
 export function handleLoopInput(
@@ -867,6 +936,12 @@ export function handleLoopAgentEnd(
 	messages: AgentEndMessages,
 	ctx: ExtensionContext,
 ): void {
+	// Capture the idle boundary while the run still reports active: the
+	// captured promise resolves only after the final settle drain completes
+	// (see loop/session-transition.ts). Later agent_end events in the same
+	// cascade each capture their own boundary; the extra promises are
+	// harmless because only the armed replacement decides when to dispatch.
+	const idle = captureIdle(ctx);
 	const state = getCurrentState(ctx);
 	if (!state) return;
 
@@ -929,6 +1004,14 @@ export function handleLoopAgentEnd(
 		return;
 	}
 
+	if (state.transitioning) {
+		// A NEXT was already accepted and its replacement is pending. A later
+		// agent_end from the same continuation cascade must not re-enter the
+		// promise decisions — it would double-advance the iteration. The
+		// pending transition owns the loop from here.
+		return;
+	}
+
 	resetProviderRecoveryChain();
 	updateLoopModelStateFromContext(pi, ctx);
 	const controlPromise = extractControlPromise(assistant);
@@ -941,7 +1024,7 @@ export function handleLoopAgentEnd(
 		return;
 	}
 	if (controlPromise === "NEXT") {
-		handleNextPromise(pi, ctx, state);
+		handleNextPromise(pi, ctx, state, idle);
 		return;
 	}
 	if (controlPromise === "WAIT") {
@@ -1088,7 +1171,7 @@ export async function resumeCurrentSession(
 		return;
 	}
 	if (promise === "NEXT") {
-		handleNextPromise(pi, ctx, state);
+		handleNextPromise(pi, ctx, state, null);
 		return;
 	}
 	if (promise === "WAIT") {
