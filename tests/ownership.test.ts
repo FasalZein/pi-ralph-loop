@@ -9,6 +9,7 @@ import {
 	isLoopOwnedByCurrentProcess,
 	isLoopOwnerActive,
 	LOOP_OWNER_STALE_AFTER_MS,
+	readOwnedRunningState,
 	startLoopHeartbeat,
 	stopLoopHeartbeat,
 } from "../src/loop/ownership.ts";
@@ -99,6 +100,57 @@ test("current process ownership uses only the persisted pid identity", () => {
 		),
 		false,
 	);
+});
+
+test("readOwnedRunningState returns state only for the owning process", () => {
+	const anySessionCtx = (cwd: string) => ({
+		cwd,
+		sessionManager: { getSessionId: () => "observer-session" },
+	});
+
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-owner-owned-read-"));
+	writeState(cwd, makeState({ owner_pid: process.pid }), "task");
+	assert.equal(readOwnedRunningState(anySessionCtx(cwd))?.iteration, 1);
+
+	writeState(
+		cwd,
+		makeState({
+			owner_pid: 999_999_999,
+			session_id: "owner-session",
+		}),
+		"task",
+	);
+	assert.equal(readOwnedRunningState(anySessionCtx(cwd)), null);
+
+	writeState(
+		cwd,
+		makeState({
+			owner_pid: null,
+			session_id: "owner-session",
+		}),
+		"task",
+	);
+	assert.equal(
+		readOwnedRunningState({
+			cwd,
+			sessionManager: { getSessionId: () => "owner-session" },
+		})?.iteration,
+		1,
+	);
+	assert.equal(
+		readOwnedRunningState({
+			cwd,
+			sessionManager: { getSessionId: () => "observer-session" },
+		}),
+		null,
+	);
+
+	writeState(
+		cwd,
+		makeState({ running: false, owner_pid: process.pid }),
+		"task",
+	);
+	assert.equal(readOwnedRunningState(anySessionCtx(cwd)), null);
 });
 
 test("legacy loop state uses recent session file activity only for a different startup session", () => {

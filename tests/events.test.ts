@@ -356,11 +356,36 @@ test("tool_call ignores configured tools outside a running loop", async () => {
 
 test("session_shutdown marks cancellation request", () => {
 	const h = createEventsHarness();
-	writeState(h.cwd, makeEventsState(), "task");
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
 
 	h.handlers.get("session_shutdown")?.({}, h.ctx);
 
 	assert.equal(readState(h.cwd)?.cancel_requested, true);
+});
+
+test("session_shutdown ignores a non-owner quit for legacy loops without owner pid", () => {
+	// Legacy loop.md files have no owner_pid; ownership falls back to the
+	// recorded session_id. A different session in another process quitting
+	// must not cancel the loop.
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({ session_id: "owner-session" }),
+		"task",
+	);
+
+	h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.cancel_requested, false);
+	assert.equal(state?.running, true);
 });
 
 test("session_shutdown ignores a non-owner process quitting", () => {
@@ -427,7 +452,15 @@ test("session_shutdown ignores a non-owner quit during a committed handoff", () 
 
 test("session_shutdown leaves a quit during a committed handoff resumable", () => {
 	const h = createEventsHarness();
-	writeState(h.cwd, makeEventsState({ transitioning: true }), "task");
+	writeState(
+		h.cwd,
+		makeEventsState({
+			transitioning: true,
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
 
 	h.handlers.get("session_shutdown")?.({ reason: "quit" }, h.ctx);
 
@@ -440,7 +473,15 @@ test("session_shutdown leaves a quit during a committed handoff resumable", () =
 
 test("session_shutdown preserves Ralph-managed new-session transitions", () => {
 	const h = createEventsHarness();
-	writeState(h.cwd, makeEventsState({ transitioning: true }), "task");
+	writeState(
+		h.cwd,
+		makeEventsState({
+			transitioning: true,
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
 
 	h.handlers.get("session_shutdown")?.({ reason: "new" }, h.ctx);
 
@@ -455,7 +496,15 @@ test("session_shutdown holds an authorized replacement for the grace period", as
 	process.env.RALPH_TEST_SESSION_SHUTDOWN_GRACE_MS = "80";
 	try {
 		const h = createEventsHarness();
-		writeState(h.cwd, makeEventsState({ transitioning: true }), "task");
+		writeState(
+			h.cwd,
+			makeEventsState({
+				transitioning: true,
+				owner_pid: process.pid,
+				owner_heartbeat_at: new Date().toISOString(),
+			}),
+			"task",
+		);
 
 		beginReplacement();
 		try {
@@ -527,9 +576,67 @@ test("model selection ignores foreign sessions and handoff transitions", () => {
 	assert.equal(readState(h.cwd)?.model_provider, null);
 });
 
+test("model selection ignores a non-owner process even with a matching session id", () => {
+	// A different pi process can resume the owner's session file, making its
+	// session id match the loop state. Its model/thinking selections must not
+	// overwrite the owning loop's saved model state.
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			session_id: "session-2",
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	h.handlers.get("model_select")?.(
+		{ model: { provider: "anthropic", id: "claude-sonnet" } },
+		h.ctx,
+	);
+	h.handlers.get("thinking_level_select")?.({ level: "high" }, h.ctx);
+	h.handlers.get("before_agent_start")?.({}, h.ctx);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.model_provider, null);
+	assert.equal(state?.model_id, null);
+	assert.equal(state?.thinking_level, null);
+});
+
+test("model selection still updates for the owner process regardless of session id", () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			session_id: "stale-session-id",
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	h.handlers.get("model_select")?.(
+		{ model: { provider: "anthropic", id: "claude-sonnet" } },
+		h.ctx,
+	);
+
+	const state = readState(h.cwd);
+	assert.equal(state?.model_provider, "anthropic");
+	assert.equal(state?.model_id, "claude-sonnet");
+});
+
 test("session_start restores status for Ralph-created new sessions", () => {
 	const h = createEventsHarness();
-	writeState(h.cwd, makeEventsState({ transitioning: true }), "my task prompt");
+	writeState(
+		h.cwd,
+		makeEventsState({
+			transitioning: true,
+			owner_pid: process.pid,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"my task prompt",
+	);
 
 	h.handlers.get("session_start")?.({ reason: "new" }, h.ctx);
 
@@ -540,6 +647,27 @@ test("session_start restores status for Ralph-created new sessions", () => {
 			(u) => u.key === "ralph-loop" && u.value !== undefined,
 		),
 	);
+});
+
+test("session_start does not restore loop status in a non-owner process", () => {
+	const h = createEventsHarness();
+	writeState(
+		h.cwd,
+		makeEventsState({
+			owner_pid: process.pid + 1,
+			owner_heartbeat_at: new Date().toISOString(),
+		}),
+		"task",
+	);
+
+	h.handlers.get("session_start")?.({ reason: "new" }, h.ctx);
+
+	assert.ok(
+		!h.statusUpdates.some((update) => update.key === "ralph-loop"),
+		"observer process must not show Ralph loop status",
+	);
+	assert.deepEqual(h.sentMessages, []);
+	assert.equal(readState(h.cwd)?.running, true);
 });
 
 test("session_start does nothing for non-transitioning sessions", () => {
@@ -585,9 +713,8 @@ test("session_start on startup preserves a live loop owned by another session", 
 	assert.equal(state?.stop_reason, null);
 	assert.equal(state?.transitioning, false);
 	assert.ok(
-		h.statusUpdates.some(
-			(update) => update.key === "ralph-loop" && update.value === "Ralph 2/5",
-		),
+		!h.statusUpdates.some((update) => update.key === "ralph-loop"),
+		"observer startup must not adopt the loop's status UI",
 	);
 });
 

@@ -103,3 +103,25 @@ export function isLoopOwnedByCurrentProcess(
 	if (state.owner_pid !== null) return state.owner_pid === process.pid;
 	return state.session_id === currentSessionId;
 }
+
+type SessionContextLike = {
+	cwd: string;
+	sessionManager: { getSessionId(): string };
+};
+
+/**
+ * Boundary for event/command handlers: the loop state iff a loop is running
+ * AND this process owns it. Handlers that drive or decorate the loop must read
+ * state through this helper so a foreign Pi session in the same workspace is
+ * inert by construction, not by remembering to repeat the gate.
+ */
+export function readOwnedRunningState(
+	ctx: SessionContextLike,
+): RalphLoopState | null {
+	const state = readState(ctx.cwd);
+	if (!state?.running) return null;
+	if (!isLoopOwnedByCurrentProcess(state, ctx.sessionManager.getSessionId())) {
+		return null;
+	}
+	return state;
+}

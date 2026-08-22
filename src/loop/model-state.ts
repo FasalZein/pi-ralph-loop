@@ -3,7 +3,8 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { RalphLoopState } from "../types.js";
-import { readState, updateState } from "../state.js";
+import { updateState } from "../state.js";
+import { readOwnedRunningState } from "./ownership.js";
 
 type ThinkingLevel = ReturnType<ExtensionAPI["getThinkingLevel"]>;
 
@@ -30,9 +31,11 @@ export function readCurrentLoopModelState(
 }
 
 function canUpdateLoopModelState(ctx: ExtensionContext): boolean {
-	const state = readState(ctx.cwd);
-	if (!state?.running || state.transitioning) return false;
-	return state.session_id === ctx.sessionManager.getSessionId();
+	// Ownership first: another pi process can resume the owner's session file
+	// (matching session id), but only the owning process may persist the
+	// loop's saved model state.
+	const state = readOwnedRunningState(ctx);
+	return state !== null && !state.transitioning;
 }
 
 export function updateLoopModelStateFromContext(

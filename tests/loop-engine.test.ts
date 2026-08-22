@@ -1097,6 +1097,51 @@ test("agent_end with provider error waits without injecting continue", () => {
 	assert.deepEqual(h.sentMessages, []);
 });
 
+test("agent_end in a non-owner session does not nudge, adopt, or mutate the loop", () => {
+	const h = createHarness();
+	h.writeState(
+		makeBaseState({
+			session_id: "owner-session",
+			owner_pid: 999_999_999,
+			owner_heartbeat_at: new Date().toISOString(),
+			transitioning: false,
+		}),
+	);
+
+	h.simulateAgentEnd({ text: "banana" });
+
+	assert.deepEqual(h.sentMessages, []);
+	assert.equal(
+		h.widgets.filter((w) => w.key === "ralph-loop-notice").length,
+		0,
+		"observer session must not show Ralph notices",
+	);
+	const state = h.readState();
+	assert.equal(state?.running, true);
+	assert.equal(state?.session_id, "owner-session");
+	assert.equal(state?.iteration, 1);
+	assert.equal(state?.error_count, 0);
+	assert.equal(state?.stop_reason, null);
+});
+
+test("turn_end in a non-owner session sends no Ralph limit reminders", () => {
+	const h = createHarness();
+	h.writeState(
+		makeBaseState({
+			session_id: "owner-session",
+			owner_pid: 999_999_999,
+			owner_heartbeat_at: new Date().toISOString(),
+			transitioning: false,
+		}),
+	);
+	h.setContextPercent(85);
+
+	handleLoopTurnEnd(h.pi, h.ctx);
+
+	assert.deepEqual(h.customMessages, []);
+	assert.equal(h.readState()?.limit_reminders, null);
+});
+
 test("provider error sends a recovery nudge after Pi retry wait and countdown", () => {
 	mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
 	try {

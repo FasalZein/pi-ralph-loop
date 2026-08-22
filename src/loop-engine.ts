@@ -26,6 +26,7 @@ import {
 import {
 	claimLoopOwnership,
 	getLoopOwnerFields,
+	readOwnedRunningState,
 	startLoopHeartbeat,
 } from "./loop/ownership.js";
 import {
@@ -836,8 +837,7 @@ export function handleLoopInput(
 	ctx: ExtensionContext,
 ): void {
 	if (event.source === "extension") return;
-	const state = readState(ctx.cwd);
-	if (!state?.running) return;
+	if (!readOwnedRunningState(ctx)) return;
 
 	resetPromiseNudgeChain();
 	resetProviderRecoveryChain();
@@ -853,8 +853,8 @@ export function handleLoopTurnEnd(
 		toolResults?: unknown[];
 	},
 ): void {
-	const state = readState(ctx.cwd);
-	if (!state?.running || state.transitioning) return;
+	const state = readOwnedRunningState(ctx);
+	if (!state || state.transitioning) return;
 
 	// A turn landing is proof Pi recovered after a provider-error turn, so any
 	// pending provider-error wait must be superseded here. Otherwise a recovery
@@ -942,6 +942,11 @@ export function handleLoopAgentEnd(
 	// cascade each capture their own boundary; the extra promises are
 	// harmless because only the armed replacement decides when to dispatch.
 	const idle = captureIdle(ctx);
+	// Only the process that owns the loop may drive it. Any other Pi session in
+	// this workspace (an observer window, a one-shot run, a helper) must be
+	// invisible to the loop: no nudges, no limit reminders, no promise routing,
+	// and no adopting the loop's session_id.
+	if (!readOwnedRunningState(ctx)) return;
 	const state = getCurrentState(ctx);
 	if (!state) return;
 

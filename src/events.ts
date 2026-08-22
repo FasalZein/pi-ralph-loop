@@ -5,8 +5,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { finalizeLoop } from "./loop/finalize.js";
 import {
-	isLoopOwnedByCurrentProcess,
 	isLoopOwnerActive,
+	readOwnedRunningState,
 } from "./loop/ownership.js";
 import {
 	handleLoopAgentEnd,
@@ -40,8 +40,10 @@ function getBlockedToolReason(toolName: string): string {
 }
 
 function restoreLoopStatus(ctx: ExtensionContext): void {
-	const state = readState(ctx.cwd);
-	if (!state?.running) return;
+	// Status is a window into the running loop; only the owning process gets
+	// it. An observer session in the same workspace stays visually Ralph-free.
+	const state = readOwnedRunningState(ctx);
+	if (!state) return;
 
 	ctx.ui.setStatus(
 		"ralph-loop",
@@ -53,13 +55,8 @@ function handleSessionBeforeSwitch(
 	event: { reason: "new" | "resume" },
 	ctx: ExtensionContext,
 ) {
-	const state = readState(ctx.cwd);
-	if (
-		!state?.running ||
-		!isLoopOwnedByCurrentProcess(state, ctx.sessionManager.getSessionId())
-	) {
-		return;
-	}
+	const state = readOwnedRunningState(ctx);
+	if (!state) return;
 
 	if (event.reason === "resume") {
 		ctx.ui.notify(
@@ -87,13 +84,8 @@ function handleBlockedSessionMutation(
 	commandName: "fork" | "tree",
 	ctx: ExtensionContext,
 ) {
-	const state = readState(ctx.cwd);
-	if (
-		!state?.running ||
-		!isLoopOwnedByCurrentProcess(state, ctx.sessionManager.getSessionId())
-	) {
-		return;
-	}
+	const state = readOwnedRunningState(ctx);
+	if (!state) return;
 
 	ctx.ui.notify(
 		`Ralph loop is running. /${commandName} is blocked. Use another pi instance or /ralph-stop.`,
@@ -118,16 +110,16 @@ async function handleSessionShutdown(
 	ctx: ExtensionContext,
 ) {
 	const cwd = ctx.cwd;
-	const state = readState(cwd);
-	if (!state?.running) return;
+	const state = readOwnedRunningState(ctx);
+	if (!state) return;
 
-	// Only the loop's owner process may cancel it by shutting down. Any other
-	// pi process in this workspace (a one-shot `pi -p`, a helper spawned by some
+	// Only the loop's owner may cancel it by shutting down. Any other pi
+	// process in this workspace (a one-shot `pi -p`, a helper spawned by some
 	// extension, an observer session, or a second `pi` window) that exits is a
-	// no-op — its pid differs from the recorded owner_pid. owner_pid is the
-	// identity gate; crash/reboot recovery is handled separately by the heartbeat
-	// on session_start, so do not treat pid alone as a liveness proof.
-	if (state.owner_pid !== null && state.owner_pid !== process.pid) return;
+	// no-op — it neither matches the recorded owner_pid nor, for legacy states
+	// without one, the saved session_id. Owner identity is the gate inside
+	// readOwnedRunningState; crash/reboot recovery is handled separately by the
+	// heartbeat on session_start, so identity alone is not a liveness proof.
 
 	// During an authorized fresh-session replacement, hold the outgoing ctx
 	// alive briefly: other extensions may finish short deferred work from
