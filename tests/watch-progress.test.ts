@@ -216,3 +216,58 @@ test("a Failed description is not an extra check execution", () => {
 	assert.equal(fields?.failed?.exit, 1);
 	assert.deepEqual(fields?.checks, [{ cmd: "verify", exits: [1, 0], detail: null }]);
 });
+
+test("in-sentence name exit=N rows are found once each and in order", () => {
+	const fields = parseProgress("# X10 passed: gates\n- Gate table: types exit=0, tests exit=0, lint exit=1.")[0].fields;
+	assert.deepEqual(fields?.checks.map((c) => [c.cmd, c.exits]), [["types", [0]], ["tests", [0]], ["lint", [1]]]);
+});
+
+test("a fence indented four spaces in a nested list is a proof block for fields only", () => {
+	const raw = [
+		"# X11 passed: nested proof",
+		"- Proof:",
+		"  - Compared outputs:",
+		"    ```text",
+		"    IDENTICAL alpha",
+		"    CHANGED beta",
+		"    ```",
+		"    ```",
+		"    types exit=0",
+		"    ```",
+	].join("\n");
+	const cards = parseProgress(raw);
+	assert.deepEqual(cards[0].fields?.proof, { identical: 1, total: 2 });
+	assert.deepEqual(cards[0].fields?.checks.map((c) => c.cmd), ["types"]);
+	// Splitting stays strict: a four-space fence does not hide a later heading.
+	const split = parseProgress("# X12 passed: a\n    ```\n# X13 blocked: b\n");
+	assert.deepEqual(split.map((c) => c.id), ["X12", "X13"]);
+});
+
+test("the per-file analysis budget nulls later fields but keeps raw, id, outcome and resolution", () => {
+	// Each entry is ~40 KiB, so the 64 KiB file budget covers the first and part of the second.
+	const pad = "- note " + "x".repeat(40 * 1_024) + "\n";
+	const entry = (id: string, outcome: string) => `# ${id} ${outcome}: work\n- Diagnosis: Cause here.\n${pad}`;
+	const raw = entry("A", "blocked") + entry("B", "passed") + entry("C", "blocked") + entry("A", "passed");
+	const cards = parseProgress(raw);
+	assert.equal(cards.length, 4);
+	assert.equal(cards[0].fields?.cause, "Cause here.");
+	assert.equal(cards[1].fields?.cause, "Cause here.");
+	assert.equal(cards[2].fields, null);
+	assert.equal(cards[3].fields, null);
+	assert.deepEqual(cards.map((c) => [c.id, c.outcome]), [["A", "blocked"], ["B", "passed"], ["C", "blocked"], ["A", "passed"]]);
+	assert.equal(cards[0].resolvedBy, 3);
+	assert.equal(cards.map((c) => c.raw).join(""), raw);
+});
+
+test("many whitespace-adversarial backtick entries parse within one second", (t) => {
+	// Eight capped-length lines of a backtick command followed by spaces, per entry.
+	const entry = "# W passed: spaces\n" + ("- `npm test`" + " ".repeat(7_900) + "x\n").repeat(8);
+	const raw = entry.repeat(16);
+	const started = performance.now();
+	const cards = parseProgress(raw);
+	const elapsed = performance.now() - started;
+	t.diagnostic(`whitespace parse: ${elapsed.toFixed(3)} ms`);
+	assert.ok(elapsed < 1_000, `whitespace parse took ${elapsed.toFixed(3)} ms`);
+	assert.equal(cards.length, 16);
+	assert.equal(cards.map((c) => c.raw).join(""), raw);
+});

@@ -364,7 +364,7 @@ const GIT_TIMEOUT_MS = 5_000;
 const GIT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 function gitRead(root: string, field: string, args: string[]): string {
-	return boundary(field, () => execFileSync("git", args, {
+	return boundary(field, () => execFileSync("git", ["--no-optional-locks", ...args], {
 		cwd: root, encoding: "utf8", shell: false, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_OUTPUT_BYTES,
 		stdio: ["ignore", "pipe", "pipe"],
 	}).trim());

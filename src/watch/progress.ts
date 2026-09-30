@@ -42,6 +42,12 @@ export function parseProgress(text: string): readonly AttemptCard[] {
 	let fenceLength: number | null = null;
 	let entryLevel = 0;
 	let itemEntry = false;
+	let budget = MAX_FILE_ANALYSIS_LENGTH;
+	const push = (raw: string) => {
+		const card = parseEntry(raw, cards.length, budget);
+		budget -= Math.min(raw.length, MAX_ENTRY_ANALYSIS_LENGTH);
+		cards.push(card);
+	};
 	for (const line of normalized.split("\n")) {
 		const marker = fenceMarker(line, fenceLength);
 		if (marker !== null) fenceLength = fenceLength === null ? marker : null;
@@ -52,7 +58,7 @@ export function parseProgress(text: string): readonly AttemptCard[] {
 				const level = heading[1].length;
 				if (!itemEntry || isItem || level <= entryLevel) {
 					if (offset > start && normalized.slice(start, offset).trim()) {
-						cards.push(parseEntry(normalized.slice(start, offset), cards.length));
+						push(normalized.slice(start, offset));
 					}
 					start = offset;
 					entryLevel = level;
@@ -62,7 +68,7 @@ export function parseProgress(text: string): readonly AttemptCard[] {
 		}
 		offset += line.length + 1;
 	}
-	if (normalized.slice(start).trim()) cards.push(parseEntry(normalized.slice(start), cards.length));
+	if (normalized.slice(start).trim()) push(normalized.slice(start));
 	const laterPass = new Map<string, number>();
 	for (let i = cards.length - 1; i >= 0; i--) {
 		const card = cards[i];
@@ -77,26 +83,39 @@ export function latestCard(cards: readonly AttemptCard[]): AttemptCard | null {
 	return cards.at(-1) ?? null;
 }
 
-function parseEntry(raw: string, index: number): AttemptCard {
+function parseEntry(raw: string, index: number, budget: number): AttemptCard {
 	const heading = clean(raw.split("\n", 1)[0].slice(0, MAX_ANALYSIS_LENGTH)).match(/^#{1,6}\s+(.+?)\s*$/)?.[1];
 	const item = heading?.match(ITEM_HEADING);
 	return {
 		index, id: item?.[1] ?? null,
 		outcome: item ? (item[2].toLowerCase() === "passed" ? "passed" : "blocked") : "unknown",
 		title: item?.[3] ?? heading ?? "", date: item?.[4] ?? null,
-		raw, fields: heading ? safeAnalyse(raw) : null, resolvedBy: null,
+		raw, fields: heading && budget > 0 ? safeAnalyse(raw.slice(0, Math.min(budget, MAX_ENTRY_ANALYSIS_LENGTH))) : null, resolvedBy: null,
 	};
 }
 
 // Bound both line and total entry analysis; later fields remain available in raw.
 const MAX_ANALYSIS_LENGTH = 8_000;
 const MAX_ENTRY_ANALYSIS_LENGTH = 64 * 1_024;
+// Shared heuristic allowance for the whole file (owner, 2026-09-30). Cards past it
+// keep raw, id, outcome and resolution links; only fields become null. It bounds
+// field-analysis CPU, not entry splitting or raw retention.
+const MAX_FILE_ANALYSIS_LENGTH = 64 * 1_024;
 
-/** Backtick fence markers follow CommonMark info-string and closing-run rules. */
-function fenceMarker(line: string, openLength: number | null): number | null {
+/**
+ * Backtick fence markers follow CommonMark info-string and closing-run rules.
+ * Entry splitting uses strict indentation; field extraction accepts any
+ * indentation so fences nested in lists still delimit proof blocks.
+ */
+const FENCE_OPEN = /^ {0,3}(`{3,})([^`]*)$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,})[ \t]*$/;
+const FENCE_OPEN_ANY = /^[ \t]*(`{3,})([^`]*)$/;
+const FENCE_CLOSE_ANY = /^[ \t]*(`{3,})[ \t]*$/;
+
+function fenceMarker(line: string, openLength: number | null, anyIndent = false): number | null {
 	const marker = openLength === null
-		? line.match(/^ {0,3}(`{3,})([^`]*)$/)
-		: line.match(/^ {0,3}(`{3,})[ \t]*$/);
+		? line.match(anyIndent ? FENCE_OPEN_ANY : FENCE_OPEN)
+		: line.match(anyIndent ? FENCE_CLOSE_ANY : FENCE_CLOSE);
 	if (!marker || (openLength !== null && marker[1].length < openLength)) return null;
 	return marker[1].length;
 }
@@ -140,7 +159,7 @@ function analyse(raw: string): CardFields | null {
 	const proofLines = new Set<string>();
 	let fenceLength: number | null = null;
 	for (const original of raw.slice(0, MAX_ENTRY_ANALYSIS_LENGTH).split("\n").slice(1)) {
-		const marker = fenceMarker(original, fenceLength);
+		const marker = fenceMarker(original, fenceLength, true);
 		if (marker !== null) {
 			fenceLength = fenceLength === null ? marker : null;
 			continue;
@@ -211,9 +230,9 @@ function analyse(raw: string): CardFields | null {
 function collectChecks(text: string, checks: Map<string, { cmd: string; exits: number[]; detail: string | null }>): void {
 	const hits: { cmd: string; at: number; exit: number; detail: string | null }[] = [];
 	const patterns = [
-		/`([^`]{2,200})`\s*,?\s*(?:exit(?:ed|s)?(?: code)?)[=\s]+(\d+)/gi,
+		/`([^`]{2,200})`\s*(?:,\s*)?(?:exit(?:ed|s)?(?: code)?)[=\s]+(\d+)/gi,
 		/((?:bun|npm|pnpm|yarn)\s+(?:run\s+)?[\w:.-]+(?:\s+--\s+[\w/.-]+)?)\s+exit(?:ed|s)?(?: code)?[=\s]+(\d+)/gi,
-		/^([\w:.-]+)[ \t]+exit=(\d+)/g,
+		/(?<![\w:.-])([\w:.-]+)[ \t]+exit=(\d+)/g,
 	];
 	const detailAfter = (end: number): string | null => {
 		const detail = text.slice(end).match(/^\s*[:,]?\s*([^.;]{3,80})/)?.[1]?.trim();
