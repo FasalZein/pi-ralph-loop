@@ -190,7 +190,7 @@ test("review-10: after a good read, failed sources show retained values marked r
 		f.state(true, T("10:00"));
 		const good = await reader.read();
 		const fresh = { status: "fresh", error: null };
-		assert.deepEqual(good.sources, { state: fresh, items: fresh, progress: fresh, git: fresh, history: fresh });
+		assert.deepEqual(good.sources, { state: fresh, items: fresh, progress: fresh, git: fresh, history: fresh, journal: { status: "unavailable", error: ".ralph/journal.jsonl not found" } });
 		assert.equal(good.retained.items, null);
 		writeFileSync(path.join(f.root, ".ralph/items.json"), "{");
 		writeFileSync(path.join(f.root, ".ralph/loop.md"), "---\nrunning: true\n");

@@ -10,10 +10,13 @@ import type { BundleItem } from "../bundle/types.js";
 import { readStateDocument } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
+import { parseJournal } from "./journal.js";
+import { deriveTimeline } from "./timeline.js";
+import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
 	CommitEvent, GitObservation, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
-	ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
+	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
 } from "./types.js";
 
 const LOOP_FILE = ".ralph/loop.md";
@@ -118,7 +121,9 @@ export type LoopObservation = {
 	readonly progress: Result<readonly AttemptCard[]> | null;
 	readonly git: Result<HeadInfo>;
 	readonly history: Result<readonly CommitEvent[]>;
-	/** Run starts with their source. The journal (T8) will add records here. */
+	readonly journal: Result<JournalView>;
+	readonly counterBaseline: CounterBaseline | null;
+	/** State run starts observed by this reader; fresh journal starts are merged during derivation. */
 	readonly runStarts: readonly RunStart[];
 	/** Committed progress cards per commit SHA, for pass commits and their first parents. */
 	readonly progressAt: ReadonlyMap<string, readonly AttemptCard[] | null>;
@@ -152,7 +157,7 @@ function freeze<T>(value: T): T {
 	return value;
 }
 
-const RETAINED_KEY = { state: "state", items: "items", progress: "attempts", git: "git", history: "history" } as const satisfies Record<SourceName, keyof RetainedValues>;
+const RETAINED_KEY = { state: "state", items: "items", progress: "attempts", git: "git", history: "history", journal: "journal" } as const satisfies Record<SourceName, keyof RetainedValues>;
 
 /**
  * Pure derivation: no filesystem, subprocess or clock access. Single rule:
@@ -161,9 +166,9 @@ const RETAINED_KEY = { state: "state", items: "items", progress: "attempts", git
  */
 export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	const issues: Issue[] = [...o.issues];
-	const results: Record<SourceName, Result<unknown> | null> = { state: o.state, items: o.items, progress: o.progress, git: o.git, history: o.history };
+	const results: Record<SourceName, Result<unknown> | null> = { state: o.state, items: o.items, progress: o.progress, git: o.git, history: o.history, journal: o.journal };
 	const sources = {} as Record<SourceName, SourceReport>;
-	const retained = { state: null, items: null, attempts: null, git: null, history: null } as { -readonly [K in keyof RetainedValues]: RetainedValues[K] };
+	const retained = { state: null, items: null, attempts: null, git: null, history: null, journal: null } as { -readonly [K in keyof RetainedValues]: RetainedValues[K] };
 	for (const name of Object.keys(results) as SourceName[]) {
 		const r = results[name];
 		const key = RETAINED_KEY[name];
@@ -263,16 +268,29 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		itemAttempts[key] = [...open, ...rest];
 	}
 
+	const journal = o.journal.status === "fresh" ? o.journal.value : null;
+	const starts = new Map((journal?.runs ?? []).map((r) => [JSON.stringify([r.loopToken, r.startedAt]), r]));
+	for (const r of o.runStarts) {
+		const key = JSON.stringify([r.loopToken, r.startedAt]);
+		if (!starts.has(key)) starts.set(key, r);
+	}
+	const mergedStarts = [...starts.values()].sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+	const launchId = state ? [...(journal?.records ?? [])].reverse().find((r) => r.k === "loop" && r.tok === state.loop_token)?.r
+		?? [...(journal?.launches ?? [])].reverse().find((r) => Date.parse(r.at) > Date.parse(state.started_at))?.launchId ?? null : null;
+	const timing = deriveTimeline({ commits, runs: mergedStarts, journal, state, items, item: currentItem ?? stoppedItem, now: o.observedAt });
+	issues.push(...timing.issues);
+	const health = deriveHealth(state, o.issues.some((i) => i.source === "state" && i.kind === "missing"), journal, Date.parse(o.observedAt), o.counterBaseline, launchId);
 	return freeze({
 		root: o.root,
 		observedAt: o.observedAt,
 		mission: o.mission,
 		task: o.mission?.task.kind ?? (state ? (state.bundle_mode ? "bundle" : "plain") : null),
-		run: { launchId: null, loopToken: state?.loop_token ?? null, startedAt: state?.started_at ?? null },
+		run: { launchId, loopToken: state?.loop_token ?? null, startedAt: state?.started_at ?? null },
 		state,
 		items, currentItem, stoppedItem, attempts, itemAttempts,
-		runStarts: [...o.runStarts],
-		historyComplete: false,
+		runStarts: mergedStarts,
+		historyComplete: timing.timeline.coverage.complete,
+		timeline: timing.timeline, health,
 		git: head ? { ...head, commits } : null,
 		sources,
 		retained,
@@ -351,7 +369,11 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	// Bytes read in this observation, shared by the worktree fingerprint and the progress parser.
 	let observed = new Map<string, { stamp: FileStamp; bytes: Buffer }>();
 	const runStarts: RunStart[] = [];
-	const lastGood: { -readonly [K in keyof RetainedValues]: RetainedValues[K] } = { state: null, items: null, attempts: null, git: null, history: null };
+	const lastGood: { -readonly [K in keyof RetainedValues]: RetainedValues[K] } = { state: null, items: null, attempts: null, git: null, history: null, journal: null };
+	let counterBaseline: CounterBaseline | null = null;
+	type JournalCache = { stamp: FileStamp; offset: number; carry: Buffer; records: JournalRecord[]; badLines: number; prefixHash: string };
+	let journalLive: JournalCache | null = null;
+	let journalRotated: JournalCache | null = null;
 	let queue: Promise<unknown> = Promise.resolve();
 	let closed = false;
 	let active: AbortController | null = null;
@@ -460,6 +482,66 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		return { result: fresh(progress.cards), stamp };
 	}
 
+	const identity = (a: FileStamp | null, b: FileStamp | null) => a === null || b === null ? a === b : a.dev === b.dev && a.ino === b.ino;
+	async function journalFile(rel: string, stamp: FileStamp | null, cache: JournalCache | null, final: boolean, issues: Issue[]): Promise<JournalCache | null> {
+		if (!stamp) return null;
+		if (cache && identity(cache.stamp, stamp) && sameFile(cache.stamp, stamp)) return cache;
+		let prefix: Buffer | null = null;
+		if (cache && identity(cache.stamp, stamp)) {
+			// Checking the old prefix is necessary to distinguish an append from a rewrite plus append.
+			prefix = stamp.size >= cache.offset ? await rt.readRange(file(rel), 0, cache.offset) : null;
+			if (stamp.size < cache.offset || !prefix || sha256(prefix) !== cache.prefixHash) {
+				issues.push({ source: "journal", kind: "partial", detail: "journal truncated or rewritten; reparsed" });
+				cache = null;
+			}
+		} else cache = null;
+		const offset = cache?.offset ?? 0;
+		const bytes = await rt.readRange(file(rel), offset, stamp.size);
+		if (bytes.length !== stamp.size - offset) throw new Error("short journal read");
+		const joined = Buffer.concat([cache?.carry ?? Buffer.alloc(0), bytes]);
+		const newline = joined.lastIndexOf(10);
+		const complete = joined.subarray(0, newline + 1);
+		const carry = joined.subarray(newline + 1);
+		const parsed = parseJournal(new StringDecoder("utf8").write(complete));
+		// Invalid timestamps cannot be timing evidence even when the wire shape is valid.
+		const records = parsed.records.filter((r) => Number.isFinite(Date.parse(r.t)) && (r.k !== "loop" || Number.isFinite(Date.parse(r.sa))));
+		return { stamp, offset: stamp.size, carry: final ? Buffer.alloc(0) : carry,
+			records: [...(cache?.records ?? []), ...records],
+			badLines: (cache?.badLines ?? 0) + parsed.badLines + parsed.records.length - records.length + (final && carry.length ? 1 : 0),
+			prefixHash: sha256(Buffer.concat([cache && prefix ? prefix : Buffer.alloc(0), bytes])),
+		};
+	}
+	async function readJournalSource(issues: Issue[]): Promise<Sourced<JournalView>> {
+		const live = await rt.stat(file(".ralph/journal.jsonl"));
+		const rotated = await rt.stat(file(".ralph/journal.1.jsonl"));
+		if (!live && !rotated) { journalLive = null; journalRotated = null; return missing("journal", ".ralph/journal.jsonl", issues); }
+		if (journalLive && !identity(journalLive.stamp, live)) {
+			if (rotated && identity(journalLive.stamp, rotated)) journalRotated = journalLive;
+			else {
+				journalRotated = null;
+				issues.push({ source: "journal", kind: "partial", detail: "rotation not followed; reparsed" });
+			}
+			journalLive = null;
+		}
+		journalRotated = await journalFile(".ralph/journal.1.jsonl", rotated, journalRotated, true, issues);
+		// Finalize a trailing partial line in an unchanged former live file.
+		if (journalRotated?.carry.length) journalRotated = { ...journalRotated, carry: Buffer.alloc(0), badLines: journalRotated.badLines + 1 };
+		journalLive = await journalFile(".ralph/journal.jsonl", live, journalLive, false, issues);
+		const headers = new Set<string>();
+		const records = [...(journalRotated?.records ?? []), ...(journalLive?.records ?? [])].filter((r) => {
+			if (r.k !== "run") return true;
+			const key = JSON.stringify([r.r, r.t]);
+			if (headers.has(key)) return false;
+			headers.add(key); return true;
+		});
+		const badLines = (journalRotated?.badLines ?? 0) + (journalLive?.badLines ?? 0);
+		if (badLines) issues.push({ source: "journal", kind: "partial", detail: `${badLines} invalid journal lines` });
+		const launches = records.flatMap((r) => r.k === "run" ? [{ launchId: r.r, at: r.t }] : []);
+		const runs: RunStart[] = records.flatMap((r) => r.k === "loop" ? [{ source: "journal" as const, loopToken: r.tok, startedAt: r.sa }] : []);
+		const stops: JournalView["stops"] = records.flatMap((r) => r.k === "d" && (r.e === "exit" || r.e === "pi-exit") ? [{ at: r.t, launchId: r.r, kind: r.e }] : []);
+		return { stamp: live, result: fresh(freeze({ records, launches, runs, stops, badLines, rotated: rotated !== null, coverageStart: records[0]?.t ?? null })) };
+	}
+
 	/**
 	 * HEAD, branch, index bytes and the content and mode of every modified,
 	 * deleted or untracked nonignored path. Any failure except the detached-HEAD
@@ -478,7 +560,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		const indexPath = path.resolve(root, (await rt.git(root, ["rev-parse", "--git-path", "index"], signal)).trim());
 		const indexStamp = await rt.stat(indexPath);
 		const index = indexStamp ? sha256(await rt.readRange(indexPath, 0)) : "absent";
-		const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter(Boolean))].sort();
+		const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl"))].sort();
 		const content: string[] = [];
 		for (const rel of dirty) {
 			const full = path.join(root, rel);
@@ -589,7 +671,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		observed = new Map();
 		const failed = (error: string): LoopObservation => ({
 			root, observedAt, mission, state: unavailable(error), items: unavailable(error), progress: unavailable(error),
-			git: unavailable(error), history: unavailable(error), runStarts, progressAt: new Map(), lastGood, issues,
+			git: unavailable(error), history: unavailable(error), journal: unavailable(error), counterBaseline, runStarts, progressAt: new Map(), lastGood, issues,
 		});
 		try {
 			signal.throwIfAborted();
@@ -605,6 +687,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				issues.push({ source: "git", kind: "unavailable", detail: message(error) });
 				git = unavailable(message(error));
 			}
+			const journalRead = await guarded("journal", signal, () => readJournalSource(issues), issues);
 			const state = await guarded("state", signal, () => readStateFile(issues), issues);
 			const bundle = mission ? mission.task.kind === "bundle" : state.result.status === "fresh" ? state.result.value.bundle_mode : existsSync(file(ITEMS_FILE));
 			const items = bundle ? await guarded("items", signal, () => readItems(issues), issues) : null;
@@ -645,6 +728,15 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 					return unavailable(message(error));
 				}
 			};
+			let journalResult = journalRead.result;
+			if (journalResult.status === "fresh") {
+				try {
+					if (!identity(journalRead.stamp, await rt.stat(file(".ralph/journal.jsonl")))) {
+						issues.push({ source: "journal", kind: "concurrent", detail: "journal rotated during observation" });
+						journalResult = unavailable("journal rotated during observation");
+					}
+				} catch (error) { journalResult = unavailable(message(error)); issues.push({ source: "journal", kind: "unavailable", detail: message(error) }); }
+			}
 			const stateResult = (await recheck("state", LOOP_FILE, state))!;
 			const itemsResult = await recheck("items", ITEMS_FILE, items);
 			const progressResult = await recheck("progress", PROGRESS_FILE, cards);
@@ -658,8 +750,13 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			}
 			const snapshot = deriveLoopSnapshot({
 				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
-				git, history, runStarts, progressAt: progressAtPass, lastGood, issues,
+				git, history, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
+			if (journalResult.status === "fresh") lastGood.journal = { value: journalResult.value, observedAt };
+			if (stateResult.status === "fresh") {
+				const s = stateResult.value;
+				counterBaseline = { launchId: snapshot.run.launchId, loopToken: s.loop_token, startedAt: s.started_at, errors: s.error_count, bundleRejections: s.bundle_rejection_count };
+			}
 			remember(snapshot);
 			return snapshot;
 		} catch (error) {
@@ -687,7 +784,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				if (closed) {
 					const error = unavailable("reader closed");
 					return deriveLoopSnapshot({
-						root, observedAt: rt.now().toISOString(), mission, state: error, items: error, progress: error, git: error, history: error,
+						root, observedAt: rt.now().toISOString(), mission, state: error, items: error, progress: error, git: error, history: error, journal: error, counterBaseline,
 						runStarts, progressAt: new Map(), lastGood, issues: [{ source: "observer", kind: "unavailable", detail: "reader closed" }],
 					});
 				}

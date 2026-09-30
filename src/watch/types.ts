@@ -178,9 +178,9 @@ export type CommitEvent = {
 	readonly passesKnown: boolean;
 };
 
-/** A run start. Sources other than loop.md (the journal) are a later seam. */
+/** A run start identified by token and original start time. */
 export type RunStart = {
-	readonly source: "state";
+	readonly source: "state" | "journal";
 	readonly loopToken: string;
 	readonly startedAt: string;
 };
@@ -194,7 +194,7 @@ export type GitObservation = {
 };
 
 /** `history` is the base..HEAD commit inspection, separate from HEAD/branch (`git`). */
-export type SourceName = "state" | "items" | "progress" | "git" | "history";
+export type SourceName = "state" | "items" | "progress" | "git" | "history" | "journal";
 
 /**
  * One report shape for every source.
@@ -218,6 +218,7 @@ export type RetainedValues = {
 	readonly attempts: Retained<readonly ObservedAttempt[]>;
 	readonly git: Retained<GitObservation>;
 	readonly history: Retained<readonly CommitEvent[]>;
+	readonly journal: Retained<JournalView>;
 };
 
 export type LoopSnapshot = {
@@ -237,8 +238,10 @@ export type LoopSnapshot = {
 	/** Per item key: unresolved blocked cards first, then newest file index first. */
 	readonly itemAttempts: Readonly<Record<string, readonly ObservedAttempt[]>>;
 	readonly runStarts: readonly RunStart[];
-	/** False until durable run history (journal) exists; only starts seen by this reader are listed. */
-	readonly historyComplete: false;
+	/** True only when durable timing coverage is complete. */
+	readonly historyComplete: boolean;
+	readonly timeline: Timeline;
+	readonly health: Health;
 	/** Fresh, consistent git evidence; null when git failed or changed during the read. */
 	readonly git: GitObservation | null;
 	readonly sources: Readonly<Record<SourceName, SourceReport>>;
@@ -292,3 +295,36 @@ export type JournalRecord = JournalBase & (
 	| { readonly k: "x"; readonly op: "stop" | "steer"; readonly id: string | null; readonly ok: 0 | 1; readonly why?: string; readonly txt?: string; readonly part?: number }
 	| { readonly k: "d"; readonly e: (typeof DRIVER_JOURNAL_EVENTS)[number]; readonly c?: number | null; readonly why?: string }
 );
+
+export type JournalView = {
+	readonly records: readonly JournalRecord[];
+	readonly launches: readonly { readonly launchId: string; readonly at: string }[];
+	readonly runs: readonly RunStart[];
+	readonly stops: readonly { readonly at: string; readonly launchId: string; readonly kind: "exit" | "pi-exit" }[];
+	readonly badLines: number;
+	readonly rotated: boolean;
+	readonly coverageStart: string | null;
+};
+export type Boundary = { readonly at: string; readonly kind: "run-start" | "item-pass" | "blocker" | "parent"; readonly sha: string | null; readonly item: string | null };
+export type Span = { readonly from: string; readonly to: string | null; readonly known: boolean };
+export type Duration = { readonly ms: number; readonly from: string; readonly to: string; readonly sha: string } | { readonly ms: null; readonly reason: string };
+export type Timeline = {
+	readonly coverage: { readonly start: string | null; readonly complete: boolean; readonly reason: string | null };
+	readonly boundaries: readonly Boundary[];
+	readonly stopped: readonly Span[];
+	readonly elapsed: { readonly wallMs: number; readonly activeMs: number | null } | null;
+	readonly currentItem: { readonly key: string; readonly since: Boundary; readonly ms: number } | { readonly key: string; readonly ms: null; readonly reason: string } | null;
+	readonly durations: Readonly<Record<string, Duration>>;
+	readonly eta: { readonly estimateMs: number | null; readonly n: number; readonly itemsLeft: number };
+};
+export type Counter = { readonly value: number; readonly previous: number | null; readonly rising: boolean };
+export type Health = {
+	readonly state: "running" | "stale" | "stopped" | "not-started" | "unknown";
+	readonly heartbeatAgeMs: number | null;
+	readonly stale: boolean | null;
+	readonly stopped: { readonly reason: string | null; readonly at: string | null } | null;
+	readonly lastJournalAt: string | null;
+	readonly stalled: "unavailable";
+	/** Null when state is not fresh; retained counters never feed comparisons. */
+	readonly counters: { readonly errors: Counter; readonly bundleRejections: Counter } | null;
+};

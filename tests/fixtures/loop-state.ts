@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,7 +20,7 @@ export class Fixture {
 		this.git("init", "-q");
 		this.git("commit", "--allow-empty", "-qm", "initial");
 		mkdirSync(path.join(this.root, ".ralph"));
-		writeFileSync(path.join(this.root, ".gitignore"), ".ralph/loop.md\n");
+		writeFileSync(path.join(this.root, ".gitignore"), ".ralph/loop.md\n.ralph/journal*.jsonl\n");
 		for (const f of ["plan.md", "prompt.md"]) writeFileSync(path.join(this.root, ".ralph", f), "text\n");
 		if (opts.mission !== false) {
 			writeFileSync(path.join(this.root, ".ralph/mission.json"), JSON.stringify({
@@ -73,6 +73,10 @@ export class Fixture {
 			provider_recovery_fresh_fallback_used: false, limit_reminders: null, ...extra,
 		}, "task");
 	}
+	journal(records: readonly import("../../src/watch/types.js").JournalRecord[], file = "journal.jsonl"): void {
+		writeFileSync(path.join(this.root, ".ralph", file), records.map((r) => JSON.stringify(r) + "\n").join(""));
+	}
+	appendJournalRaw(text: string | Buffer): void { appendFileSync(path.join(this.root, ".ralph/journal.jsonl"), text); }
 	close(): void { rmSync(this.root, { recursive: true, force: true }); }
 }
 
