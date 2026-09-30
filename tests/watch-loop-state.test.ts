@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -486,10 +486,9 @@ test("large progress reads: unchanged polls read nothing; a changed file is read
 		appendFileSync(path.join(f.root, ".ralph/progress.md"), euro.subarray(euro.length - 3));
 		const s = await reader.read();
 		// Each changed poll reads the file once; the old prefix is hash-verified, not trusted.
-		// The worktree fingerprint also hashes the now-dirty file once per change (end undefined).
+		// One full read per change, shared by the worktree fingerprint and the parser (owner rule).
 		assert.deepEqual(ranges.filter((r) => r[0] === "progress.md"), [
-			["progress.md", 0, undefined], ["progress.md", 0, size + euro.length - 3],
-			["progress.md", 0, undefined], ["progress.md", 0, size + euro.length],
+			["progress.md", 0, size + euro.length - 3], ["progress.md", 0, size + euro.length],
 		]);
 		// An unchanged dirty file is not reread by the source or the fingerprint.
 		ranges.length = 0;
@@ -658,7 +657,7 @@ test("review-1: a relaunch in ignored loop.md during the git window withholds ac
 		let s = await reader.read();
 		assert.ok(s.issues.some((i) => i.source === "state" && i.kind === "concurrent"));
 		assert.equal(s.state, null);
-		assert.equal(s.sources.state, "unavailable");
+		assert.equal(s.sources.state.status, "unavailable");
 		assert.deepEqual(statuses(s), { A: "pending" });
 		s = await reader.read();
 		assert.deepEqual([s.run.loopToken, statuses(s)], ["run-b", { A: "retry" }]);
@@ -819,32 +818,28 @@ test("review-9: an item key __proto__ is an own, frozen itemAttempts entry", asy
 	} finally { f.close(); }
 });
 
-test("review-10: after a good read, failed sources show retained values marked stale, never fresh", async () => {
+test("review-10: after a good read, failed sources show retained values marked retained, never fresh", async () => {
 	const f = new Fixture([{ id: "A", passes: false }]);
 	let appendDuringRead = false;
-	const runtime: ObservationRuntime = {
-		...clock(),
-		async readRange(file, start, end) {
-			const out = await defaultRuntime.readRange(file, start, end);
-			if (appendDuringRead && file.endsWith("progress.md") && end !== undefined) { appendDuringRead = false; appendFileSync(file, "# A blocked: racing\n"); }
-			return out;
-		},
-	};
-	const reader = openLoop(f.root, { runtime });
+	// Appends after the progress read (during the git history window).
+	const runtime = midRead(() => { if (appendDuringRead) appendFileSync(path.join(f.root, ".ralph/progress.md"), "# A blocked: racing\n"); });
+	const reader = openLoop(f.root, { runtime: { ...runtime, git: (r, a, sig) => (a[0] === "rev-list" && !appendDuringRead ? defaultRuntime.git(r, a, sig) : runtime.git(r, a, sig)) } });
 	try {
 		f.block("A", T("10:05"));
 		f.state(true, T("10:00"));
 		const good = await reader.read();
-		assert.deepEqual(good.sources, { state: "fresh", items: "fresh", progress: "fresh", git: "fresh" });
+		const fresh = { status: "fresh", error: null };
+		assert.deepEqual(good.sources, { state: fresh, items: fresh, progress: fresh, git: fresh, history: fresh });
 		assert.equal(good.retained.items, null);
 		writeFileSync(path.join(f.root, ".ralph/items.json"), "{");
 		writeFileSync(path.join(f.root, ".ralph/loop.md"), "---\nrunning: true\n");
 		appendFileSync(path.join(f.root, ".ralph/progress.md"), "# A blocked: new\n");
 		appendDuringRead = true;
 		const s = await reader.read();
-		assert.equal(s.sources.items, "stale");
-		assert.equal(s.sources.state, "stale");
-		assert.equal(s.sources.progress, "stale");
+		assert.equal(s.sources.items.status, "retained");
+		assert.equal(s.sources.state.status, "retained");
+		assert.equal(s.sources.progress.status, "retained");
+		assert.match(s.sources.progress.error ?? "", /changed during/);
 		assert.deepEqual(s.items, []);
 		assert.equal(s.state, null);
 		assert.deepEqual(s.attempts, []);
@@ -874,4 +869,157 @@ test("review-11: an invalid committer timestamp is an issue and never a boundary
 		assert.ok(s.issues.some((i) => i.source === "git" && i.detail === `invalid committer timestamp at ${oid}`));
 		assert.deepEqual(statuses(s), { A: "stopped" });
 	} finally { f.close(); }
+});
+
+// ---- Re-review regressions (R1-R8): one result shape per source ----
+
+test("R1: an invalid historical items file after a blocker withholds blocked", async () => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }, { id: "C", passes: false, title: "c" }]);
+	try {
+		f.block("A", T("10:05"));
+		f.items = f.items.map((i) => (i.id === "B" ? { ...i, passes: true } : i.id === "C" ? { ...i, title: 12 as unknown as string } : i));
+		f.writeBundle();
+		f.commit("feat: B with a bad C title", T("10:10"));
+		f.items[2].title = "c";
+		f.writeBundle();
+		f.commit("fix: C title", T("10:12"));
+		f.state(false, T("10:00"));
+		const s = await readOnce(f);
+		assert.deepEqual(statuses(s), { A: "stopped", B: "passed", C: "pending" });
+		assert.equal(s.sources.history.status, "fresh");
+		assert.ok(s.issues.some((i) => i.source === "git" && /pass evidence unknown/.test(i.detail)));
+	} finally { f.close(); }
+});
+
+test("R2: a pass entry only moved to a new index by the flip commit gets no SHA", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.progress = "# X blocked: other\n# A passed: done\n";
+		f.writeBundle();
+		f.commit("notes", T("10:05"));
+		f.progress = "# A passed: done\n# X blocked: other\n";
+		f.items[0].passes = true;
+		f.writeBundle();
+		f.commit("feat: A", T("10:10"));
+		f.state(false, T("10:00"));
+		const s = await readOnce(f);
+		assert.equal(s.attempts[0].id, "A");
+		assert.equal(s.attempts[0].commitSha, null);
+		assert.ok(s.issues.some((i) => i.source === "progress" && /not introduced/.test(i.detail)));
+	} finally { f.close(); }
+});
+
+test("R3: a history failure keeps git fresh, marks history retained and keeps last-good history", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	let fail = false;
+	const runtime: ObservationRuntime = {
+		...clock(),
+		git: (root, args, signal) => (fail && args[0] === "cat-file" ? Promise.reject(new Error("blob read failed")) : defaultRuntime.git(root, args, signal)),
+	};
+	const reader = openLoop(f.root, { runtime });
+	try {
+		f.block("A", T("10:05"));
+		f.state(false, T("10:00"));
+		const good = await reader.read();
+		const before = good.git?.commits?.length;
+		f.block("A", T("10:07"));
+		fail = true;
+		const s = await reader.read();
+		assert.equal(s.retained.history?.value.length, before);
+		assert.equal(s.sources.git.status, "fresh");
+		assert.equal(s.sources.history.status, "retained");
+		assert.match(s.sources.history.error ?? "", /blob read failed/);
+		assert.equal(s.git?.commits, null);
+		assert.equal(s.retained.history?.value.length, before);
+		assert.equal(s.retained.history?.observedAt, good.observedAt);
+		assert.deepEqual(statuses(s), { A: "stopped" });
+		fail = false;
+		assert.equal((await reader.read()).git?.commits?.length, (before ?? 0) + 1);
+	} finally { await reader.close(); f.close(); }
+});
+
+test("R4: a progress read error is a retained progress source; items stay fresh", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	let deny = false;
+	const runtime: ObservationRuntime = {
+		...clock(),
+		readRange: (file, start, end) => (deny && file.endsWith("progress.md") ? Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })) : defaultRuntime.readRange(file, start, end)),
+	};
+	const reader = openLoop(f.root, { runtime });
+	try {
+		f.block("A", T("10:05"));
+		f.state(true, T("10:00"));
+		const good = await reader.read();
+		assert.deepEqual(statuses(good), { A: "retry" });
+		appendFileSync(path.join(f.root, ".ralph/progress.md"), "# A blocked: again\n");
+		deny = true;
+		const s = await reader.read();
+		assert.equal(s.currentItem, "A");
+		assert.equal(s.retained.attempts?.value.length, 1);
+		assert.equal(s.task, "bundle");
+		assert.equal(s.sources.items.status, "fresh");
+		assert.equal(s.sources.progress.status, "retained");
+		assert.match(s.sources.progress.error ?? "", /EACCES/);
+		assert.equal(s.retained.attempts?.value.length, 1);
+		assert.deepEqual(s.attempts, []);
+		assert.equal(s.currentItem, "A");
+	} finally { await reader.close(); f.close(); }
+});
+
+test("R5: an incomplete trailing UTF-8 sequence is withheld, never shown as U+FFFD", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const reader = openLoop(f.root, { runtime: clock() });
+	try {
+		f.state(true, T("10:00"));
+		await reader.read();
+		const euro = Buffer.from("# A blocked: price €\n");
+		const file = path.join(f.root, ".ralph/progress.md");
+		appendFileSync(file, euro.subarray(0, euro.length - 3));
+		let s = await reader.read();
+		assert.equal(s.attempts.at(-1)?.title, "price");
+		assert.ok(!s.attempts.at(-1)?.raw.includes("\uFFFD"));
+		appendFileSync(file, euro.subarray(euro.length - 3));
+		s = await reader.read();
+		assert.equal(s.attempts.at(-1)?.title, "price €");
+	} finally { await reader.close(); f.close(); }
+});
+
+test("R7: a failed second git inspection keeps its cause and is not reported as concurrent", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	let lsFiles = 0;
+	const runtime: ObservationRuntime = {
+		...clock(),
+		git: (root, args, signal) => (args[0] === "ls-files" && ++lsFiles === 2 ? Promise.reject(new Error("post-stamp access failure")) : defaultRuntime.git(root, args, signal)),
+	};
+	try {
+		f.state(true, T("10:00"));
+		const s = await readOnce(f, runtime);
+		assert.equal(s.git, null);
+		assert.ok(!s.issues.some((i) => i.kind === "concurrent"));
+		assert.ok(s.issues.some((i) => i.source === "git" && /post-stamp access failure/.test(i.detail)));
+		assert.match(s.sources.git.error ?? "", /post-stamp access failure/);
+	} finally { f.close(); }
+});
+
+test("R8: an unreadable dirty file is an inspection error, not a deletion", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const dir = path.join(f.root, "private");
+	try {
+		mkdirSync(dir);
+		writeFileSync(path.join(dir, "dirty.txt"), "one\n");
+		f.commit("private file", T("09:30"));
+		f.block("A", T("10:05"));
+		f.state(false, T("10:00"));
+		writeFileSync(path.join(dir, "dirty.txt"), "two\n");
+		const reader = openLoop(f.root, { runtime: clock() });
+		try {
+			assert.equal((await reader.read()).git?.head, f.git("rev-parse", "HEAD"));
+			chmodSync(dir, 0o000);
+			const s = await reader.read();
+			assert.equal(s.git, null);
+			assert.ok(s.issues.some((i) => i.source === "git" && /EACCES|permission/i.test(i.detail)));
+			assert.equal(s.sources.git.status, "retained");
+			assert.notEqual(statuses(s).A, "blocked");
+		} finally { await reader.close(); }
+	} finally { chmodSync(dir, 0o755); f.close(); }
 });

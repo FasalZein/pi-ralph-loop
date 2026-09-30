@@ -3,21 +3,25 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { lstat, open, readlink, stat } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import { parseBundleItemsJson } from "../bundle/schema.js";
 import type { BundleItem } from "../bundle/types.js";
-import { readStateDocument, type StateDocument } from "../state.js";
+import { readStateDocument } from "../state.js";
+import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
 	CommitEvent, GitObservation, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
-	ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceStatus,
+	ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
 } from "./types.js";
 
 const LOOP_FILE = ".ralph/loop.md";
 const ITEMS_FILE = ".ralph/items.json";
 const PROGRESS_FILE = ".ralph/progress.md";
 const MISSION_FILE = ".ralph/mission.json";
+
+const isMissing = (error: unknown) => ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException | null)?.code ?? "");
 
 export type FileStamp = { readonly dev: number; readonly ino: number; readonly size: number; readonly mtimeNs: bigint };
 
@@ -47,8 +51,10 @@ export const defaultRuntime: ObservationRuntime = {
 		try {
 			const s = await stat(file, { bigint: true });
 			return { dev: Number(s.dev), ino: Number(s.ino), size: Number(s.size), mtimeNs: s.mtimeNs };
-		} catch {
-			return null;
+		} catch (error) {
+			// Only a missing path is absence; permission and I/O errors propagate.
+			if (isMissing(error)) return null;
+			throw error;
 		}
 	},
 	async readRange(file, start, end) {
@@ -89,23 +95,34 @@ export const defaultRuntime: ObservationRuntime = {
 
 type KeyedItem = { readonly key: string; readonly index: number; readonly item: BundleItem };
 
+/**
+ * The one result shape for every observed source. Ordinary failures are
+ * values, never exceptions, and always carry their cause.
+ */
+export type Result<T> =
+	| { readonly status: "fresh"; readonly value: T; readonly error: null }
+	| { readonly status: "unavailable"; readonly value: null; readonly error: string };
+const fresh = <T>(value: T): Result<T> => ({ status: "fresh", value, error: null });
+const unavailable = (error: string): Result<never> => ({ status: "unavailable", value: null, error });
+
+type HeadInfo = { readonly head: string; readonly branch: string | null; readonly base: string | null };
+
 /** Everything derivation needs. Collected by the reader; pure input to deriveLoopSnapshot. */
 export type LoopObservation = {
 	readonly root: string;
 	readonly observedAt: string;
 	readonly mission: Mission | null;
-	readonly state: StateDocument;
-	/** Null when no bundle applies or the items source is not fresh. */
-	readonly items: readonly KeyedItem[] | null;
-	readonly cards: readonly AttemptCard[];
+	readonly state: Result<RalphLoopState>;
+	/** Null when the task has no bundle (not applicable). */
+	readonly items: Result<readonly KeyedItem[]> | null;
+	readonly progress: Result<readonly AttemptCard[]> | null;
+	readonly git: Result<HeadInfo>;
+	readonly history: Result<readonly CommitEvent[]>;
 	/** Run starts with their source. The journal (T8) will add records here. */
 	readonly runStarts: readonly RunStart[];
-	readonly git: GitObservation | null;
 	/** Committed progress cards per commit SHA, for pass commits and their first parents. */
 	readonly progressAt: ReadonlyMap<string, readonly AttemptCard[] | null>;
-	/** Reader-assigned availability; derivation marks unavailable sources with retained values stale. */
-	readonly sources: Readonly<Record<SourceName, SourceStatus>>;
-	/** Last good values from earlier reads, shown only for sources that are not fresh. */
+	/** Last good values from earlier reads; shown only for sources that are not fresh. */
 	readonly lastGood: RetainedValues;
 	readonly issues: readonly Issue[];
 };
@@ -135,12 +152,34 @@ function freeze<T>(value: T): T {
 	return value;
 }
 
-/** Pure derivation: no filesystem, subprocess or clock access. */
+const RETAINED_KEY = { state: "state", items: "items", progress: "attempts", git: "git", history: "history" } as const satisfies Record<SourceName, keyof RetainedValues>;
+
+/**
+ * Pure derivation: no filesystem, subprocess or clock access. Single rule:
+ * only `fresh` results prove a status or feed evidence. Retained values are
+ * display only.
+ */
 export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	const issues: Issue[] = [...o.issues];
-	const state = o.sources.state === "fresh" && o.state.status === "valid" ? o.state.state : null;
-	const commits = o.git?.commits ?? null;
-	const keyed = o.items ?? [];
+	const results: Record<SourceName, Result<unknown> | null> = { state: o.state, items: o.items, progress: o.progress, git: o.git, history: o.history };
+	const sources = {} as Record<SourceName, SourceReport>;
+	const retained = { state: null, items: null, attempts: null, git: null, history: null } as { -readonly [K in keyof RetainedValues]: RetainedValues[K] };
+	for (const name of Object.keys(results) as SourceName[]) {
+		const r = results[name];
+		const key = RETAINED_KEY[name];
+		if (r === null) sources[name] = { status: "not-applicable", error: null };
+		else if (r.status === "fresh") sources[name] = { status: "fresh", error: null };
+		else if (o.lastGood[key]) {
+			sources[name] = { status: "retained", error: r.error };
+			(retained as Record<string, unknown>)[key] = o.lastGood[key];
+		} else sources[name] = { status: "unavailable", error: r.error };
+	}
+
+	const state = o.state.status === "fresh" ? o.state.value : null;
+	const keyed = o.items?.status === "fresh" ? o.items.value : [];
+	const cards = o.progress?.status === "fresh" ? o.progress.value : [];
+	const head = o.git.status === "fresh" ? o.git.value : null;
+	const commits = head && o.history.status === "fresh" ? o.history.value : null;
 	const keys = new Set(keyed.map((k) => k.key));
 	const firstFalse = keyed.find((k) => k.item.passes !== true) ?? null;
 
@@ -155,6 +194,11 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	const newBlocker = (key: string): CommitEvent | null => {
 		if (!commits || !linear) return null;
 		for (let i = commits.length - 1; i > lastPass; i--) {
+			// An unknown pass after the last proven pass could move the boundary.
+			if (!commits[i].passesKnown) {
+				issues.push({ source: "git", kind: "partial", detail: `pass evidence unknown at ${commits[i].sha}; retry and blocked cannot be proven` });
+				return null;
+			}
 			if (commits[i].kind === "blocker" && commits[i].blockerItem === key) return commits[i];
 		}
 		return null;
@@ -166,7 +210,8 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	if (firstFalse && state) {
 		const blocker = newBlocker(firstFalse.key);
 		if (!commits) {
-			issues.push({ source: "git", kind: "unavailable", detail: "blocker history unavailable; retry and blocked cannot be proven" });
+			const cause = o.git.status !== "fresh" ? o.git.error : o.history.error;
+			issues.push({ source: "git", kind: "unavailable", detail: `blocker history unavailable (${cause}); retry and blocked cannot be proven` });
 		}
 		if (state.running) {
 			currentItem = firstFalse.key;
@@ -176,13 +221,13 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 			const start = Date.parse(state.started_at);
 			const at = blocker?.committedAt == null ? Number.NaN : Date.parse(blocker.committedAt);
 			if (blocker && !(Number.isFinite(start) && Number.isFinite(at))) {
-				issues.push({ source: blocker && Number.isFinite(start) ? "git" : "state", kind: "partial", detail: "blocker or run start time is invalid; blocked cannot be proven" });
+				issues.push({ source: Number.isFinite(start) ? "git" : "state", kind: "partial", detail: "blocker or run start time is invalid; blocked cannot be proven" });
 			}
 			// Strictly newer than the run start: equality is not newer.
 			firstStatus = blocker && Number.isFinite(start) && at > start ? "blocked" : "stopped";
 		}
 	} else if (firstFalse) {
-		issues.push({ source: "state", kind: "unavailable", detail: "loop state not fresh and valid; item activity unknown" });
+		issues.push({ source: "state", kind: "unavailable", detail: `loop state not fresh (${o.state.error}); item activity unknown` });
 	}
 
 	const items: ObservedItem[] = keyed.map(({ key, index, item }) => ({
@@ -196,13 +241,13 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	}));
 
 	const commitFor = new Map<number, string | null>();
-	for (const card of o.cards) {
+	for (const card of cards) {
 		if (card.outcome !== "passed" || card.id === null || !keys.has(card.id)) continue;
-		const found = passCommit(card, commits, o.progressAt);
+		const found = passCommit(card, cards, commits, o.progressAt);
 		if (found.issue) issues.push({ source: "progress", kind: "partial", detail: found.issue });
 		commitFor.set(card.index, found.sha);
 	}
-	const attempts: ObservedAttempt[] = o.cards.map((card) => ({
+	const attempts: ObservedAttempt[] = cards.map((card) => ({
 		...card,
 		commitSha: commitFor.get(card.index) ?? null,
 		resolvedCommitSha: card.resolvedBy === null ? null : commitFor.get(card.resolvedBy) ?? null,
@@ -216,18 +261,6 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		itemAttempts[key] = [...open, ...rest];
 	}
 
-	// A source that is not fresh shows its last good value, marked stale.
-	const sources = { ...o.sources };
-	const retain = <K extends keyof RetainedValues>(name: SourceName, key: K): RetainedValues[K] => {
-		if (sources[name] === "fresh" || sources[name] === "not-applicable" || !o.lastGood[key]) return null;
-		if (sources[name] === "unavailable") sources[name] = "stale";
-		return o.lastGood[key];
-	};
-	const retained: RetainedValues = {
-		state: retain("state", "state"), items: retain("items", "items"),
-		attempts: retain("progress", "attempts"), git: retain("git", "git"),
-	};
-
 	return freeze({
 		root: o.root,
 		observedAt: o.observedAt,
@@ -238,7 +271,7 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		items, currentItem, stoppedItem, attempts, itemAttempts,
 		runStarts: [...o.runStarts],
 		historyComplete: false,
-		git: o.git,
+		git: head ? { ...head, commits } : null,
 		sources,
 		retained,
 		issues,
@@ -252,23 +285,22 @@ function itemTitle(item: BundleItem, key: string, mission: Mission | null): stri
 }
 
 /**
- * The single item-pass commit that flips this card's item and introduces this
- * complete entry at the same index (absent at its first parent). A committed
- * entry that predates its flip, or several candidates, give null plus an issue.
+ * The single item-pass commit that flips this card's item, holds this entry at
+ * its index, and whose first parent holds no identical entry at any index.
+ * Moved, copied, duplicated or pre-existing entries give null plus an issue.
  */
 function passCommit(
 	card: AttemptCard,
+	cards: readonly AttemptCard[],
 	commits: readonly CommitEvent[] | null,
 	progressAt: ReadonlyMap<string, readonly AttemptCard[] | null>,
 ): { sha: string | null; issue: string | null } {
-	const holds = (sha: string | undefined) => {
-		const committed = sha === undefined ? undefined : progressAt.get(sha)?.[card.index];
-		return !!committed && committed.outcome === "passed" && committed.id === card.id && committed.raw.trimEnd() === card.raw.trimEnd();
-	};
-	const candidates = (commits ?? []).filter((c) => c.passedItems.includes(card.id!) && holds(c.sha));
+	const same = (c: AttemptCard | undefined) => !!c && c.outcome === "passed" && c.id === card.id && c.raw.trimEnd() === card.raw.trimEnd();
+	const candidates = (commits ?? []).filter((c) => c.passedItems.includes(card.id!) && same(progressAt.get(c.sha)?.[card.index]));
 	if (!candidates.length) return { sha: null, issue: null };
-	const introduced = candidates.filter((c) => c.parents[0] !== undefined && progressAt.has(c.parents[0]) && !holds(c.parents[0]));
-	if (introduced.length === 1 && candidates.length === 1) return { sha: introduced[0].sha, issue: null };
+	const introduced = candidates.filter((c) => c.parents[0] !== undefined && progressAt.has(c.parents[0]) && !(progressAt.get(c.parents[0]) ?? []).some(same));
+	const unique = cards.filter(same).length === 1;
+	if (unique && introduced.length === 1 && candidates.length === 1) return { sha: introduced[0].sha, issue: null };
 	return { sha: null, issue: `progress entry ${card.index} (${card.id}) was not introduced by exactly one pass commit; commit SHA unavailable` };
 }
 
@@ -293,6 +325,8 @@ function sameFile(a: FileStamp | null, b: FileStamp | null): boolean {
 const sha256 = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
+type Sourced<T> = { readonly result: Result<T>; readonly stamp: FileStamp | null };
+
 /**
  * Open a serialized reader for one loop root. Invalid root or mismatched mission
  * throws; ordinary observation failures become snapshot issues.
@@ -305,15 +339,17 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	const file = (rel: string) => path.join(root, rel);
 
 	let mission: Mission | null = opts.mission ?? null;
-	let stateCache: { stamp: FileStamp; doc: StateDocument } | null = null;
-	let itemsCache: { stamp: FileStamp; items: readonly BundleItem[] | string } | null = null;
+	let stateCache: { stamp: FileStamp; result: Result<RalphLoopState> } | null = null;
+	let itemsCache: { stamp: FileStamp; result: Result<readonly KeyedItem[]> } | null = null;
 	let progress: ProgressCache | null = null;
 	// Immutable git facts, cached only after a successful read.
 	const commitCache = new Map<string, CommitFacts>();
 	const blobCards = new Map<string, readonly AttemptCard[]>();
 	const contentHashes = new Map<string, { stamp: FileStamp; hash: string }>();
+	// Bytes read in this observation, shared by the worktree fingerprint and the progress parser.
+	let observed = new Map<string, { stamp: FileStamp; bytes: Buffer }>();
 	const runStarts: RunStart[] = [];
-	const lastGood: { -readonly [K in keyof RetainedValues]: RetainedValues[K] } = { state: null, items: null, attempts: null, git: null };
+	const lastGood: { -readonly [K in keyof RetainedValues]: RetainedValues[K] } = { state: null, items: null, attempts: null, git: null, history: null };
 	let queue: Promise<unknown> = Promise.resolve();
 	let closed = false;
 	let active: AbortController | null = null;
@@ -332,87 +368,100 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		}
 	}
 
-	type Read<T> = { stamp: FileStamp | null; status: SourceStatus; value: T };
-
-	async function readStateFile(issues: Issue[]): Promise<Read<StateDocument>> {
-		const stamp = await rt.stat(file(LOOP_FILE));
-		if (!stamp) {
-			stateCache = null;
-			issues.push({ source: "state", kind: "missing", detail: `${LOOP_FILE} not found` });
-			return { stamp, status: "missing", value: { status: "missing" } };
+	/** Run a source reader; an exception becomes an unavailable result with its cause. */
+	async function guarded<T>(source: SourceName, signal: AbortSignal, read: () => Promise<Sourced<T>>, issues: Issue[]): Promise<Sourced<T>> {
+		try {
+			return await read();
+		} catch (error) {
+			if (signal.aborted) throw error;
+			issues.push({ source, kind: "unavailable", detail: message(error) });
+			return { result: unavailable(message(error)), stamp: null };
 		}
+	}
+
+	/** Whole-file bytes for a stamp, read at most once per observation. */
+	async function fileBytes(full: string, stamp: FileStamp): Promise<Buffer> {
+		const seen = observed.get(full);
+		if (seen && sameFile(seen.stamp, stamp)) return seen.bytes;
+		const bytes = await rt.readRange(full, 0, stamp.size);
+		observed.set(full, { stamp, bytes });
+		return bytes;
+	}
+
+	async function missing<T>(source: SourceName, rel: string, issues: Issue[]): Promise<Sourced<T>> {
+		issues.push({ source, kind: "missing", detail: `${rel} not found` });
+		return { result: unavailable(`${rel} not found`), stamp: null };
+	}
+
+	async function readStateFile(issues: Issue[]): Promise<Sourced<RalphLoopState>> {
+		const stamp = await rt.stat(file(LOOP_FILE));
+		if (!stamp) { stateCache = null; return missing("state", LOOP_FILE, issues); }
 		if (!stateCache || !sameFile(stateCache.stamp, stamp)) {
 			const doc = readStateDocument(root);
 			if (!sameFile(stamp, await rt.stat(file(LOOP_FILE)))) {
 				stateCache = null;
 				issues.push({ source: "state", kind: "concurrent", detail: `${LOOP_FILE} changed during read` });
-				return { stamp, status: "unavailable", value: { status: "partial", reason: "changed during read", body: null, fields: {} } };
+				return { result: unavailable(`${LOOP_FILE} changed during read`), stamp };
 			}
-			stateCache = { stamp, doc };
+			const result = doc.status === "valid" ? fresh(doc.state) : unavailable(doc.status === "partial" ? doc.reason : `${LOOP_FILE} not found`);
+			// Read errors are operational: never cached.
+			stateCache = doc.status === "partial" && doc.reason.startsWith("read error:") ? null : { stamp, result };
+			if (!stateCache) { issues.push({ source: "state", kind: "unavailable", detail: result.error! }); return { result, stamp }; }
 		}
-		const doc = stateCache.doc;
-		if (doc.status === "partial") issues.push({ source: "state", kind: "partial", detail: doc.reason });
-		return { stamp, status: doc.status === "valid" ? "fresh" : "unavailable", value: doc };
+		if (stateCache.result.status !== "fresh") issues.push({ source: "state", kind: "partial", detail: stateCache.result.error });
+		return { result: stateCache.result, stamp };
 	}
 
-	async function readItems(issues: Issue[]): Promise<Read<KeyedItem[] | null>> {
+	async function readItems(issues: Issue[]): Promise<Sourced<readonly KeyedItem[]>> {
 		const stamp = await rt.stat(file(ITEMS_FILE));
-		if (!stamp) {
-			itemsCache = null;
-			issues.push({ source: "items", kind: "missing", detail: `${ITEMS_FILE} not found` });
-			return { stamp, status: "missing", value: null };
-		}
+		if (!stamp) { itemsCache = null; return missing("items", ITEMS_FILE, issues); }
 		if (!itemsCache || !sameFile(itemsCache.stamp, stamp)) {
-			let items: readonly BundleItem[] | string;
-			try {
-				items = parseBundleItemsJson((await rt.readRange(file(ITEMS_FILE), 0)).toString("utf8")).items;
-			} catch (error) {
-				items = message(error);
-			}
+			// A read failure throws to `guarded` and is not cached; parse failures are content facts.
+			const text = (await rt.readRange(file(ITEMS_FILE), 0)).toString("utf8");
 			if (!sameFile(stamp, await rt.stat(file(ITEMS_FILE)))) {
 				itemsCache = null;
 				issues.push({ source: "items", kind: "concurrent", detail: `${ITEMS_FILE} changed during read` });
-				return { stamp, status: "unavailable", value: null };
+				return { result: unavailable(`${ITEMS_FILE} changed during read`), stamp };
 			}
-			itemsCache = { stamp, items };
+			let keyed: KeyedItem[] | string;
+			try {
+				keyed = keyItems(parseBundleItemsJson(text).items);
+			} catch (error) {
+				keyed = message(error);
+			}
+			itemsCache = { stamp, result: typeof keyed === "string" ? unavailable(keyed) : fresh(keyed) };
 		}
-		const keyed = typeof itemsCache.items === "string" ? itemsCache.items : keyItems(itemsCache.items);
-		if (typeof keyed === "string") {
-			issues.push({ source: "items", kind: "partial", detail: keyed });
-			return { stamp, status: "unavailable", value: null };
-		}
-		return { stamp, status: "fresh", value: keyed };
+		if (itemsCache.result.status !== "fresh") issues.push({ source: "items", kind: "partial", detail: itemsCache.result.error });
+		return { result: itemsCache.result, stamp };
 	}
 
 	/**
-	 * Unchanged files are not read. A changed file is read once; the cached
-	 * prefix is reused only when its hash still matches, so an edit anywhere in
-	 * old content is detected and reparsed with an issue.
+	 * Unchanged files are not read. A changed file is read in full once per
+	 * observation; the cached prefix hash must still match, so an edit anywhere
+	 * in old content is detected and reparsed with an issue.
 	 */
-	async function readProgress(issues: Issue[]): Promise<Read<readonly AttemptCard[] | null>> {
+	async function readProgress(issues: Issue[]): Promise<Sourced<readonly AttemptCard[]>> {
 		const stamp = await rt.stat(file(PROGRESS_FILE));
-		if (!stamp) {
-			progress = null;
-			issues.push({ source: "progress", kind: "missing", detail: `${PROGRESS_FILE} not found` });
-			return { stamp, status: "missing", value: null };
-		}
-		if (progress && sameFile(progress.stamp, stamp)) return { stamp, status: "fresh", value: progress.cards };
-		const bytes = await rt.readRange(file(PROGRESS_FILE), 0, stamp.size);
+		if (!stamp) { progress = null; return missing("progress", PROGRESS_FILE, issues); }
+		if (progress && sameFile(progress.stamp, stamp)) return { result: fresh(progress.cards), stamp };
+		const bytes = await fileBytes(file(PROGRESS_FILE), stamp);
 		if (!sameFile(stamp, await rt.stat(file(PROGRESS_FILE)))) {
 			issues.push({ source: "progress", kind: "concurrent", detail: `${PROGRESS_FILE} changed during read` });
-			return { stamp, status: "unavailable", value: null };
+			return { result: unavailable(`${PROGRESS_FILE} changed during read`), stamp };
 		}
 		if (progress && (bytes.length < progress.bytes || sha256(bytes.subarray(0, progress.bytes)) !== progress.prefixHash)) {
 			issues.push({ source: "progress", kind: "partial", detail: `${PROGRESS_FILE} was edited, not appended; reparsed` });
 		}
-		progress = { stamp, bytes: bytes.length, prefixHash: sha256(bytes), cards: parseProgress(bytes.toString("utf8")) };
-		return { stamp, status: "fresh", value: progress.cards };
+		// The decoder withholds an incomplete trailing UTF-8 sequence until the append completes.
+		const text = new StringDecoder("utf8").write(bytes);
+		progress = { stamp, bytes: bytes.length, prefixHash: sha256(bytes), cards: parseProgress(text) };
+		return { result: fresh(progress.cards), stamp };
 	}
 
 	/**
 	 * HEAD, branch, index bytes and the content and mode of every modified,
 	 * deleted or untracked nonignored path. Any failure except the detached-HEAD
-	 * exit throws.
+	 * exit and a missing path throws.
 	 */
 	async function gitStamp(signal: AbortSignal): Promise<{ head: string; branch: string | null; digest: string }> {
 		const head = (await rt.git(root, ["rev-parse", "--verify", "HEAD"], signal)).trim();
@@ -425,12 +474,16 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			branch = null;
 		}
 		const indexPath = path.resolve(root, (await rt.git(root, ["rev-parse", "--git-path", "index"], signal)).trim());
-		const index = (await rt.stat(indexPath)) ? sha256(await rt.readRange(indexPath, 0)) : "absent";
+		const indexStamp = await rt.stat(indexPath);
+		const index = indexStamp ? sha256(await rt.readRange(indexPath, 0)) : "absent";
 		const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter(Boolean))].sort();
 		const content: string[] = [];
 		for (const rel of dirty) {
 			const full = path.join(root, rel);
-			const info = await lstat(full).catch(() => null);
+			const info = await lstat(full).catch((error: unknown) => {
+				if (isMissing(error)) return null;
+				throw error;
+			});
 			if (!info) content.push(`${rel}\0deleted`);
 			else if (info.isSymbolicLink()) content.push(`${rel}\0link\0${await readlink(full)}`);
 			else if (info.isFile()) content.push(`${rel}\0${info.mode}\0${await contentHash(full)}`);
@@ -442,10 +495,11 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	/** Content hash, reused while the file stamp is unchanged so unchanged dirty files are not reread. */
 	async function contentHash(full: string): Promise<string> {
 		const stamp = await rt.stat(full);
+		if (!stamp) return "deleted";
 		const cached = contentHashes.get(full);
-		if (stamp && cached && sameFile(cached.stamp, stamp)) return cached.hash;
-		const hash = sha256(await rt.readRange(full, 0));
-		if (stamp && sameFile(stamp, await rt.stat(full))) contentHashes.set(full, { stamp, hash });
+		if (cached && sameFile(cached.stamp, stamp)) return cached.hash;
+		const hash = sha256(await fileBytes(full, stamp));
+		if (sameFile(stamp, await rt.stat(full))) contentHashes.set(full, { stamp, hash });
 		return hash;
 	}
 
@@ -486,11 +540,11 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		return blobCards.get(oid)!;
 	}
 
-	async function readGit(issues: Issue[], signal: AbortSignal, progressOut: Map<string, readonly AttemptCard[] | null>, head: string): Promise<CommitEvent[] | null> {
+	async function readHistory(issues: Issue[], signal: AbortSignal, progressOut: Map<string, readonly AttemptCard[] | null>, head: string): Promise<Result<readonly CommitEvent[]>> {
 		const base = mission?.git.baseCommit ?? null;
 		if (base === null) {
 			issues.push({ source: "git", kind: "unavailable", detail: "no mission base; commit history unavailable" });
-			return null;
+			return unavailable("no mission base");
 		}
 		try {
 			try {
@@ -498,8 +552,9 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			} catch (error) {
 				// Exit 1 proves non-ancestry; anything else is unknown, not a history fact.
 				if (!(error instanceof GitCommandError && error.exitCode === 1)) throw error;
-				issues.push({ source: "git", kind: "partial", detail: `base ${base} is not an ancestor of HEAD; history incomplete` });
-				return null;
+				const detail = `base ${base} is not an ancestor of HEAD; history incomplete`;
+				issues.push({ source: "git", kind: "partial", detail });
+				return unavailable(detail);
 			}
 			const list = (await rt.git(root, ["rev-list", "--reverse", "--topo-order", `${base}..${head}`], signal)).split("\n").filter(Boolean);
 			const commits: CommitEvent[] = [];
@@ -517,62 +572,82 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 					if (facts.parents[0]) progressOut.set(facts.parents[0], await progressAt(facts.parents[0], signal));
 				}
 			}
-			return commits;
+			return fresh(commits);
 		} catch (error) {
 			if (signal.aborted) throw error;
-			issues.push({ source: "git", kind: "unavailable", detail: `history unavailable: ${message(error)}` });
-			return null;
+			const detail = `history unavailable: ${message(error)}`;
+			issues.push({ source: "git", kind: "unavailable", detail });
+			return unavailable(detail);
 		}
 	}
 
 	async function observe(signal: AbortSignal): Promise<LoopSnapshot> {
 		const issues: Issue[] = [];
 		const observedAt = rt.now().toISOString();
-		const sources: Record<SourceName, SourceStatus> = { state: "unavailable", items: "not-applicable", progress: "not-applicable", git: "unavailable" };
-		const base: LoopObservation = { root, observedAt, mission, state: { status: "missing" }, items: null, cards: [], runStarts, git: null, progressAt: new Map(), sources, lastGood, issues };
+		observed = new Map();
+		const failed = (error: string): LoopObservation => ({
+			root, observedAt, mission, state: unavailable(error), items: unavailable(error), progress: unavailable(error),
+			git: unavailable(error), history: unavailable(error), runStarts, progressAt: new Map(), lastGood, issues,
+		});
 		try {
 			signal.throwIfAborted();
 			await readMission(issues);
 			// The git window opens before any source read, so it covers the whole observation.
+			let git: Result<HeadInfo>;
 			let before: Awaited<ReturnType<typeof gitStamp>> | null = null;
 			try {
 				before = await gitStamp(signal);
+				git = fresh({ head: before.head, branch: before.branch, base: mission?.git.baseCommit ?? null });
 			} catch (error) {
 				if (signal.aborted) throw error;
 				issues.push({ source: "git", kind: "unavailable", detail: message(error) });
+				git = unavailable(message(error));
 			}
-			const state = await readStateFile(issues);
-			const bundle = mission ? mission.task.kind === "bundle" : state.value.status === "valid" ? state.value.state.bundle_mode : existsSync(file(ITEMS_FILE));
-			const items = bundle ? await readItems(issues) : null;
-			const cards = bundle ? await readProgress(issues) : null;
+			const state = await guarded("state", signal, () => readStateFile(issues), issues);
+			const bundle = mission ? mission.task.kind === "bundle" : state.result.status === "fresh" ? state.result.value.bundle_mode : existsSync(file(ITEMS_FILE));
+			const items = bundle ? await guarded("items", signal, () => readItems(issues), issues) : null;
+			const cards = bundle ? await guarded("progress", signal, () => readProgress(issues), issues) : null;
 			const progressAtPass = new Map<string, readonly AttemptCard[] | null>();
-			let git: GitObservation | null = null;
+			let history: Result<readonly CommitEvent[]> = unavailable(git.error ?? "git unavailable");
 			if (before) {
-				const commits = await readGit(issues, signal, progressAtPass, before.head);
-				const after = await gitStamp(signal).catch((error) => {
+				history = await readHistory(issues, signal, progressAtPass, before.head);
+				let after: typeof before | null = null;
+				try {
+					after = await gitStamp(signal);
+				} catch (error) {
 					if (signal.aborted) throw error;
-					return null;
-				});
-				if (after?.digest !== before.digest) {
-					// No tight retry loop: the next read retries and publishes one coherent result.
-					issues.push({ source: "git", kind: "concurrent", detail: "HEAD, index or worktree changed during read; retry next poll" });
-				} else {
-					git = { head: before.head, branch: before.branch, base: mission?.git.baseCommit ?? null, commits };
+					// An inspection failure is not evidence of change: keep its cause.
+					const detail = `second git inspection failed: ${message(error)}`;
+					issues.push({ source: "git", kind: "unavailable", detail });
+					git = unavailable(detail);
 				}
+				if (after && after.digest !== before.digest) {
+					// No tight retry loop: the next read retries and publishes one coherent result.
+					const detail = "HEAD, index or worktree changed during read; retry next poll";
+					issues.push({ source: "git", kind: "concurrent", detail });
+					git = unavailable(detail);
+				}
+				// History from an inconsistent window is not fresh.
+				if (git.status !== "fresh" && history.status === "fresh") history = unavailable(git.error);
 			}
 			signal.throwIfAborted();
-			// Every source must be unchanged from its read to the end of the observation.
-			for (const [name, rel, read] of [["state", LOOP_FILE, state], ["items", ITEMS_FILE, items], ["progress", PROGRESS_FILE, cards]] as const) {
-				if (!read) continue;
-				sources[name] = read.status;
-				if (read.status !== "missing" && !sameFile(read.stamp, await rt.stat(file(rel)))) {
+			// Every fresh file source must be unchanged from its read to the end of the observation.
+			const recheck = async <T>(name: SourceName, rel: string, read: Sourced<T> | null): Promise<Result<T> | null> => {
+				if (!read || read.result.status !== "fresh") return read?.result ?? null;
+				try {
+					if (sameFile(read.stamp, await rt.stat(file(rel)))) return read.result;
 					issues.push({ source: name, kind: "concurrent", detail: `${rel} changed during observation; retry next poll` });
-					sources[name] = "unavailable";
+					return unavailable(`${rel} changed during observation`);
+				} catch (error) {
+					issues.push({ source: name, kind: "unavailable", detail: message(error) });
+					return unavailable(message(error));
 				}
-			}
-			sources.git = git ? "fresh" : "unavailable";
-			if (sources.state === "fresh" && state.value.status === "valid") {
-				const s = state.value.state;
+			};
+			const stateResult = (await recheck("state", LOOP_FILE, state))!;
+			const itemsResult = await recheck("items", ITEMS_FILE, items);
+			const progressResult = await recheck("progress", PROGRESS_FILE, cards);
+			if (stateResult.status === "fresh") {
+				const s = stateResult.value;
 				if (!Number.isFinite(Date.parse(s.started_at))) {
 					issues.push({ source: "state", kind: "partial", detail: "started_at is not a valid time; no run boundary" });
 				} else if (!runStarts.some((r) => r.loopToken === s.loop_token && r.startedAt === s.started_at)) {
@@ -580,34 +655,38 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				}
 			}
 			const snapshot = deriveLoopSnapshot({
-				...base, mission, state: state.value,
-				items: sources.items === "fresh" ? items!.value : null,
-				cards: sources.progress === "fresh" ? cards!.value ?? [] : [],
-				git, progressAt: progressAtPass,
+				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
+				git, history, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
 			remember(snapshot);
 			return snapshot;
 		} catch (error) {
-			issues.push({ source: "observer", kind: "unavailable", detail: signal.aborted ? "read aborted" : message(error) });
-			return deriveLoopSnapshot({ ...base, mission });
+			const detail = signal.aborted ? "read aborted" : message(error);
+			issues.push({ source: "observer", kind: "unavailable", detail });
+			return deriveLoopSnapshot(failed(detail));
+		} finally {
+			observed = new Map();
 		}
 	}
 
+	/** Only fresh values become last-good; a failure never advances observedAt. */
 	function remember(s: LoopSnapshot): void {
-		if (s.sources.state === "fresh" && s.state) lastGood.state = { value: s.state, observedAt: s.observedAt };
-		if (s.sources.items === "fresh") lastGood.items = { value: s.items, observedAt: s.observedAt };
-		if (s.sources.progress === "fresh") lastGood.attempts = { value: s.attempts, observedAt: s.observedAt };
-		if (s.sources.git === "fresh" && s.git) lastGood.git = { value: s.git, observedAt: s.observedAt };
+		const at = s.observedAt;
+		if (s.sources.state.status === "fresh" && s.state) lastGood.state = { value: s.state, observedAt: at };
+		if (s.sources.items.status === "fresh") lastGood.items = { value: s.items, observedAt: at };
+		if (s.sources.progress.status === "fresh") lastGood.attempts = { value: s.attempts, observedAt: at };
+		if (s.sources.git.status === "fresh" && s.git) lastGood.git = { value: s.git, observedAt: at };
+		if (s.sources.history.status === "fresh" && s.git?.commits) lastGood.history = { value: s.git.commits, observedAt: at };
 	}
 
 	return {
 		read(signal?: AbortSignal): Promise<LoopSnapshot> {
 			const run = async (): Promise<LoopSnapshot> => {
 				if (closed) {
-					const sources = { state: "unavailable", items: "unavailable", progress: "unavailable", git: "unavailable" } as const;
+					const error = unavailable("reader closed");
 					return deriveLoopSnapshot({
-						root, observedAt: rt.now().toISOString(), mission, state: { status: "missing" }, items: null, cards: [], runStarts, git: null,
-						progressAt: new Map(), sources, lastGood, issues: [{ source: "observer", kind: "unavailable", detail: "reader closed" }],
+						root, observedAt: rt.now().toISOString(), mission, state: error, items: error, progress: error, git: error, history: error,
+						runStarts, progressAt: new Map(), lastGood, issues: [{ source: "observer", kind: "unavailable", detail: "reader closed" }],
 					});
 				}
 				active = new AbortController();
@@ -637,6 +716,7 @@ function classify(sha: string, facts: CommitFacts, parent: CommitFacts | null, m
 	const committedAt = Number.isFinite(Date.parse(facts.committedAt)) ? facts.committedAt : null;
 	const now = facts.items.kind === "ok" ? facts.items.passes : null;
 	const before = parent?.items.kind === "ok" ? parent.items.passes : null;
+	const passesKnown = facts.items.kind !== "invalid" && parent?.items.kind !== "invalid";
 	// Only false->true flips on keys present in both versions count as passes.
 	// Merges are not classified: which parent a flip came from is ambiguous.
 	const passedItems = facts.parents.length <= 1 && now && before
@@ -650,5 +730,5 @@ function classify(sha: string, facts: CommitFacts, parent: CommitFacts | null, m
 	}
 	const parentReason = mission.git.parentCommits.find((p) => p.sha === sha)?.reason ?? null;
 	const kind = passedItems.length ? "item-pass" : blockerItem ? "blocker" : parentReason ? "parent" : "other";
-	return { sha, parents: facts.parents, subject: facts.subject, committedAt, kind, passedItems, blockerItem, parentReason };
+	return { sha, parents: facts.parents, subject: facts.subject, committedAt, kind, passedItems, blockerItem, parentReason, passesKnown };
 }

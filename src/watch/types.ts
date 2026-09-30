@@ -174,6 +174,8 @@ export type CommitEvent = {
 	/** Known item key captured by the configured blocker pattern. */
 	readonly blockerItem: string | null;
 	readonly parentReason: string | null;
+	/** False when items.json at this commit or its first parent was invalid: a pass there is unknown. */
+	readonly passesKnown: boolean;
 };
 
 /** A run start. Sources other than loop.md (the journal) are a later seam. */
@@ -191,15 +193,18 @@ export type GitObservation = {
 	readonly commits: readonly CommitEvent[] | null;
 };
 
-export type SourceName = "state" | "items" | "progress" | "git";
+/** `history` is the base..HEAD commit inspection, separate from HEAD/branch (`git`). */
+export type SourceName = "state" | "items" | "progress" | "git" | "history";
 
 /**
- * fresh: read completely and unchanged over the whole observation.
- * stale: not fresh now; the last good value is in `retained`.
- * missing: the file is absent. unavailable: not fresh and nothing retained.
+ * One report shape for every source.
+ * fresh: read completely and unchanged over the whole observation; may prove status.
+ * retained: not fresh now; the last good value is in `retained` (display only).
+ * unavailable: not fresh and nothing retained. `error` always carries the cause.
  * not-applicable: the task has no such source (plain task items/progress).
  */
-export type SourceStatus = "fresh" | "stale" | "missing" | "unavailable" | "not-applicable";
+export type SourceStatus = "fresh" | "retained" | "unavailable" | "not-applicable";
+export type SourceReport = { readonly status: SourceStatus; readonly error: string | null };
 
 type Retained<T> = { readonly value: T; readonly observedAt: string } | null;
 
@@ -212,6 +217,7 @@ export type RetainedValues = {
 	readonly items: Retained<readonly ObservedItem[]>;
 	readonly attempts: Retained<readonly ObservedAttempt[]>;
 	readonly git: Retained<GitObservation>;
+	readonly history: Retained<readonly CommitEvent[]>;
 };
 
 export type LoopSnapshot = {
@@ -235,7 +241,7 @@ export type LoopSnapshot = {
 	readonly historyComplete: false;
 	/** Fresh, consistent git evidence; null when git failed or changed during the read. */
 	readonly git: GitObservation | null;
-	readonly sources: Readonly<Record<SourceName, SourceStatus>>;
+	readonly sources: Readonly<Record<SourceName, SourceReport>>;
 	readonly retained: RetainedValues;
 	readonly issues: readonly Issue[];
 };
