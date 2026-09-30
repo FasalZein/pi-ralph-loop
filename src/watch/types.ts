@@ -250,3 +250,44 @@ export type LoopReader = {
 	read(signal?: AbortSignal): Promise<LoopSnapshot>;
 	close(): Promise<void>;
 };
+
+export type Usage = { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number };
+export type IterationTotals = Usage & { readonly costUsd: number; readonly messages: number; readonly dialogsCancelled: number; readonly refusals: number };
+export type ToolEntry = {
+	readonly id: string;
+	readonly name: string;
+	readonly label: string;
+	readonly startedAt: string | null;
+} & (
+	| { readonly endedAt: null }
+	| { readonly endedAt: string; readonly ms: number | null; readonly error: boolean }
+);
+export type DriverCounters = { readonly dialogsCancelled: number; readonly refusals: number; readonly badRecords: number; readonly badFacts: number; readonly subscriberDrops: number };
+export type DriverEvent =
+	| { readonly kind: "tool-start" | "tool-end"; readonly tool: ToolEntry }
+	| { readonly kind: "assistant-end"; readonly usage: Usage; readonly costUsd: number; readonly stopReason: string | null; readonly model: string | null }
+	| { readonly kind: "activity" }
+	| { readonly kind: "dialog-cancelled"; readonly method: string; readonly title: string | null }
+	| { readonly kind: "refusal"; readonly tool: string; readonly text: string }
+	| { readonly kind: "fact"; readonly fact: import("../loop/watch-events.js").LoopFact };
+export type DriverState = "starting" | "ready" | "launched" | "closing";
+export type ControlOp = "stop" | "steer" | "go";
+export type EventFrame =
+	| { readonly v: 1; readonly type: "hello"; readonly launchId: string; readonly pid: number; readonly nextSeq: number; readonly lastPiAt: string | null; readonly loop: { readonly token: string; readonly startedAt: string; readonly iteration: number } | null; readonly tools: readonly ToolEntry[]; readonly totals: IterationTotals; readonly counters: DriverCounters; readonly state: DriverState }
+	| ({ readonly v: 1; readonly seq: number; readonly at: string } & (
+		| { readonly type: "event"; readonly event: DriverEvent }
+		| { readonly type: "gap"; readonly source: "facts"; readonly from: number; readonly to: number }
+		| { readonly type: "lifecycle"; readonly state: "ready" | "launched" | "pi-exited" | "closed"; readonly code?: number | null; readonly detail?: string }
+		| { readonly type: "ack"; readonly id: string; readonly op: ControlOp; readonly phase: "accepted" | "completed" | "rejected"; readonly reason?: string; readonly duplicate?: boolean }
+	));
+
+type JournalBase = { readonly v: 1; readonly t: string; readonly r: string };
+/** Only non-derivable facts belong in the bounded operator journal. */
+export type JournalRecord = JournalBase & (
+	| { readonly k: "run"; readonly m: string; readonly th: string; readonly mx: number; readonly tk: "b" | "p" }
+	| { readonly k: "loop"; readonly tok: string; readonly sa: string; readonly i: number; readonly ph: "initialized" | "resumed" }
+	| { readonly k: "g"; readonly tok: string; readonly i: number; readonly p: "NEXT" | "STOP" | "COMPLETE" | "WAIT"; readonly ok: 0 | 1; readonly why?: string }
+	| { readonly k: "u"; readonly tok: string | null; readonly i: number; readonly in: number; readonly out: number; readonly cr: number; readonly cw: number; readonly c: number; readonly n: number; readonly dc: number; readonly pr: number }
+	| { readonly k: "x"; readonly op: "stop" | "steer"; readonly id: string | null; readonly ok: 0 | 1; readonly why?: string; readonly txt?: string; readonly part?: number }
+	| { readonly k: "d"; readonly e: "start" | "ready" | "launched" | "gate-wait" | "pi-not-ready" | "pi-exit" | "gap" | "exit"; readonly c?: number | null; readonly why?: string }
+);
