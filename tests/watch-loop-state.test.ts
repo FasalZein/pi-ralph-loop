@@ -485,7 +485,9 @@ test("large progress reads are incremental: unchanged polls read nothing, append
 		await reader.read();
 		appendFileSync(path.join(f.root, ".ralph/progress.md"), euro.subarray(euro.length - 3));
 		const s = await reader.read();
-		assert.deepEqual(ranges, [["progress.md", size, size + euro.length - 3], ["progress.md", size + euro.length - 3, size + euro.length]]);
+		// Each append read covers only the new suffix plus a fixed 64-byte tail check.
+		const tail = 64;
+		assert.deepEqual(ranges, [["progress.md", size - tail, size + euro.length - 3], ["progress.md", size + euro.length - 3 - tail, size + euro.length]]);
 		assert.equal(s.attempts.at(-1)?.title, "price €");
 	} finally { await reader.close(); f.close(); }
 });
@@ -524,6 +526,94 @@ test("snapshots are deeply frozen; overlapping reads serialize; close is idempot
 	} finally { await reader.close(); f.close(); }
 });
 type ObservedItemArray = unknown[];
+
+test("a same-inode edit before the old end is detected and reparsed", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const reader = openLoop(f.root, { runtime: clock() });
+	try {
+		f.state(true, T("10:00"));
+		const file = path.join(f.root, ".ralph/progress.md");
+		writeFileSync(file, "# A blocked: one\n");
+		await reader.read();
+		// Rewrite in place (same inode) and grow: not an append.
+		writeFileSync(file, "# A passed: won\n# A blocked: two\n");
+		const s = await reader.read();
+		assert.deepEqual(s.attempts.map((a) => [a.outcome, a.title]), [["passed", "won"], ["blocked", "two"]]);
+		assert.ok(s.issues.some((i) => i.source === "progress" && /edited, not appended/.test(i.detail)));
+	} finally { await reader.close(); f.close(); }
+});
+
+test("a merge in history gives a partial issue and no blocked assertion", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.git("checkout", "-qb", "side");
+		f.commit("side work", T("10:02"));
+		f.git("checkout", "-q", "-");
+		f.block("A", T("10:05"));
+		f.env = { GIT_COMMITTER_DATE: T("10:06"), GIT_AUTHOR_DATE: T("10:06") };
+		f.git("merge", "-q", "--no-ff", "-m", "blocked(A): merge", "side");
+		f.state(false, T("10:00"));
+		const s = await readOnce(f);
+		const merge = s.git?.commits?.at(-1);
+		assert.equal(merge?.parents.length, 2);
+		assert.equal(merge?.kind, "other");
+		assert.ok(s.issues.some((i) => i.source === "git" && /merge/.test(i.detail)));
+		assert.deepEqual(statuses(s), { A: "stopped" });
+	} finally { f.close(); }
+});
+
+test("detached HEAD reports no branch; a rewind drops unreachable commits", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const reader = openLoop(f.root, { runtime: clock() });
+	try {
+		const setup = f.git("rev-parse", "HEAD");
+		f.block("A", T("10:05"));
+		f.state(false, T("10:00"));
+		assert.deepEqual(statuses(await reader.read()), { A: "blocked" });
+		f.git("checkout", "-q", "--detach", setup);
+		const s = await reader.read();
+		assert.equal(s.git?.branch, null);
+		assert.equal(s.git?.head, setup);
+		assert.deepEqual(s.git?.commits?.map((c) => c.subject), ["setup"]);
+		assert.deepEqual(statuses(s), { A: "stopped" });
+	} finally { await reader.close(); f.close(); }
+});
+
+test("staging a change during a read gives a concurrent issue", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	let injected = false;
+	const runtime: ObservationRuntime = {
+		...clock(),
+		async git(root, args, signal) {
+			const out = await defaultRuntime.git(root, args, signal);
+			if (!injected && args[0] === "rev-list") {
+				injected = true;
+				writeFileSync(path.join(f.root, "new file.txt"), "x");
+				f.git("add", "new file.txt");
+			}
+			return out;
+		},
+	};
+	try {
+		f.state(true, T("10:00"));
+		const s = await readOnce(f, runtime);
+		assert.equal(s.git, null);
+		assert.ok(s.issues.some((i) => i.kind === "concurrent"));
+		assert.deepEqual(statuses(s), { A: "working" });
+	} finally { f.close(); }
+});
+
+test("independent readers keep independent run-start history", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const first = openLoop(f.root, { runtime: clock() });
+	try {
+		f.state(true, T("10:00"), "run-a");
+		await first.read();
+		f.state(true, T("10:20"), "run-b");
+		assert.equal((await first.read()).runStarts.length, 2);
+		assert.deepEqual((await readOnce(f)).runStarts.map((r) => r.loopToken), ["run-b"]);
+	} finally { await first.close(); f.close(); }
+});
 
 test("openLoop rejects a missing root and a mismatched mission", async () => {
 	assert.throws(() => openLoop(path.join(tmpdir(), "no-such-ralph-root-xyz")));

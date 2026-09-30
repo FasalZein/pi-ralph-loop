@@ -126,10 +126,15 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	const firstFalse = keyed.find((k) => k.item.passes !== true) ?? null;
 
 	// Pass recency uses commit graph order, not commit timestamps.
+	// A merge makes graph recency ambiguous: blocked and retry are then not asserted.
+	const linear = !!commits && commits.every((c) => c.parents.length <= 1);
+	if (commits && !linear) {
+		issues.push({ source: "git", kind: "partial", detail: "merge commit in history; pass and blocker recency ambiguous" });
+	}
 	let lastPass = -1;
 	commits?.forEach((c, i) => { if (c.kind === "item-pass") lastPass = i; });
 	const newBlocker = (key: string): CommitEvent | null => {
-		if (!commits) return null;
+		if (!commits || !linear) return null;
 		for (let i = commits.length - 1; i > lastPass; i--) {
 			if (commits[i].kind === "blocker" && commits[i].blockerItem === key) return commits[i];
 		}
@@ -235,7 +240,11 @@ type CommitFacts = {
 	readonly passes: ReadonlyMap<string, boolean> | null;
 };
 
-type ProgressCache = { stamp: FileStamp; bytes: number; text: string; decoder: StringDecoder; cards: readonly AttemptCard[] };
+type ProgressCache = { stamp: FileStamp; bytes: number; tail: Buffer; text: string; decoder: StringDecoder; cards: readonly AttemptCard[] };
+
+// Bytes before the old end that an append must leave unchanged. Detects edits
+// near the end, not every in-place rewrite of older content.
+const PROGRESS_TAIL_CHECK_BYTES = 64;
 
 function sameFile(a: FileStamp | null, b: FileStamp | null): boolean {
 	return !!a && !!b && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
@@ -330,10 +339,23 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		const stamp = await rt.stat(file(PROGRESS_FILE));
 		if (!stamp) { progress = null; issues.push({ source: "progress", kind: "missing", detail: `${PROGRESS_FILE} not found` }); return []; }
 		if (progress && sameFile(progress.stamp, stamp)) return progress.cards;
-		const appended = progress && progress.stamp.dev === stamp.dev && progress.stamp.ino === stamp.ino && stamp.size >= progress.bytes;
-		// Truncation or replacement resets; the initial parse necessarily sees the full file.
-		const base = appended ? progress! : { bytes: 0, text: "", decoder: new StringDecoder("utf8") };
-		const chunk = await rt.readRange(file(PROGRESS_FILE), base.bytes, stamp.size);
+		let base: Pick<ProgressCache, "bytes" | "text" | "decoder"> = { bytes: 0, text: "", decoder: new StringDecoder("utf8") };
+		let from = 0;
+		if (progress && progress.stamp.dev === stamp.dev && progress.stamp.ino === stamp.ino && stamp.size >= progress.bytes) {
+			base = progress;
+			from = progress.bytes - progress.tail.length;
+		}
+		// Truncation, replacement or a changed tail resets; the initial parse sees the full file.
+		let chunk = await rt.readRange(file(PROGRESS_FILE), from, stamp.size);
+		if (from < base.bytes) {
+			if (!chunk.subarray(0, base.bytes - from).equals(progress!.tail)) {
+				issues.push({ source: "progress", kind: "partial", detail: `${PROGRESS_FILE} was edited, not appended; reparsed` });
+				base = { bytes: 0, text: "", decoder: new StringDecoder("utf8") };
+				chunk = await rt.readRange(file(PROGRESS_FILE), 0, stamp.size);
+			} else {
+				chunk = chunk.subarray(base.bytes - from);
+			}
+		}
 		if (!sameFile(stamp, await rt.stat(file(PROGRESS_FILE)))) {
 			issues.push({ source: "progress", kind: "concurrent", detail: `${PROGRESS_FILE} changed during read` });
 			return progress?.cards ?? [];
@@ -341,7 +363,10 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		// The decoder carries a split UTF-8 sequence to the next append.
 		const decoder = base.decoder;
 		const text = base.text + decoder.write(chunk);
-		progress = { stamp, bytes: base.bytes + chunk.length, text, decoder, cards: parseProgress(text) };
+		const bytes = base.bytes + chunk.length;
+		const prior = base.bytes > 0 ? progress!.tail : Buffer.alloc(0);
+		const tail = Buffer.from(Buffer.concat([prior, chunk]).subarray(-PROGRESS_TAIL_CHECK_BYTES));
+		progress = { stamp, bytes, tail, text, decoder, cards: parseProgress(text) };
 		return progress.cards;
 	}
 
@@ -471,11 +496,12 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 
 function classify(sha: string, facts: CommitFacts, parent: CommitFacts | null, mission: Mission): CommitEvent {
 	// Only false->true flips on keys present in both versions count as passes.
-	const passedItems = facts.passes && parent?.passes
+	// Merges are not classified: which parent a flip came from is ambiguous.
+	const passedItems = facts.parents.length <= 1 && facts.passes && parent?.passes
 		? [...facts.passes].filter(([key, passes]) => passes && parent.passes!.get(key) === false).map(([key]) => key)
 		: [];
 	let blockerItem: string | null = null;
-	if (mission.blocker) {
+	if (mission.blocker && facts.parents.length <= 1) {
 		const captured = new RegExp(mission.blocker.subjectRegex).exec(facts.subject)?.groups?.[mission.blocker.itemGroup];
 		// An unknown captured item is not bound to a real item.
 		if (captured !== undefined && facts.passes?.has(captured)) blockerItem = captured;
