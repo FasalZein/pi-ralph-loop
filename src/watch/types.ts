@@ -166,7 +166,8 @@ export type CommitEvent = {
 	readonly sha: string;
 	readonly parents: readonly string[];
 	readonly subject: string;
-	readonly committedAt: string;
+	/** Null when the commit carries an invalid committer timestamp (reported as an issue). */
+	readonly committedAt: string | null;
 	readonly kind: "item-pass" | "blocker" | "parent" | "other";
 	/** Item keys whose `passes` flipped false to true against the first parent. */
 	readonly passedItems: readonly string[];
@@ -190,6 +191,29 @@ export type GitObservation = {
 	readonly commits: readonly CommitEvent[] | null;
 };
 
+export type SourceName = "state" | "items" | "progress" | "git";
+
+/**
+ * fresh: read completely and unchanged over the whole observation.
+ * stale: not fresh now; the last good value is in `retained`.
+ * missing: the file is absent. unavailable: not fresh and nothing retained.
+ * not-applicable: the task has no such source (plain task items/progress).
+ */
+export type SourceStatus = "fresh" | "stale" | "missing" | "unavailable" | "not-applicable";
+
+type Retained<T> = { readonly value: T; readonly observedAt: string } | null;
+
+/**
+ * Last good values for sources that are not fresh in this snapshot. Display
+ * only: retained data never proves a terminal state or a HARD alert.
+ */
+export type RetainedValues = {
+	readonly state: Retained<import("../types.js").RalphLoopState>;
+	readonly items: Retained<readonly ObservedItem[]>;
+	readonly attempts: Retained<readonly ObservedAttempt[]>;
+	readonly git: Retained<GitObservation>;
+};
+
 export type LoopSnapshot = {
 	readonly root: string;
 	readonly observedAt: string;
@@ -211,6 +235,8 @@ export type LoopSnapshot = {
 	readonly historyComplete: false;
 	/** Fresh, consistent git evidence; null when git failed or changed during the read. */
 	readonly git: GitObservation | null;
+	readonly sources: Readonly<Record<SourceName, SourceStatus>>;
+	readonly retained: RetainedValues;
 	readonly issues: readonly Issue[];
 };
 

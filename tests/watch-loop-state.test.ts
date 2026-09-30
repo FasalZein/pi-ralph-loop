@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -218,7 +218,7 @@ test("timeline: blocked, then retry after relaunch, then working after another p
 		f.pass("B", T("10:25"));
 		const s = await readOnce(f);
 		assert.deepEqual(statuses(s), { A: "working", B: "passed" });
-		assert.deepEqual(s.git?.commits?.map((c) => [c.kind, c.subject, c.committedAt.slice(11, 16)]).slice(1), [
+		assert.deepEqual(s.git?.commits?.map((c) => [c.kind, c.subject, c.committedAt?.slice(11, 16)]).slice(1), [
 			["blocker", "blocked(A): gate", "10:05"], ["item-pass", "feat: B", "10:25"],
 		]);
 	} finally { f.close(); }
@@ -455,7 +455,7 @@ test("mid-read HEAD change gives a concurrent issue, then a coherent next read",
 	} finally { await reader.close(); f.close(); }
 });
 
-test("large progress reads are incremental: unchanged polls read nothing, appends read the suffix", async () => {
+test("large progress reads: unchanged polls read nothing; a changed file is read once and its prefix verified", async () => {
 	const f = new Fixture([{ id: "A", passes: false }]);
 	const ranges: [string, number, number | undefined][] = [];
 	const shows: string[] = [];
@@ -476,7 +476,7 @@ test("large progress reads are incremental: unchanged polls read nothing, append
 		const firstShows = shows.length;
 		ranges.length = 0;
 		await reader.read();
-		assert.deepEqual(ranges, []);
+		assert.deepEqual(ranges.filter((r) => r[0] === "progress.md"), []);
 		// Immutable commits are inspected once per SHA.
 		assert.equal(shows.length, firstShows);
 		// A split multibyte character across appends still decodes.
@@ -485,9 +485,17 @@ test("large progress reads are incremental: unchanged polls read nothing, append
 		await reader.read();
 		appendFileSync(path.join(f.root, ".ralph/progress.md"), euro.subarray(euro.length - 3));
 		const s = await reader.read();
-		// Each append read covers only the new suffix plus a fixed 64-byte tail check.
-		const tail = 64;
-		assert.deepEqual(ranges, [["progress.md", size - tail, size + euro.length - 3], ["progress.md", size + euro.length - 3 - tail, size + euro.length]]);
+		// Each changed poll reads the file once; the old prefix is hash-verified, not trusted.
+		// The worktree fingerprint also hashes the now-dirty file once per change (end undefined).
+		assert.deepEqual(ranges.filter((r) => r[0] === "progress.md"), [
+			["progress.md", 0, undefined], ["progress.md", 0, size + euro.length - 3],
+			["progress.md", 0, undefined], ["progress.md", 0, size + euro.length],
+		]);
+		// An unchanged dirty file is not reread by the source or the fingerprint.
+		ranges.length = 0;
+		await reader.read();
+		assert.deepEqual(ranges.filter((r) => r[0] === "progress.md"), []);
+		assert.ok(!s.issues.some((i) => i.source === "progress"));
 		assert.equal(s.attempts.at(-1)?.title, "price €");
 	} finally { await reader.close(); f.close(); }
 });
@@ -624,4 +632,246 @@ test("openLoop rejects a missing root and a mismatched mission", async () => {
 		const mission = await loadMission(g.root);
 		assert.throws(() => openLoop(f.root, { mission }), /mission root/);
 	} finally { f.close(); g.close(); }
+});
+
+// ---- Review regressions (rw-t3 review, findings 1-11) ----
+
+/** Runtime that runs `inject` once, right after the first `rev-list`. */
+function midRead(inject: () => void, base: ObservationRuntime = clock()): ObservationRuntime {
+	let done = false;
+	return {
+		...base,
+		async git(root, args, signal) {
+			const out = await base.git(root, args, signal);
+			if (!done && args[0] === "rev-list") { done = true; inject(); }
+			return out;
+		},
+	};
+}
+
+test("review-1: a relaunch in ignored loop.md during the git window withholds activity", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const reader = openLoop(f.root, { runtime: midRead(() => f.state(true, T("10:20"), "run-b")) });
+	try {
+		f.block("A", T("10:05"));
+		f.state(false, T("10:00"), "run-a");
+		let s = await reader.read();
+		assert.ok(s.issues.some((i) => i.source === "state" && i.kind === "concurrent"));
+		assert.equal(s.state, null);
+		assert.equal(s.sources.state, "unavailable");
+		assert.deepEqual(statuses(s), { A: "pending" });
+		s = await reader.read();
+		assert.deepEqual([s.run.loopToken, statuses(s)], ["run-b", { A: "retry" }]);
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-2a: a content change to an already-dirty items file during the read is detected", async () => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	const reader = openLoop(f.root, { runtime: midRead(() => { f.items[0].passes = true; f.writeBundle(); }) });
+	try {
+		f.items[1].regression_notes = "dirty";
+		f.writeBundle();
+		f.state(true, T("10:00"));
+		let s = await reader.read();
+		assert.equal(s.git, null);
+		assert.ok(s.issues.some((i) => i.source === "git" && i.kind === "concurrent"));
+		assert.ok(!s.items.some((i) => i.status === "working"));
+		s = await reader.read();
+		assert.deepEqual(statuses(s), { A: "passed", B: "working" });
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-2b: worktree fingerprint covers file content, including names with spaces and newlines", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const odd = path.join(f.root, "odd name\n\tx.txt");
+	writeFileSync(odd, "one\n");
+	f.commit("odd file", T("09:30"));
+	writeFileSync(odd, "two\n");
+	const reader = openLoop(f.root, { runtime: midRead(() => writeFileSync(odd, "six\n")) });
+	try {
+		f.state(true, T("10:00"));
+		const s = await reader.read();
+		assert.equal(s.git, null);
+		assert.ok(s.issues.some((i) => i.source === "git" && i.kind === "concurrent"));
+		assert.equal((await reader.read()).git?.head, f.git("rev-parse", "HEAD"));
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-3: a transient historical items read failure is an issue and is not cached", async () => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	try {
+		f.block("A", T("10:05"));
+		const passB = f.pass("B", T("10:10"));
+		f.state(false, T("10:00"));
+		let failed = false;
+		const runtime: ObservationRuntime = {
+			...clock(),
+			git(root, args, signal) {
+				const line = args.join(" ");
+				if (!failed && line.includes(passB) && line.includes("items.json")) { failed = true; return Promise.reject(new Error("transient")); }
+				return defaultRuntime.git(root, args, signal);
+			},
+		};
+		const reader = openLoop(f.root, { runtime });
+		try {
+			let s = await reader.read();
+			assert.ok(failed);
+			assert.equal(s.git?.commits ?? null, null);
+			assert.ok(s.issues.some((i) => i.source === "git" && /transient/.test(i.detail)));
+			assert.notEqual(statuses(s).A, "blocked");
+			s = await reader.read();
+			assert.deepEqual(statuses(s), { A: "stopped", B: "passed" });
+		} finally { await reader.close(); }
+	} finally { f.close(); }
+});
+
+test("review-4: a failing required git stamp command is an issue and withholds git", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.block("A", T("10:05"));
+		f.state(false, T("10:00"));
+		const s = await readOnce(f, {
+			...clock(),
+			git: (root, args, signal) => (["status", "ls-files"].includes(args[0]) ? Promise.reject(new Error("stamp failed")) : defaultRuntime.git(root, args, signal)),
+		});
+		assert.equal(s.git, null);
+		assert.ok(s.issues.some((i) => i.source === "git" && /stamp failed/.test(i.detail)));
+		assert.deepEqual(statuses(s), { A: "stopped" });
+	} finally { f.close(); }
+});
+
+test("review-5: a same-length edit of an old progress entry is detected and reparsed", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	const reader = openLoop(f.root, { runtime: clock() });
+	try {
+		f.state(true, T("10:00"));
+		const file = path.join(f.root, ".ralph/progress.md");
+		const tail = "# B blocked: later entry that keeps the last sixty-four bytes unchanged\n";
+		writeFileSync(file, "# A blocked: original\n" + tail);
+		await reader.read();
+		writeFileSync(file, "# A passed:  original\n" + tail);
+		utimesSync(file, new Date(T("11:00")), new Date(T("11:00")));
+		const s = await reader.read();
+		assert.equal(s.attempts[0].outcome, "passed");
+		assert.ok(s.issues.some((i) => i.source === "progress" && /edited, not appended/.test(i.detail)));
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-6: an operational ancestry failure is unavailable, not proven non-ancestry", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.state(true, T("10:00"));
+		const s = await readOnce(f, {
+			...clock(),
+			git: (root, args, signal) => (args[0] === "merge-base" ? Promise.reject(new Error("spawn failed")) : defaultRuntime.git(root, args, signal)),
+		});
+		assert.ok(!s.issues.some((i) => /not an ancestor/.test(i.detail)));
+		assert.ok(s.issues.some((i) => i.source === "git" && i.kind === "unavailable" && /spawn failed/.test(i.detail)));
+		assert.equal(s.git?.commits, null);
+	} finally { f.close(); }
+});
+
+test("review-7: a pass entry committed before its flip commit gets no SHA and an issue", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.progress += "# A passed: done\n";
+		f.writeBundle();
+		f.commit("notes only", T("10:05"));
+		f.items[0].passes = true;
+		f.writeBundle();
+		const flip = f.commit("feat: A", T("10:10"));
+		f.state(false, T("10:00"));
+		const s = await readOnce(f);
+		assert.equal(s.git?.commits?.at(-1)?.sha, flip);
+		assert.equal(s.attempts[0].commitSha, null);
+		assert.ok(s.issues.some((i) => i.source === "progress" && /not introduced/.test(i.detail)));
+	} finally { f.close(); }
+});
+
+test("review-8: invalid optional id or title metadata is an issue, not a fallback key", async () => {
+	const f = new Fixture([{ id: "A", passes: false }], { mission: false });
+	const reader = openLoop(f.root, { runtime: clock() });
+	try {
+		f.state(true, T("10:00"));
+		assert.deepEqual(statuses(await reader.read()), { A: "working" });
+		for (const bad of [{ id: 5 }, { title: 12 }, { id: " " }]) {
+			f.items = [{ id: "A", passes: false, ...bad } as unknown as Item];
+			f.writeBundle();
+			const s = await reader.read();
+			assert.deepEqual(s.items, [], JSON.stringify(bad));
+			assert.ok(s.issues.some((i) => i.source === "items" && /must be a nonblank string/.test(i.detail)));
+		}
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-9: an item key __proto__ is an own, frozen itemAttempts entry", async () => {
+	const f = new Fixture([{ id: "__proto__", passes: false }], { mission: false });
+	try {
+		f.progress = "# __proto__ blocked: gate\n";
+		f.writeBundle();
+		f.state(true, T("10:00"));
+		const s = await readOnce(f);
+		assert.deepEqual(Object.keys(s.itemAttempts), ["__proto__"]);
+		const own = Object.getOwnPropertyDescriptor(s.itemAttempts, "__proto__")?.value as unknown[];
+		assert.equal(own.length, 1);
+		assert.ok(Object.isFrozen(own));
+		assert.match(JSON.stringify(s.itemAttempts), /"__proto__":\[/);
+	} finally { f.close(); }
+});
+
+test("review-10: after a good read, failed sources show retained values marked stale, never fresh", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	let appendDuringRead = false;
+	const runtime: ObservationRuntime = {
+		...clock(),
+		async readRange(file, start, end) {
+			const out = await defaultRuntime.readRange(file, start, end);
+			if (appendDuringRead && file.endsWith("progress.md") && end !== undefined) { appendDuringRead = false; appendFileSync(file, "# A blocked: racing\n"); }
+			return out;
+		},
+	};
+	const reader = openLoop(f.root, { runtime });
+	try {
+		f.block("A", T("10:05"));
+		f.state(true, T("10:00"));
+		const good = await reader.read();
+		assert.deepEqual(good.sources, { state: "fresh", items: "fresh", progress: "fresh", git: "fresh" });
+		assert.equal(good.retained.items, null);
+		writeFileSync(path.join(f.root, ".ralph/items.json"), "{");
+		writeFileSync(path.join(f.root, ".ralph/loop.md"), "---\nrunning: true\n");
+		appendFileSync(path.join(f.root, ".ralph/progress.md"), "# A blocked: new\n");
+		appendDuringRead = true;
+		const s = await reader.read();
+		assert.equal(s.sources.items, "stale");
+		assert.equal(s.sources.state, "stale");
+		assert.equal(s.sources.progress, "stale");
+		assert.deepEqual(s.items, []);
+		assert.equal(s.state, null);
+		assert.deepEqual(s.attempts, []);
+		assert.equal(s.currentItem, null);
+		assert.deepEqual(s.retained.items?.value.map((i) => [i.key, i.status]), [["A", "retry"]]);
+		assert.equal(s.retained.items?.observedAt, good.observedAt);
+		assert.equal(s.retained.state?.value.loop_token, "run-a");
+		assert.equal(s.retained.attempts?.value.length, 1);
+	} finally { await reader.close(); f.close(); }
+});
+
+test("review-11: an invalid committer timestamp is an issue and never a boundary time", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		const tree = f.git("rev-parse", "HEAD^{tree}");
+		const head = f.git("rev-parse", "HEAD");
+		const raw = path.join(f.root, "..", `${path.basename(f.root)}-commit.txt`);
+		writeFileSync(raw, `tree ${tree}\nparent ${head}\nauthor T <t@example.invalid> 1790000000 +0000\ncommitter bad\n\nblocked(A): gate\n`);
+		const oid = f.git("hash-object", "-t", "commit", "-w", "--literally", raw);
+		rmSync(raw);
+		f.git("update-ref", "HEAD", oid);
+		f.state(false, T("10:00"));
+		const s = await readOnce(f);
+		const event = s.git?.commits?.at(-1);
+		assert.equal(event?.sha, oid);
+		assert.equal(event?.committedAt, null);
+		assert.ok(s.issues.some((i) => i.source === "git" && i.detail === `invalid committer timestamp at ${oid}`));
+		assert.deepEqual(statuses(s), { A: "stopped" });
+	} finally { f.close(); }
 });
