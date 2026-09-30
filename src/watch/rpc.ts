@@ -27,7 +27,7 @@ export class RpcMonitor {
 		this.lastPiAt = at;
 		if (date.getTime() - this.lastActivity >= 1000) { this.lastActivity = date.getTime(); this.emit({ kind: "activity" }); }
 		if (record.type === "agent_start") this.settled = false;
-		if (record.type === "agent_end") this.settled = true;
+		if (record.type === "agent_settled") this.settled = true;
 		if (record.type === "extension_ui_request" && typeof record.id === "string" && ["select", "confirm", "input", "editor"].includes(text(record.method))) {
 			reply({ type: "extension_ui_response", id: record.id, cancelled: true });
 			this.counters.dialogsCancelled++;
