@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
-import { join, relative, resolve, isAbsolute } from "node:path";
+import { join } from "node:path";
 import { FACT_SOCKET_ENV, LAUNCH_ID_ENV } from "../loop/watch-events.js";
-import { JournalWriter, object } from "./journal.js";
-import { PiRpc, RpcMonitor, emptyTotals, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
-import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, parseEnvelope, parseEventFrame, parseFact, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Envelope } from "./transport.js";
+import { ControlHandler } from "./driver-control.js";
+import { FactTracker } from "./driver-facts.js";
+import { JournalWriter } from "./journal.js";
+import { PiRpc, RpcMonitor, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
+import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, parseEventFrame, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Broadcast, type Envelope } from "./transport.js";
 import type { Control, DriverState, EventFrame, JournalRecord, Mission, Receipt, RunKey } from "./types.js";
 
 export { ControlError, DriverError, FIFO_ENVELOPE_MAX_BYTES, SUBSCRIBER_QUEUE_LIMIT_BYTES } from "./transport.js";
@@ -139,18 +141,6 @@ export async function releaseLaunch(target: { root: string; launchId: string }, 
 	await sendControl({ root: target.root, run: { launchId: target.launchId, loopToken: null, startedAt: null } }, { kind: "go" }, signal);
 }
 
-function readSteer(root: string, path: string): { path: string; text: string } {
-	const directory = join(root, ".ralph/steer");
-	const resolved = resolve(root, path);
-	const inside = relative(directory, resolved);
-	if (!inside || inside === ".." || inside.startsWith("../") || isAbsolute(inside) || realpathSync(directory) !== directory || realpathSync(resolved) !== resolved || !lstatSync(resolved).isFile()) throw new ControlError("rejected", "Steer path escapes .ralph/steer or is not a regular file");
-	const fd = openSync(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
-	try {
-		if (!fstatSync(fd).isFile()) throw new ControlError("rejected", "Steer path is not a regular file");
-		return { path: resolved, text: readFileSync(fd, "utf8") };
-	} finally { closeSync(fd); }
-}
-
 export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): Promise<DriverExit> {
 	let root: string;
 	try { root = realpathSync(spec.mission.root); if (!lstatSync(join(root, ".ralph")).isDirectory()) throw new Error("missing .ralph"); }
@@ -167,14 +157,11 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	let journal: JournalWriter | null = null;
 	let metadataWritten = false;
 	let state: DriverState = "starting";
-	let loop: Extract<EventFrame, { type: "hello" }>["loop"] = null;
-	let launched = false;
-	let launchPending = false;
+		let launched = false;
 	let launchTimer: ReturnType<typeof setTimeout> | undefined;
 	let ready = false;
 	let finished = false;
 	let ended = false;
-	let released = false;
 	let settleTimer: ReturnType<typeof setTimeout> | undefined;
 	let resolveExit!: (exit: DriverExit) => void;
 	const terminal = new Promise<DriverExit>((resolve) => { resolveExit = resolve; });
@@ -185,111 +172,37 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	const base = () => ({ v: 1 as const, t: now().toISOString(), r: spec.launchId });
 	function driverFact(e: Extract<JournalRecord, { k: "d" }>["e"], why?: string, c?: number | null): void { journal?.append({ ...base(), k: "d", e, ...(why ? { why: why.slice(0, 100) } : {}), ...(c !== undefined ? { c } : {}) }); }
 	const monitor = new RpcMonitor((event) => events?.publish({ type: "event", event }), now);
-	function flushUsage(): void {
-		const totals = monitor.totals;
-		if (Object.values(totals).some((value) => value !== 0)) journal?.append({ ...base(), k: "u", tok: loop?.token ?? null, i: loop?.iteration ?? 1, in: totals.input, out: totals.output, cr: totals.cacheRead, cw: totals.cacheWrite, c: Number(totals.costUsd.toFixed(6)), n: totals.messages, dc: totals.dialogsCancelled, pr: totals.refusals });
-		monitor.totals = emptyTotals();
-	}
+	const publish = (frame: Broadcast) => events?.publish(frame);
 	function checkSettled(): void {
 		clearTimeout(settleTimer);
 		if (!ended || finished) return;
 		if (monitor.settled) finish("loop-finished");
 		else settleTimer = setTimeout(() => finish("loop-finished"), runtime.settleTimeoutMs ?? 5000);
 	}
-	const lastSequences = new Map<string, number>();
-	const endedTokens = new Set<string>();
-	const acceptedStops = new Map<string, Set<string>>();
-	const stopResults = new Map<string, Promise<boolean>>();
-	function receiveFact(line: string): void {
-		const envelope = parseFact(line);
-		if (!envelope || envelope.fact.run.launchId !== spec.launchId) { monitor.counters.badFacts++; return; }
-		const fact = envelope.fact;
-		const key = JSON.stringify([fact.run.launchId, fact.run.loopToken]);
-		const last = lastSequences.get(key) ?? 0;
-		if (envelope.sequence <= last) return;
-		if (envelope.sequence > last + 1) { events?.publish({ type: "gap", source: "facts", from: last + 1, to: envelope.sequence - 1 }); driverFact("gap", `${last + 1}-${envelope.sequence - 1}`); }
-		lastSequences.set(key, envelope.sequence);
-		if (!loop || loop.token !== fact.run.loopToken || loop.iteration !== fact.iteration) {
-			flushUsage(); monitor.resetIteration();
-		}
-		loop = { token: fact.run.loopToken, startedAt: fact.run.startedAt, iteration: fact.iteration };
-		if (fact.kind === "iteration-start" && (fact.phase === "initialized" || fact.phase === "resumed")) journal?.append({ ...base(), k: "loop", tok: loop.token, sa: loop.startedAt, i: loop.iteration, ph: fact.phase });
-		if (fact.kind === "promise-decision") journal?.append({ ...base(), k: "g", tok: loop.token, i: loop.iteration, p: fact.promise, ok: fact.accepted ? 1 : 0, ...(fact.reason ? { why: fact.reason.slice(0, 100) } : {}) });
-		if (fact.kind === "iteration-end") flushUsage();
-		events?.publish({ type: "event", event: { kind: "fact", fact } });
-		if (launchPending && fact.kind === "iteration-start" && (fact.phase === "initialized" || fact.phase === "entered")) {
-			launchPending = false; launched = true; clearTimeout(launchTimer);
-			state = "launched"; events?.publish({ type: "lifecycle", state: "launched" }); driverFact("launched");
-		}
-		if (fact.kind === "loop-ended") {
-			ended = true; endedTokens.add(loop.token);
-			for (const id of acceptedStops.get(loop.token) ?? []) events?.publish({ type: "ack", id, op: "stop", phase: "completed" });
-			checkSettled();
-		}
-	}
-	async function control(envelope: Envelope | null): Promise<void> {
-		const op = envelope?.op ?? "stop";
-		const id = envelope?.id ?? null;
-		const token = loop?.token ?? "pre-loop";
-		const ack = (phase: "accepted" | "completed" | "rejected", reason?: string, duplicate?: boolean) => { if (id) events?.publish({ type: "ack", id, op, phase, ...(reason ? { reason } : {}), ...(duplicate ? { duplicate } : {}) }); };
-		const intervention = (ok: boolean, why?: string, txt?: string) => { if (op !== "go") journal?.append({ ...base(), k: "x", op, id, ok: ok ? 1 : 0, ...(why ? { why: why.slice(0, 100) } : {}), ...(txt !== undefined ? { txt } : {}) }); };
-		if (envelope && (envelope.launch !== spec.launchId || (envelope.token !== null && envelope.token !== loop?.token))) { ack("rejected", "wrong-run"); return; }
-		if (op === "go") {
+	const tracker: FactTracker = new FactTracker({
+		launchId: spec.launchId, monitor, journal: () => journal, base, publish, driverFact,
+		onLaunched: () => { launched = true; clearTimeout(launchTimer); state = "launched"; publish({ type: "lifecycle", state: "launched" }); driverFact("launched"); },
+		onLoopEnded: (token) => { ended = true; controls.loopEnded(token); checkSettled(); },
+	});
+	const controls: ControlHandler = new ControlHandler({
+		root, launchId: spec.launchId, tracker, monitor, rpc: () => rpc, journal: () => journal, base, publish, log,
+		finished: () => finished, launched: () => launched,
+		releaseGate: () => {
 			const gate = gateReleases.get(spec.gate);
-			if (!gate || gate.root !== root || gate.launchId !== spec.launchId) { ack("rejected", "no-fifo-gate"); return; }
-			gate.release(); ack("accepted", undefined, released); released = true; return;
-		}
-		if (op === "steer" && envelope?.op === "steer") {
-			let steer: { path: string; text: string };
-			try { steer = readSteer(root, envelope.textPath); } catch (error) { ack("rejected", String(error)); intervention(false, "invalid-steer-path"); return; }
-			try {
-				if (!launched || finished || !rpc) { intervention(false, "not-launched", steer.text); ack("rejected", "not-launched"); return; }
-				// pi queues a steer even while idle; it would reach a later iteration or be lost.
-				if (monitor.settled) { intervention(false, "not-streaming", steer.text); ack("rejected", "not-streaming"); return; }
-				const response = await rpc.send({ type: "steer", message: steer.text });
-				intervention(response.success, response.error ?? undefined, steer.text);
-				ack(response.success ? "accepted" : "rejected", response.error ?? undefined);
-			} catch (error) { intervention(false, String(error), steer.text); ack("rejected", String(error)); }
-			finally { try { unlinkSync(steer.path); } catch (error) { log(`steer cleanup: ${String(error)}`); } }
-			return;
-		}
+			if (!gate || gate.root !== root || gate.launchId !== spec.launchId) return false;
+			gate.release(); return true;
+		},
 		// Before the first fact no loop exists to stop: closing pi ends the launch instead.
-		if (!launched) { intervention(true, "not-launched"); ack("completed", "not-launched"); finish("stopped-before-launch"); return; }
-		if (endedTokens.has(token)) { intervention(true, "already-ended"); ack("completed"); return; }
-		const duplicate = stopResults.has(token);
-		let pending = stopResults.get(token);
-		if (!pending) {
-			pending = (async () => { try { return (await rpc!.send({ type: "prompt", message: "/ralph-stop" })).success; } catch { return false; } })();
-			stopResults.set(token, pending);
-		}
-		const success = await pending;
-		if (!success) stopResults.delete(token);
-		else if (id) { const ids = acceptedStops.get(token) ?? new Set<string>(); ids.add(id); acceptedStops.set(token, ids); }
-		intervention(success, success ? undefined : "pi-rejected");
-		ack(success ? (endedTokens.has(token) ? "completed" : "accepted") : "rejected", success ? undefined : "pi-rejected", duplicate && success);
-	}
-	function receiveControl(line: string): void {
-		if (!line) return;
-		if (line === "/ralph-stop") { void control(null).catch((error) => log(`control: ${String(error)}`)); return; }
-		const envelope = parseEnvelope(line);
-		if (!envelope) {
-			log("FIFO: rejected invalid command");
-			try {
-				const value: unknown = JSON.parse(line);
-				if (object(value) && typeof value.id === "string" && value.id.length <= 64) events?.publish({ type: "ack", id: value.id, op: value.op === "steer" || value.op === "go" ? value.op : "stop", phase: "rejected", reason: "bad-envelope" });
-			} catch { /* Plain text is never forwarded to pi. */ }
-			return;
-		}
-		void control(envelope).catch((error) => log(`control: ${String(error)}`));
-	}
+		stopBeforeLaunch: () => { finish("stopped-before-launch"); return "not-launched"; },
+	});
 	let exit: DriverExit | null = null;
 	try {
 		const fifoPath = ensureFifo(root);
 		const paths = socketPaths(root, runtime.tmpDir);
-		events = new EventServer(paths.eventSocket, () => ({ v: 1, type: "hello", launchId: spec.launchId, pid: process.pid, nextSeq: events!.nextSeq, lastPiAt: monitor.lastPiAt, loop, tools: monitor.tools, totals: monitor.totals, counters: monitor.counters, state }), () => { monitor.counters.subscriberDrops++; log("events: dropped subscriber over 1 MB"); }, now);
-		facts = new LineServer(paths.factSocket, receiveFact, () => { monitor.counters.badFacts++; });
+		events = new EventServer(paths.eventSocket, () => ({ v: 1, type: "hello", launchId: spec.launchId, pid: process.pid, nextSeq: events!.nextSeq, lastPiAt: monitor.lastPiAt, loop: tracker.loop, tools: monitor.tools, totals: monitor.totals, counters: monitor.counters, state }), () => { monitor.counters.subscriberDrops++; log("events: dropped subscriber over 1 MB"); }, now);
+		facts = new LineServer(paths.factSocket, (line) => tracker.receive(line), () => { monitor.counters.badFacts++; });
 		await events.listen(); await facts.listen();
-		fifo = readFifo(fifoPath, receiveControl, () => log("FIFO: rejected oversized command"));
+		fifo = readFifo(fifoPath, (line) => controls.receive(line), () => log("FIFO: rejected oversized command"));
 		fifo.on("error", (error) => { log(`FIFO: ${String(error)}`); finish("aborted", null, "FIFO reader failed"); });
 		journal = new JournalWriter(root, { ...base(), k: "run", m: spec.mission.run.model, th: spec.mission.run.thinking, mx: spec.mission.run.maxIterations, tk: spec.mission.task.kind === "bundle" ? "b" : "p" }, log);
 		driverFact("start");
@@ -315,13 +228,13 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			if (spec.mission.task.kind === "plain" && /--max-iterations/i.test(spec.mission.task.prompt)) finish("launch-rejected", null, "Plain prompt contains reserved --max-iterations option");
 			else {
 				const task = spec.mission.task.kind === "bundle" ? '"@.ralph/prompt.md"' : spec.mission.task.prompt;
-				launchPending = true;
-				monitor.onErrorNotify = (message) => { if (launchPending) finish("launch-rejected", null, message); };
+				tracker.expectLaunch(["initialized", "entered"]);
+				monitor.onErrorNotify = (message) => { if (tracker.launchPending) finish("launch-rejected", null, message); };
 				const response = await Promise.race([rpc.send({ type: "prompt", message: `/ralph-loop ${task} --max-iterations=${spec.mission.run.maxIterations}` }).catch(() => null), terminal.then(() => null)]);
 				if (!finished && !response?.success) finish("launch-rejected", null, response?.error ?? "Pi rejected launch");
-				else if (!finished && launchPending) {
+				else if (!finished && tracker.launchPending) {
 					const limit = runtime.launchTimeoutMs ?? LAUNCH_CONFIRM_TIMEOUT_MS;
-					launchTimer = setTimeout(() => { if (launchPending) finish("launch-rejected", null, `No iteration-start fact within ${limit} ms`); }, limit);
+					launchTimer = setTimeout(() => { if (tracker.launchPending) finish("launch-rejected", null, `No iteration-start fact within ${limit} ms`); }, limit);
 				}
 			}
 		}
@@ -335,7 +248,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		if (rpc) {
 			const code = await rpc.close(runtime.shutdownGraceMs ?? PI_SHUTDOWN_GRACE_MS);
 			if (exit && exit.code === null) exit = { ...exit, code };
-			flushUsage(); driverFact("exit", exit?.reason, exit?.code);
+			tracker.flushUsage(); driverFact("exit", exit?.reason, exit?.code);
 			events?.publish({ type: "lifecycle", state: "closed", code, ...(exit?.detail ? { detail: exit.detail } : {}) });
 		}
 		fifo?.destroy();
