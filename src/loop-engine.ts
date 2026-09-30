@@ -13,6 +13,7 @@ import { getCommandCtx, setCommandCtx } from "./loop/command-context.js";
 import { extractControlPromise } from "./loop/control-promise.js";
 import { finalizeLoop } from "./loop/finalize.js";
 import { sendWhenIdle } from "./loop/idle.js";
+import { publishConfirmedFact } from "./loop/watch-events.js";
 import {
 	areLimitRemindersDisabled,
 	selectLimitReminder,
@@ -507,12 +508,28 @@ function getCurrentState(ctx: ExtensionContext): RalphLoopState | null {
 	return readState(ctx.cwd);
 }
 
+// A promise decision belongs to a run that is still active in saved state.
+function isActiveRun(saved: RalphLoopState): boolean {
+	return saved.running;
+}
+
 function handleCompletePromise(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	state: RalphLoopState,
 ): void {
 	const rejection = validateBundlePromise(ctx.cwd, state, "COMPLETE");
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{
+		kind: "promise-decision",
+		promise: "COMPLETE",
+		accepted: !rejection,
+		reason: rejection,
+	},
+		isActiveRun,
+	);
 	if (rejection) {
 		rejectBundlePromise(pi, ctx, state, "COMPLETE", rejection, finalizeLoop);
 		return;
@@ -528,6 +545,17 @@ function handleCompletePromise(
 }
 
 function handleStopPromise(ctx: ExtensionContext, state: RalphLoopState): void {
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{
+		kind: "promise-decision",
+		promise: "STOP",
+		accepted: true,
+		reason: null,
+	},
+		isActiveRun,
+	);
 	showLoopNotice(
 		ctx,
 		`Ralph loop stopped by assistant at iteration ${state.iteration} via <promise>STOP</promise>`,
@@ -541,6 +569,17 @@ function handleWaitPromise(
 	ctx: ExtensionContext,
 	state: RalphLoopState,
 ): void {
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{
+		kind: "promise-decision",
+		promise: "WAIT",
+		accepted: true,
+		reason: null,
+	},
+		isActiveRun,
+	);
 	resetPromiseNudgeChain();
 	scheduleRecoveryCountdown(
 		ctx,
@@ -583,6 +622,15 @@ function markIterationStarted(
 	if ((options.snapshotBundle ?? true) && state.bundle_mode) {
 		snapshotBundleIteration(ctx.cwd, state);
 	}
+	// Entry is confirmed by the saved run being active on this iteration with
+	// the transition cleared by the update above.
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{ kind: "iteration-start", phase: "entered" },
+		(saved) =>
+			saved.running && saved.iteration === state.iteration && !saved.transitioning,
+	);
 }
 
 function startCurrentIteration(
@@ -806,6 +854,17 @@ function handleNextPromise(
 	idle: Promise<void> | null,
 ): void {
 	const rejection = validateBundlePromise(ctx.cwd, state, "NEXT");
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{
+		kind: "promise-decision",
+		promise: "NEXT",
+		accepted: !rejection,
+		reason: rejection,
+	},
+		isActiveRun,
+	);
 	if (rejection) {
 		rejectBundlePromise(pi, ctx, state, "NEXT", rejection, finalizeLoop);
 		return;
@@ -829,6 +888,15 @@ function handleNextPromise(
 		provider_recovery_fresh_fallback_used: false,
 		limit_reminders: null,
 	});
+	// The handoff is committed once the advance is written; `state` still
+	// carries the iteration that just ended.
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{ kind: "iteration-end", outcome: "NEXT" },
+		(saved) =>
+			saved.running && saved.iteration === nextIteration && saved.transitioning,
+	);
 	scheduleNextIteration(ctx, state, idle);
 }
 
@@ -1093,6 +1161,12 @@ export async function runLoop(
 	if (bundleMode) {
 		snapshotBundleIteration(cwd, initialState);
 	}
+	publishConfirmedFact(
+		cwd,
+		initialState,
+		{ kind: "iteration-start", phase: "initialized" },
+		(saved) => saved.running && saved.iteration === initialState.iteration,
+	);
 
 	setCommandCtx(ctx);
 	claimLoopOwnership(ctx.cwd);
@@ -1164,6 +1238,16 @@ export async function resumeCurrentSession(
 	claimLoopOwnership(ctx.cwd);
 	const state = readState(ctx.cwd);
 	if (!state) return;
+	// The reactivation update above can silently write nothing.
+	publishConfirmedFact(
+		ctx.cwd,
+		state,
+		{ kind: "iteration-start", phase: "resumed" },
+		(saved) =>
+			saved.running &&
+			saved.stop_reason === null &&
+			saved.iteration === state.iteration,
+	);
 
 	const { lastAssistant, hasTurns } = readSessionTurns(ctx);
 	const promise = extractControlPromise(lastAssistant);

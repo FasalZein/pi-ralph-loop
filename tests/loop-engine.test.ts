@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import fs, {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
@@ -12,6 +18,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { setLoopApi } from "../src/loop/api-context.ts";
+import { finalizeLoop } from "../src/loop/finalize.ts";
+import {
+	type LoopFactEnvelope,
+	setLoopFactTransportForTests,
+} from "../src/loop/watch-events.ts";
 import {
 	continueLoop,
 	handleLoopAgentEnd,
@@ -2224,3 +2235,622 @@ test("continueLoop sends task and sets up iteration", async () => {
 	assert.equal(state?.session_id, "session-3");
 	assert.equal(state?.transitioning, false);
 });
+
+// Telemetry (#8) ─────────────────────────────────────────────────────
+// A recording receiver replaces the private delivery seam; the engine calls
+// stay real. Each summary line is `kind:detail@iteration`.
+
+async function withRecordedFacts(
+	run: (facts: LoopFactEnvelope[]) => Promise<void> | void,
+): Promise<void> {
+	const facts: LoopFactEnvelope[] = [];
+	setLoopFactTransportForTests((envelope) => {
+		facts.push(envelope);
+	});
+	try {
+		await run(facts);
+	} finally {
+		setLoopFactTransportForTests(null);
+	}
+}
+
+function summarize(facts: LoopFactEnvelope[]): string[] {
+	return facts.map(({ fact }) => {
+		switch (fact.kind) {
+			case "iteration-start":
+				return `start:${fact.phase}@${fact.iteration}`;
+			case "promise-decision":
+				return `${fact.promise}:${fact.accepted ? "accepted" : "rejected"}@${fact.iteration}`;
+			case "iteration-end":
+				return `end:${fact.outcome}@${fact.iteration}`;
+			case "loop-ended":
+				return `ended:${fact.reason}@${fact.iteration}`;
+		}
+	});
+}
+
+test("telemetry observes initial initialization and entry with one identity", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+
+		await runLoop(h.pi, h.ctx, "task", 3);
+
+		const state = h.readState();
+		assert.deepEqual(summarize(facts), [
+			"start:initialized@1",
+			"start:entered@1",
+		]);
+		for (const { fact } of facts) {
+			assert.equal(fact.run.loopToken, state?.loop_token);
+			assert.equal(fact.run.startedAt, state?.started_at);
+			assert.equal(fact.run.launchId, null);
+			assert.ok(!Number.isNaN(Date.parse(fact.at)));
+		}
+		assert.deepEqual(
+			facts.map((f) => f.sequence),
+			[1, 2],
+		);
+		assert.notEqual(facts[0]?.id, facts[1]?.id);
+	});
+});
+
+test("telemetry observes accepted NEXT handoff before the next iteration is entered", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		const gate: { release: () => void } = { release: () => {} };
+		h.ctx.waitForIdle = () =>
+			new Promise<void>((resolve) => {
+				gate.release = resolve;
+			});
+		h.writeState(makeBaseState({ transitioning: false }));
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+		await new Promise((r) => setTimeout(r, 300));
+		assert.deepEqual(summarize(facts), [
+			"start:entered@1",
+			"NEXT:accepted@1",
+			"end:NEXT@1",
+		]);
+		assert.equal(facts[1]?.fact.kind === "promise-decision" && facts[1].fact.reason, null);
+
+		gate.release();
+		await new Promise((r) => setTimeout(r, 50));
+		assert.equal(h.newSessionCalls, 1);
+		assert.deepEqual(summarize(facts).slice(3), ["start:entered@2"]);
+	});
+});
+
+test("telemetry reports the real rejected NEXT reason without ending the iteration", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		writeBundleItems(h.cwd, [false]);
+		h.writeState(makeBaseState({ transitioning: false, bundle_mode: true }));
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "Iteration 1\n<promise>NEXT</promise>" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		assert.deepEqual(summarize(facts), ["start:entered@1", "NEXT:rejected@1"]);
+		const decision = facts[1]?.fact;
+		assert.equal(decision?.kind, "promise-decision");
+		const reason = decision?.kind === "promise-decision" ? decision.reason : null;
+		assert.match(reason ?? "", /exactly one item/);
+		// The published reason is the same text the agent was told.
+		assert.ok((h.sentMessages.at(-1) ?? "").includes(reason ?? "<none>"));
+		assert.equal(h.readState()?.bundle_rejection_count, 1);
+		assert.equal(h.readState()?.iteration, 1);
+		assert.equal(h.newSessionCalls, 0);
+	});
+});
+
+test("telemetry reports repeated WAIT with distinct ids and no iteration end", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+
+		h.simulateAgentEnd({ text: "Waiting.\n<promise>WAIT</promise>" });
+		h.simulateAgentEnd({ text: "Still waiting.\n<promise>WAIT</promise>" });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		assert.deepEqual(summarize(facts), ["WAIT:accepted@1", "WAIT:accepted@1"]);
+		assert.notEqual(facts[0]?.id, facts[1]?.id);
+		assert.equal(h.readState()?.running, true);
+		assert.equal(h.readState()?.iteration, 1);
+		assert.deepEqual(h.sentMessages, []);
+	});
+});
+
+test("telemetry reports accepted and rejected COMPLETE decisions", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		writeBundleItems(h.cwd, [true, false]);
+		h.writeState(makeBaseState({ transitioning: false, bundle_mode: true }));
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "All done\n<promise>COMPLETE</promise>" });
+		assert.equal(h.readState()?.running, true);
+		writeBundleItems(h.cwd, [true, true]);
+		h.simulateAgentEnd({ text: "All done\n<promise>COMPLETE</promise>" });
+
+		assert.equal(h.readState()?.stop_reason, "complete");
+		assert.deepEqual(summarize(facts), [
+			"start:entered@1",
+			"COMPLETE:rejected@1",
+			"COMPLETE:accepted@1",
+			"ended:complete@1",
+		]);
+		const rejected = facts[1]?.fact;
+		assert.match(
+			rejected?.kind === "promise-decision" ? (rejected.reason ?? "") : "",
+			/every item/,
+		);
+	});
+});
+
+test("telemetry reports STOP and terminal max-iteration NEXT without a handoff", async () => {
+	await withRecordedFacts(async (facts) => {
+		const stopped = createHarness();
+		stopped.writeState(makeBaseState({ transitioning: false }));
+		stopped.simulateAgentEnd({ text: "halt\n<promise>STOP</promise>" });
+		assert.equal(stopped.readState()?.stop_reason, "manual_stop");
+		assert.deepEqual(summarize(facts), ["STOP:accepted@1", "ended:manual_stop@1"]);
+
+		facts.length = 0;
+		const maxed = createHarness();
+		maxed.writeState(
+			makeBaseState({
+				iteration: 2,
+				max_iterations: 2,
+				transitioning: false,
+				loop_token: "token-2",
+			}),
+		);
+		maxed.simulateAgentEnd({ text: "Iteration 2\n<promise>NEXT</promise>" });
+		assert.equal(maxed.readState()?.stop_reason, "max_iterations");
+		assert.deepEqual(summarize(facts), [
+			"NEXT:accepted@2",
+			"ended:max_iterations@2",
+		]);
+	});
+});
+
+test("telemetry observes resume without resnapshotting or changing identity", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+		h.simulateAgentEnd({ stopReason: "aborted", text: "Interrupted" });
+		assert.equal(h.readState()?.stop_reason, "user_cancelled");
+
+		await resumeCurrentSession(h.pi, h.ctx);
+
+		assert.deepEqual(summarize(facts), [
+			"ended:user_cancelled@1",
+			"start:resumed@1",
+			"start:entered@1",
+		]);
+		assert.ok(facts.every((f) => f.fact.run.loopToken === "token-1"));
+		assert.equal(h.readState()?.loop_token, "token-1");
+	});
+});
+
+test("telemetry records finalization after rejection exhaustion", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		writeBundleItems(h.cwd, [false]);
+		h.writeState(
+			makeBaseState({
+				transitioning: false,
+				bundle_mode: true,
+				bundle_rejection_count: 4,
+			}),
+		);
+		await continueLoop(h.pi, h.ctx);
+		h.simulateAgentEnd({ text: "Still not done\n<promise>NEXT</promise>" });
+		h.simulateAgentEnd({ text: "Still not done again\n<promise>NEXT</promise>" });
+
+		assert.equal(h.readState()?.stop_reason, "error");
+		assert.deepEqual(summarize(facts), [
+			"start:entered@1",
+			"NEXT:rejected@1",
+			"NEXT:rejected@1",
+			"ended:error@1",
+		]);
+	});
+});
+
+test("telemetry finalization closes once and keeps cleanup", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+
+		finalizeLoop(h.ctx, h.cwd, "manual_stop", 0);
+		finalizeLoop(h.ctx, h.cwd, "manual_stop", 0);
+
+		assert.deepEqual(summarize(facts), ["ended:manual_stop@1"]);
+		assert.equal(h.readState()?.running, false);
+		assert.equal(h.readState()?.owner_pid, null);
+	});
+});
+
+// Runs one deterministic scenario that crosses every publication site:
+// initialization and entry, WAIT with its bounded recovery prompt, rejected
+// NEXT, accepted NEXT with a fresh session, and accepted COMPLETE.
+async function runTelemetryIsolationScenario() {
+	const previousWait = process.env.RALPH_TEST_WAIT_PARK_TIMEOUT_MS;
+	process.env.RALPH_TEST_WAIT_PARK_TIMEOUT_MS = "20";
+	try {
+		const h = createHarness();
+		writeBundleItems(h.cwd, [false, false, false]);
+		await runLoop(h.pi, h.ctx, "task", 3, { bundleMode: true });
+
+		h.simulateAgentEnd({ text: "Waiting.\n<promise>WAIT</promise>" });
+		await new Promise((r) => setTimeout(r, 1_200));
+
+		h.simulateAgentEnd({ text: "No work\n<promise>NEXT</promise>" });
+		await new Promise((r) => setTimeout(r, 50));
+
+		writeBundleItems(h.cwd, [true, false, false]);
+		h.simulateAgentEnd({ text: "One item\n<promise>NEXT</promise>" });
+		await new Promise((r) => setTimeout(r, 600));
+
+		writeBundleItems(h.cwd, [true, true, true]);
+		h.simulateAgentEnd({ text: "done\n<promise>COMPLETE</promise>" });
+
+		const state = h.readState();
+		return {
+			running: state?.running,
+			stop_reason: state?.stop_reason,
+			iteration: state?.iteration,
+			bundle_rejection_count: state?.bundle_rejection_count,
+			error_count: state?.error_count,
+			sentMessages: [...h.sentMessages],
+			sentMessageOptions: [...h.sentMessageOptions],
+			notifications: [...h.notifications],
+			newSessionCalls: h.newSessionCalls,
+		};
+	} finally {
+		if (previousWait === undefined) {
+			delete process.env.RALPH_TEST_WAIT_PARK_TIMEOUT_MS;
+		} else {
+			process.env.RALPH_TEST_WAIT_PARK_TIMEOUT_MS = previousWait;
+		}
+	}
+}
+
+test("telemetry delivery failure and absent channel leave engine behavior identical", async () => {
+	const absent = await runTelemetryIsolationScenario();
+
+	let attempts = 0;
+	setLoopFactTransportForTests(() => {
+		attempts++;
+		throw new Error("receiver exploded");
+	});
+	let failing: Awaited<ReturnType<typeof runTelemetryIsolationScenario>>;
+	try {
+		failing = await runTelemetryIsolationScenario();
+	} finally {
+		setLoopFactTransportForTests(null);
+	}
+
+	const recorded: LoopFactEnvelope[] = [];
+	setLoopFactTransportForTests((envelope) => {
+		recorded.push(envelope);
+	});
+	let recording: Awaited<ReturnType<typeof runTelemetryIsolationScenario>>;
+	try {
+		recording = await runTelemetryIsolationScenario();
+	} finally {
+		setLoopFactTransportForTests(null);
+	}
+
+	assert.deepEqual(summarize(recorded), [
+		"start:initialized@1",
+		"start:entered@1",
+		"WAIT:accepted@1",
+		"NEXT:rejected@1",
+		"NEXT:accepted@1",
+		"end:NEXT@1",
+		"start:entered@2",
+		"COMPLETE:accepted@2",
+		"ended:complete@2",
+	]);
+	assert.equal(attempts, recorded.length);
+	assert.equal(absent.newSessionCalls, 1);
+	assert.equal(absent.stop_reason, "complete");
+	assert.match(absent.sentMessages.join("\n"), /WAIT timed out/);
+	assert.deepEqual(failing, absent);
+	assert.deepEqual(recording, absent);
+});
+
+// Records facts and, right after the first promise decision is published,
+// makes the next state-file read inside updateState fail once. The update
+// that follows the decision then silently writes nothing (existing
+// updateState behavior); every other read is untouched.
+async function withFailedUpdateAfterDecision(
+	run: (facts: LoopFactEnvelope[]) => Promise<void> | void,
+): Promise<void> {
+	const original = fs.readFileSync;
+	let armed = false;
+	let fired = false;
+	mock.method(fs, "readFileSync", function (
+		this: unknown,
+		...args: Parameters<typeof fs.readFileSync>
+	) {
+		if (
+			armed &&
+			String(args[0]).endsWith(join(".ralph", "loop.md")) &&
+			(new Error().stack ?? "").includes("updateState")
+		) {
+			armed = false;
+			throw new Error("transient state read failure");
+		}
+		return original.apply(this, args);
+	});
+	syncBuiltinESMExports();
+	const facts: LoopFactEnvelope[] = [];
+	setLoopFactTransportForTests((envelope) => {
+		facts.push(envelope);
+		if (envelope.fact.kind === "promise-decision" && !fired) {
+			fired = true;
+			armed = true;
+		}
+	});
+	try {
+		await run(facts);
+		assert.equal(fired && !armed, true, "the injected read failure must fire");
+	} finally {
+		setLoopFactTransportForTests(null);
+		mock.restoreAll();
+		syncBuiltinESMExports();
+	}
+}
+
+test("telemetry does not report a NEXT handoff when the advance was not written", async () => {
+	await withFailedUpdateAfterDecision(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+		await new Promise((r) => setTimeout(r, 100));
+
+		// Existing engine behavior: the no-op advance leaves iteration 1 active.
+		assert.equal(h.readState()?.iteration, 1);
+		assert.equal(h.readState()?.transitioning, false);
+		assert.equal(h.newSessionCalls, 0);
+		assert.deepEqual(summarize(facts), ["start:entered@1", "NEXT:accepted@1"]);
+	});
+});
+
+test("telemetry does not report loop end when the terminal write did not happen", async () => {
+	await withFailedUpdateAfterDecision((facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+
+		h.simulateAgentEnd({ text: "halt\n<promise>STOP</promise>" });
+
+		// Existing engine behavior: the no-op terminal write leaves it running.
+		assert.equal(h.readState()?.running, true);
+		assert.deepEqual(summarize(facts), ["STOP:accepted@1"]);
+	});
+});
+
+test("telemetry does not invent finalization identity for a state without a token", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+		const statePath = join(h.cwd, ".ralph", "loop.md");
+		writeFileSync(
+			statePath,
+			readFileSync(statePath, "utf8").replace(/^loop_token: .*\n/m, ""),
+		);
+
+		// Direct finalization, as /ralph-stop and shutdown paths do.
+		finalizeLoop(h.ctx, h.cwd, "manual_stop", 0);
+
+		const state = h.readState();
+		assert.equal(state?.stop_reason, "manual_stop");
+		assert.deepEqual(
+			facts.map((f) => f.fact.run.loopToken),
+			[],
+			`closure must not carry an invented token (persisted ${state?.loop_token})`,
+		);
+	});
+});
+
+test("telemetry observes a forced fresh initial session: initialized, then entered", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+
+		await runLoop(h.pi, h.ctx, "task", 3, { forceFreshSession: true });
+		assert.deepEqual(summarize(facts), ["start:initialized@1"]);
+
+		await new Promise((r) => setTimeout(r, 600));
+		assert.equal(h.newSessionCalls, 1);
+		assert.deepEqual(summarize(facts), [
+			"start:initialized@1",
+			"start:entered@1",
+		]);
+		assert.equal(facts[0]?.fact.run.loopToken, facts[1]?.fact.run.loopToken);
+	});
+});
+
+test("telemetry observes same-iteration provider fallback as a re-entry, not a handoff", async () => {
+	await withRecordedFacts(async (facts) => {
+		mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		try {
+			const h = createHarness();
+			h.writeState(makeBaseState({ transitioning: false }));
+			await continueLoop(h.pi, h.ctx);
+
+			await exhaustProviderRecoveryToFreshFallback(h);
+
+			assert.equal(h.newSessionCalls, 1);
+			assert.equal(h.readState()?.iteration, 1);
+			assert.deepEqual(summarize(facts), [
+				"start:entered@1",
+				"start:entered@1",
+			]);
+		} finally {
+			mock.timers.reset();
+		}
+	});
+});
+
+test("telemetry ignores a duplicate NEXT in the same settle cascade", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+		await continueLoop(h.pi, h.ctx);
+
+		h.simulateAgentEnd({ text: "done\n<promise>NEXT</promise>" });
+		h.simulateAgentEnd({ text: "more work\n<promise>NEXT</promise>" });
+		await new Promise((r) => setTimeout(r, 100));
+
+		assert.equal(h.newSessionCalls, 1);
+		assert.deepEqual(summarize(facts), [
+			"start:entered@1",
+			"NEXT:accepted@1",
+			"end:NEXT@1",
+			"start:entered@2",
+		]);
+	});
+});
+
+test("telemetry omits decisions whose run identity is not the saved one (legacy state)", async () => {
+	for (const promise of ["WAIT", "STOP", "COMPLETE", "NEXT"] as const) {
+		await withRecordedFacts(async (facts) => {
+			const h = createHarness();
+			h.writeState(makeBaseState({ transitioning: false }));
+			const statePath = join(h.cwd, ".ralph", "loop.md");
+			// A legacy state file written before loop_token existed.
+			writeFileSync(
+				statePath,
+				readFileSync(statePath, "utf8").replace(/^loop_token: .*\n/m, ""),
+			);
+
+			h.simulateAgentEnd({ text: `work\n<promise>${promise}</promise>` });
+
+			const saved = h.readState();
+			// Existing engine behavior for legacy state is unchanged.
+			const expected = {
+				WAIT: { running: true, iteration: 1 },
+				STOP: { running: false, iteration: 1 },
+				COMPLETE: { running: false, iteration: 1 },
+				NEXT: { running: true, iteration: 2 },
+			}[promise];
+			assert.deepEqual(
+				{ running: saved?.running, iteration: saved?.iteration },
+				expected,
+			);
+			assert.equal(h.newSessionCalls, 0);
+			assert.deepEqual(
+				facts
+					.filter((f) => f.fact.run.loopToken !== saved?.loop_token)
+					.map((f) => summarize([f])[0]),
+				[],
+				`${promise}: no fact may name a run other than the saved one`,
+			);
+			assert.deepEqual(
+				summarize(facts).filter((line) => line.startsWith(`${promise}:`)),
+				[],
+				`${promise}: the decision is omitted because its identity was invented`,
+			);
+		});
+	}
+});
+
+// Makes the next `count` state-file reads inside updateState fail, so those
+// updates silently write nothing (existing updateState behavior).
+function failUpdateStateReads(count: number): {
+	restore: () => void;
+	remaining: () => number;
+} {
+	const original = fs.readFileSync;
+	let remaining = count;
+	mock.method(fs, "readFileSync", function (
+		this: unknown,
+		...args: Parameters<typeof fs.readFileSync>
+	) {
+		if (
+			remaining > 0 &&
+			String(args[0]).endsWith(join(".ralph", "loop.md")) &&
+			(new Error().stack ?? "").includes("updateState")
+		) {
+			remaining--;
+			throw new Error("transient state read failure");
+		}
+		return original.apply(this, args);
+	});
+	syncBuiltinESMExports();
+	return {
+		restore: () => {
+			mock.restoreAll();
+			syncBuiltinESMExports();
+		},
+		remaining: () => remaining,
+	};
+}
+
+function removeSavedLoopToken(cwd: string): void {
+	const statePath = join(cwd, ".ralph", "loop.md");
+	writeFileSync(
+		statePath,
+		readFileSync(statePath, "utf8").replace(/^loop_token: .*\n/m, ""),
+	);
+}
+
+test("telemetry omits entry for a legacy continuation whose saved token differs", async () => {
+	await withRecordedFacts(async (facts) => {
+		const h = createHarness();
+		h.writeState(makeBaseState({ transitioning: false }));
+		removeSavedLoopToken(h.cwd);
+
+		await continueLoop(h.pi, h.ctx);
+
+		// Existing engine behavior is unchanged.
+		const saved = h.readState();
+		assert.equal(saved?.running, true);
+		assert.deepEqual(h.sentMessages, ["task"]);
+		assert.equal(h.newSessionCalls, 0);
+		assert.deepEqual(
+			facts
+				.filter((f) => f.fact.run.loopToken !== saved?.loop_token)
+				.map((f) => summarize([f])[0]),
+			[],
+			"no fact may name a run other than the saved one",
+		);
+	});
+});
+
+for (const variant of ["legacy", "valid-token"] as const) {
+	test(`telemetry publishes no start facts when a ${variant} resume did not reactivate`, async () => {
+		await withRecordedFacts(async (facts) => {
+			const h = createHarness();
+			h.writeState(
+				makeBaseState({
+					running: false,
+					transitioning: false,
+					stop_reason: "user_cancelled",
+				}),
+			);
+			if (variant === "legacy") removeSavedLoopToken(h.cwd);
+
+			// Reactivation and ownership updates both write nothing.
+			const failure = failUpdateStateReads(2);
+			try {
+				await resumeCurrentSession(h.pi, h.ctx);
+			} finally {
+				failure.restore();
+			}
+			assert.equal(failure.remaining(), 0, "both injected failures must fire");
+
+			// Existing engine behavior: the seed prompt is still sent.
+			assert.equal(h.readState()?.running, false);
+			assert.deepEqual(h.sentMessages, ["task"]);
+			assert.equal(h.newSessionCalls, 0);
+			assert.deepEqual(summarize(facts), []);
+		});
+	});
+}
