@@ -18,25 +18,25 @@ async function waitFor(check: () => boolean, ms = 3000): Promise<void> {
 	const end = Date.now() + ms;
 	while (!check()) { if (Date.now() > end) throw new Error("timed out waiting"); await new Promise((r) => setTimeout(r, 5)); }
 }
-async function mission(root: string) {
+async function mission(root: string, prompt = "Do the task.") {
 	const { execFileSync } = await import("node:child_process");
 	const { writeFileSync } = await import("node:fs");
 	execFileSync("git", ["init", "-q"], { cwd: root });
 	execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], { cwd: root });
 	const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-	writeFileSync(join(root, ".ralph/mission.json"), JSON.stringify({ version: 1, task: { kind: "plain", prompt: "Do the task." }, run: { model: "test-model", thinking: "high", maxIterations: 3, budgetAuthority: "Test" }, git: { baseCommit: sha }, rules: {}, host: { prefer: ["tmux"] } }));
+	writeFileSync(join(root, ".ralph/mission.json"), JSON.stringify({ version: 1, task: { kind: "plain", prompt }, run: { model: "test-model", thinking: "high", maxIterations: 3, budgetAuthority: "Test" }, git: { baseCommit: sha }, rules: {}, host: { prefer: ["tmux"] } }));
 	return loadMission(root);
 }
 function log(root: string): Record<string, unknown>[] {
 	const path = join(root, "pi.log");
 	return existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 }
-async function start(t: test.TestContext, scenario: unknown = {}, gate = immediateGate) {
+async function start(t: test.TestContext, scenario: unknown = {}, gate = immediateGate, extra: Record<string, number> = {}) {
 	const root = temp(t);
 	const m = await mission(root);
 	const abort = new AbortController();
 	const frames: EventFrame[] = [];
-	const result = runDriver({ mission: m, launchId: "launch", gate }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario), FAKE_PI_STDIN_LOG: join(root, "pi.log"), RALPH_BLOCKED_TOOLS: "other" }, signal: abort.signal, tmpDir: root, readyTimeoutMs: 300, shutdownGraceMs: 100, settleTimeoutMs: 100, log: () => {} });
+	const result = runDriver({ mission: m, launchId: "launch", gate }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario), FAKE_PI_STDIN_LOG: join(root, "pi.log"), RALPH_BLOCKED_TOOLS: "other" }, signal: abort.signal, tmpDir: root, readyTimeoutMs: 300, shutdownGraceMs: 100, settleTimeoutMs: 100, log: () => {}, ...extra });
 	t.after(async () => { abort.abort(); await result; rmSync(root, { recursive: true, force: true }); });
 	await waitFor(() => existsSync(join(root, ".ralph/driver.json")));
 	const consume = (async () => { for await (const frame of connectEvents({ root })) frames.push(frame); })();
@@ -141,7 +141,7 @@ test("control: stop is idempotent even for concurrent requests and legacy stop",
 });
 
 test("control: steer text travels through a file, is journaled in full and deleted after response", async (t) => {
-	const f = await start(t, { steps: [fact(1, { kind: "iteration-start", phase: "initialized" })], responseDelay: 20 });
+	const f = await start(t, { steps: [{ op: "emit", record: { type: "agent_start" } }, fact(1, { kind: "iteration-start", phase: "initialized" })], responseDelay: 20 });
 	await waitFor(() => hasLoop(f.frames));
 	const text = "Operator note. ".repeat(1000);
 	const receipt = await controlLoop({ root: f.root, run }, { kind: "steer", text });
@@ -267,4 +267,90 @@ test("control: dead driver gives no-driver/no-reader without hanging", async (t)
 	const started = Date.now();
 	assert.throws(() => writeFifo(ensureFifo(root), "/ralph-stop"), { code: "no-reader" });
 	assert.ok(Date.now() - started < 1000);
+});
+
+test("driver: refused /ralph-loop (handled plus error notify) ends launch-rejected and closes pi", async (t) => {
+	const f = await start(t, { steps: [{ op: "sleep", ms: 200 }, { op: "emit", record: { type: "extension_ui_request", id: "n", method: "notify", notifyType: "error", message: "A Ralph loop is already running" } }] });
+	const exit = await f.result;
+	assert.equal(exit.reason, "launch-rejected");
+	assert.equal(exit.detail, "A Ralph loop is already running");
+	assert.ok(log(f.root).some((r) => r.eof === true));
+	assert.equal(f.frames.some((r) => r.type === "lifecycle" && r.state === "launched"), false);
+});
+
+test("driver: launch without a first iteration fact times out as launch-rejected", async (t) => {
+	const f = await start(t, {}, immediateGate, { launchTimeoutMs: 300 });
+	const exit = await f.result;
+	assert.equal(exit.reason, "launch-rejected");
+	assert.match(exit.detail ?? "", /iteration-start/);
+	assert.ok(log(f.root).some((r) => r.eof === true));
+});
+
+test("driver: launched lifecycle follows the first iteration-start fact", async (t) => {
+	const f = await start(t, { steps: [{ op: "sleep", ms: 100 }, fact(1, { kind: "iteration-start", phase: "initialized" })] });
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launched"));
+	const launchedAt = f.frames.findIndex((r) => r.type === "lifecycle" && r.state === "launched");
+	const factAt = f.frames.findIndex((r) => r.type === "event" && r.event.kind === "fact");
+	assert.ok(factAt >= 0 && factAt < launchedAt);
+});
+
+test("control: steer while no agent run is active is rejected not-streaming and journaled", async (t) => {
+	const f = await start(t, { steps: [fact(1, { kind: "iteration-start", phase: "initialized" }), { op: "emit", record: { type: "agent_settled" } }] });
+	await waitFor(() => hasLoop(f.frames) && log(f.root).length > 0);
+	await new Promise((r) => setTimeout(r, 100));
+	await assert.rejects(controlLoop({ root: f.root, run }, { kind: "steer", text: "too late" }), (e: { code?: string; message?: string }) => e.code === "rejected" && /not-streaming/.test(e.message ?? ""));
+	assert.equal(log(f.root).some((r) => r.type === "steer"), false);
+	const { readJournal } = await import("../src/watch/journal.ts");
+	assert.ok(readJournal(f.root).records.some((r) => r.k === "x" && r.op === "steer" && r.ok === 0 && r.why === "not-streaming" && r.txt === "too late"));
+	assert.deepEqual(readdirSync(join(f.root, ".ralph/steer")), []);
+});
+
+test("control: symlinked steer file or directory is rejected before pi", async (t) => {
+	const f = await start(t, { steps: [{ op: "emit", record: { type: "agent_start" } }, fact(1, { kind: "iteration-start", phase: "initialized" })] });
+	await waitFor(() => hasLoop(f.frames));
+	const { mkdirSync: mkdir, writeFileSync, symlinkSync } = await import("node:fs");
+	const { writeFifo } = await import("../src/watch/transport.ts");
+	mkdir(join(f.root, ".ralph/steer"), { recursive: true });
+	writeFileSync(join(f.root, "outside.txt"), "outside");
+	symlinkSync(join(f.root, "outside.txt"), join(f.root, ".ralph/steer/link.txt"));
+	writeFifo(join(f.root, ".ralph/rpc.in"), JSON.stringify({ v: 1, op: "steer", id: "file-link", launch: "launch", token: null, textPath: ".ralph/steer/link.txt" }));
+	await waitFor(() => f.frames.some((r) => r.type === "ack" && r.id === "file-link" && r.phase === "rejected"));
+	rmSync(join(f.root, ".ralph/steer"), { recursive: true });
+	mkdir(join(f.root, "elsewhere"));
+	writeFileSync(join(f.root, "elsewhere/x.txt"), "outside");
+	symlinkSync(join(f.root, "elsewhere"), join(f.root, ".ralph/steer"));
+	writeFifo(join(f.root, ".ralph/rpc.in"), JSON.stringify({ v: 1, op: "steer", id: "dir-link", launch: "launch", token: null, textPath: ".ralph/steer/x.txt" }));
+	await waitFor(() => f.frames.some((r) => r.type === "ack" && r.id === "dir-link" && r.phase === "rejected"));
+	assert.equal(log(f.root).some((r) => r.type === "steer"), false);
+	assert.equal(readFileSync(join(f.root, "outside.txt"), "utf8"), "outside");
+});
+
+test("driver: loop-ended without agent_settled finishes after the settle timeout", async (t) => {
+	const f = await start(t, { steps: [{ op: "emit", record: { type: "agent_start" } }, fact(1, { kind: "iteration-start", phase: "initialized" }), fact(2, { kind: "loop-ended", reason: "complete" })] }, immediateGate, { settleTimeoutMs: 300 });
+	assert.equal((await f.result).reason, "loop-finished");
+	// The fact can precede the test subscriber, so time it from the journal:
+	// launch confirmation (first fact) to exit spans the settle timeout.
+	const { readJournal } = await import("../src/watch/journal.ts");
+	const records = readJournal(f.root).records;
+	const at = (e: string) => Date.parse(records.find((r) => r.k === "d" && r.e === e)!.t);
+	assert.ok(at("exit") - at("launched") >= 250, `${at("exit") - at("launched")} ms`);
+});
+
+test("control: stop after the launch prompt but before the first fact ends the launch", async (t) => {
+	const f = await start(t);
+	await waitFor(() => log(f.root).some((r) => r.type === "prompt"));
+	const receipt = await controlLoop({ root: f.root, run: { launchId: "launch", loopToken: null, startedAt: null } }, { kind: "stop" });
+	assert.equal(receipt.phase, "completed");
+	assert.equal((await f.result).reason, "stopped-before-launch");
+	assert.equal(log(f.root).some((r) => r.message === "/ralph-stop"), false);
+});
+
+test("driver: plain prompt with reserved --max-iterations is refused before pi gets it", async (t) => {
+	const root = temp(t);
+	const m = await mission(root, "Do it --max-iterations=99");
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const exit = await runDriver({ mission: m, launchId: "launch", gate: immediateGate }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_STDIN_LOG: join(root, "pi.log") }, tmpDir: root, shutdownGraceMs: 100, log: () => {} });
+	assert.equal(exit.reason, "launch-rejected");
+	assert.match(exit.detail ?? "", /--max-iterations/);
+	assert.equal(log(root).some((r) => r.type === "prompt"), false);
 });

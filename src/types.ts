@@ -1,11 +1,13 @@
 /** Stop reasons for the Ralph loop */
-type StopReason =
-	| "complete" // <promise>COMPLETE</promise> detected
-	| "max_iterations" // Reached max_iterations limit
-	| "user_cancelled" // User pressed Ctrl+C / session_shutdown
-	| "error" // Unrecoverable provider error (after retries)
-	| "interrupted" // Committed NEXT handoff cut off by host/stdin shutdown; resumable
-	| "manual_stop"; // /ralph-stop command
+export const STOP_REASONS = [
+	"complete", // <promise>COMPLETE</promise> detected
+	"max_iterations", // Reached max_iterations limit
+	"user_cancelled", // User pressed Ctrl+C / session_shutdown
+	"error", // Unrecoverable provider error (after retries)
+	"interrupted", // Committed NEXT handoff cut off by host/stdin shutdown; resumable
+	"manual_stop", // /ralph-stop command
+] as const;
+type StopReason = (typeof STOP_REASONS)[number];
 
 /** State persisted in .ralph/loop.md frontmatter */
 export interface RalphLoopState {

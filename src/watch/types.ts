@@ -281,13 +281,14 @@ export type EventFrame =
 		| { readonly type: "ack"; readonly id: string; readonly op: ControlOp; readonly phase: "accepted" | "completed" | "rejected"; readonly reason?: string; readonly duplicate?: boolean }
 	));
 
+export const DRIVER_JOURNAL_EVENTS = ["start", "ready", "launched", "gate-wait", "pi-not-ready", "pi-exit", "gap", "exit"] as const;
 type JournalBase = { readonly v: 1; readonly t: string; readonly r: string };
 /** Only non-derivable facts belong in the bounded operator journal. */
 export type JournalRecord = JournalBase & (
 	| { readonly k: "run"; readonly m: string; readonly th: string; readonly mx: number; readonly tk: "b" | "p" }
 	| { readonly k: "loop"; readonly tok: string; readonly sa: string; readonly i: number; readonly ph: "initialized" | "resumed" }
-	| { readonly k: "g"; readonly tok: string; readonly i: number; readonly p: "NEXT" | "STOP" | "COMPLETE" | "WAIT"; readonly ok: 0 | 1; readonly why?: string }
+	| { readonly k: "g"; readonly tok: string; readonly i: number; readonly p: import("../loop/control-promise.js").ControlPromise; readonly ok: 0 | 1; readonly why?: string }
 	| { readonly k: "u"; readonly tok: string | null; readonly i: number; readonly in: number; readonly out: number; readonly cr: number; readonly cw: number; readonly c: number; readonly n: number; readonly dc: number; readonly pr: number }
 	| { readonly k: "x"; readonly op: "stop" | "steer"; readonly id: string | null; readonly ok: 0 | 1; readonly why?: string; readonly txt?: string; readonly part?: number }
-	| { readonly k: "d"; readonly e: "start" | "ready" | "launched" | "gate-wait" | "pi-not-ready" | "pi-exit" | "gap" | "exit"; readonly c?: number | null; readonly why?: string }
+	| { readonly k: "d"; readonly e: (typeof DRIVER_JOURNAL_EVENTS)[number]; readonly c?: number | null; readonly why?: string }
 );

@@ -1,9 +1,14 @@
 import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { JournalRecord } from "./types.js";
+import { CONTROL_PROMISES } from "../loop/control-promise.js";
+import { DRIVER_JOURNAL_EVENTS, type JournalRecord } from "./types.js";
 
 export const JOURNAL_CAP_BYTES = 1_048_576;
 
+/** Membership test against a shared literal list, so validators follow the types. */
+export function includes<T extends string>(list: readonly T[], value: unknown): value is T {
+	return typeof value === "string" && (list as readonly string[]).includes(value);
+}
 export function object(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -15,10 +20,10 @@ function validRecord(value: unknown): value is JournalRecord {
 	switch (value.k) {
 		case "run": return strings("m", "th") && numbers("mx") && (value.tk === "b" || value.tk === "p");
 		case "loop": return strings("tok", "sa") && numbers("i") && (value.ph === "initialized" || value.ph === "resumed");
-		case "g": return strings("tok") && numbers("i") && ["NEXT", "STOP", "COMPLETE", "WAIT"].includes(String(value.p)) && (value.ok === 0 || value.ok === 1);
+		case "g": return strings("tok") && numbers("i") && includes(CONTROL_PROMISES, value.p) && (value.ok === 0 || value.ok === 1);
 		case "u": return (value.tok === null || strings("tok")) && numbers("i", "in", "out", "cr", "cw", "c", "n", "dc", "pr");
 		case "x": return (value.op === "stop" || value.op === "steer") && (value.id === null || strings("id")) && (value.ok === 0 || value.ok === 1) && (value.txt === undefined || strings("txt")) && (value.part === undefined || numbers("part"));
-		case "d": return ["start", "ready", "launched", "gate-wait", "pi-not-ready", "pi-exit", "gap", "exit"].includes(String(value.e)) && (value.c === undefined || value.c === null || numbers("c"));
+		case "d": return includes(DRIVER_JOURNAL_EVENTS, value.e) && (value.c === undefined || value.c === null || numbers("c"));
 		default: return false;
 	}
 }

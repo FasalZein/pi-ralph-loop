@@ -4,7 +4,10 @@ import { closeSync, constants, existsSync, lstatSync, openSync, readFileSync, re
 import { connect, createServer, Socket, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { object } from "./journal.js";
+import { includes, object } from "./journal.js";
+import { CONTROL_PROMISES } from "../loop/control-promise.js";
+import { ITERATION_START_PHASES } from "../loop/watch-events.js";
+import { STOP_REASONS } from "../types.js";
 import type { ControlOp, DriverEvent, EventFrame, IterationTotals, ToolEntry } from "./types.js";
 import type { LoopFact, LoopFactEnvelope } from "../loop/watch-events.js";
 
@@ -208,10 +211,10 @@ export function readMetadata(root: string): DriverMetadata {
 function validFact(value: unknown): value is LoopFact {
 	if (!object(value) || !object(value.run) || (value.run.launchId !== null && typeof value.run.launchId !== "string") || typeof value.run.loopToken !== "string" || typeof value.run.startedAt !== "string" || !Number.isSafeInteger(value.iteration) || Number(value.iteration) < 1 || typeof value.at !== "string") return false;
 	switch (value.kind) {
-		case "iteration-start": return ["initialized", "entered", "resumed"].includes(String(value.phase));
+		case "iteration-start": return includes(ITERATION_START_PHASES, value.phase);
 		case "iteration-end": return value.outcome === "NEXT";
-		case "promise-decision": return ["NEXT", "STOP", "COMPLETE", "WAIT"].includes(String(value.promise)) && typeof value.accepted === "boolean" && (value.reason === null || typeof value.reason === "string");
-		case "loop-ended": return value.reason === null || ["complete", "max_iterations", "user_cancelled", "error", "interrupted", "manual_stop"].includes(String(value.reason));
+		case "promise-decision": return includes(CONTROL_PROMISES, value.promise) && typeof value.accepted === "boolean" && (value.reason === null || typeof value.reason === "string");
+		case "loop-ended": return value.reason === null || includes(STOP_REASONS, value.reason);
 		default: return false;
 	}
 }

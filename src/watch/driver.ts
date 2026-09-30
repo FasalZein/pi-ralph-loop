@@ -23,7 +23,14 @@ export type DriverRuntime = {
 	readonly readyTimeoutMs?: number;
 	readonly shutdownGraceMs?: number;
 	readonly settleTimeoutMs?: number;
+	readonly launchTimeoutMs?: number;
 };
+/**
+ * Launch-readiness limit (owner decision on #9/#10). pi answers `/ralph-loop`
+ * with success even when the extension refuses, so launch is confirmed only by
+ * the first iteration-start fact within this time.
+ */
+export const LAUNCH_CONFIRM_TIMEOUT_MS = 30_000;
 export type DriverExit = {
 	readonly reason: "pi-exited" | "loop-finished" | "stopped-before-launch" | "aborted" | "pi-not-ready" | "launch-rejected";
 	readonly code: number | null;
@@ -162,6 +169,8 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	let state: DriverState = "starting";
 	let loop: Extract<EventFrame, { type: "hello" }>["loop"] = null;
 	let launched = false;
+	let launchPending = false;
+	let launchTimer: ReturnType<typeof setTimeout> | undefined;
 	let ready = false;
 	let finished = false;
 	let ended = false;
@@ -208,6 +217,10 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		if (fact.kind === "promise-decision") journal?.append({ ...base(), k: "g", tok: loop.token, i: loop.iteration, p: fact.promise, ok: fact.accepted ? 1 : 0, ...(fact.reason ? { why: fact.reason.slice(0, 100) } : {}) });
 		if (fact.kind === "iteration-end") flushUsage();
 		events?.publish({ type: "event", event: { kind: "fact", fact } });
+		if (launchPending && fact.kind === "iteration-start" && (fact.phase === "initialized" || fact.phase === "entered")) {
+			launchPending = false; launched = true; clearTimeout(launchTimer);
+			state = "launched"; events?.publish({ type: "lifecycle", state: "launched" }); driverFact("launched");
+		}
 		if (fact.kind === "loop-ended") {
 			ended = true; endedTokens.add(loop.token);
 			for (const id of acceptedStops.get(loop.token) ?? []) events?.publish({ type: "ack", id, op: "stop", phase: "completed" });
@@ -230,7 +243,9 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			let steer: { path: string; text: string };
 			try { steer = readSteer(root, envelope.textPath); } catch (error) { ack("rejected", String(error)); intervention(false, "invalid-steer-path"); return; }
 			try {
-				if (!launched || finished || !rpc) { ack("rejected", "not-launched"); intervention(false, "not-launched", steer.text); return; }
+				if (!launched || finished || !rpc) { intervention(false, "not-launched", steer.text); ack("rejected", "not-launched"); return; }
+				// pi queues a steer even while idle; it would reach a later iteration or be lost.
+				if (monitor.settled) { intervention(false, "not-streaming", steer.text); ack("rejected", "not-streaming"); return; }
 				const response = await rpc.send({ type: "steer", message: steer.text });
 				intervention(response.success, response.error ?? undefined, steer.text);
 				ack(response.success ? "accepted" : "rejected", response.error ?? undefined);
@@ -238,6 +253,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			finally { try { unlinkSync(steer.path); } catch (error) { log(`steer cleanup: ${String(error)}`); } }
 			return;
 		}
+		// Before the first fact no loop exists to stop: closing pi ends the launch instead.
 		if (!launched) { intervention(true, "not-launched"); ack("completed", "not-launched"); finish("stopped-before-launch"); return; }
 		if (endedTokens.has(token)) { intervention(true, "already-ended"); ack("completed"); return; }
 		const duplicate = stopResults.has(token);
@@ -299,11 +315,13 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			if (spec.mission.task.kind === "plain" && /--max-iterations/i.test(spec.mission.task.prompt)) finish("launch-rejected", null, "Plain prompt contains reserved --max-iterations option");
 			else {
 				const task = spec.mission.task.kind === "bundle" ? '"@.ralph/prompt.md"' : spec.mission.task.prompt;
-				launched = true; monitor.settled = false;
+				launchPending = true;
+				monitor.onErrorNotify = (message) => { if (launchPending) finish("launch-rejected", null, message); };
 				const response = await Promise.race([rpc.send({ type: "prompt", message: `/ralph-loop ${task} --max-iterations=${spec.mission.run.maxIterations}` }).catch(() => null), terminal.then(() => null)]);
-				if (!finished) {
-					if (!response?.success) finish("launch-rejected", null, response?.error ?? "Pi rejected launch");
-					else { state = "launched"; events.publish({ type: "lifecycle", state: "launched" }); driverFact("launched"); }
+				if (!finished && !response?.success) finish("launch-rejected", null, response?.error ?? "Pi rejected launch");
+				else if (!finished && launchPending) {
+					const limit = runtime.launchTimeoutMs ?? LAUNCH_CONFIRM_TIMEOUT_MS;
+					launchTimer = setTimeout(() => { if (launchPending) finish("launch-rejected", null, `No iteration-start fact within ${limit} ms`); }, limit);
 				}
 			}
 		}
@@ -312,7 +330,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		if (!rpc) throw error;
 		finish("aborted", null, String(error)); exit = await terminal;
 	} finally {
-		clearTimeout(settleTimer); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
+		clearTimeout(settleTimer); clearTimeout(launchTimer); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
 		state = "closing";
 		if (rpc) {
 			const code = await rpc.close(runtime.shutdownGraceMs ?? PI_SHUTDOWN_GRACE_MS);

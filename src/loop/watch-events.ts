@@ -51,10 +51,11 @@ export type LoopFactRun = {
  * - iteration-end: an accepted NEXT handoff was committed (old iteration).
  * - loop-ended: the loop reached a terminal state.
  */
+export const ITERATION_START_PHASES = ["initialized", "entered", "resumed"] as const;
 export type LoopFactDetail =
 	| {
 			readonly kind: "iteration-start";
-			readonly phase: "initialized" | "entered" | "resumed";
+			readonly phase: (typeof ITERATION_START_PHASES)[number];
 	  }
 	| {
 			readonly kind: "promise-decision";

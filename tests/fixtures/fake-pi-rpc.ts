@@ -7,7 +7,8 @@ type Step =
 	| { op: "fact"; envelope: unknown }
 	| { op: "sleep"; ms: number }
 	| { op: "flood"; n: number }
-	| { op: "exit"; code: number };
+	| { op: "exit"; code: number }
+	| { op: "big"; bytes: number };
 type Scenario = { ready?: "silent" | "exit"; readyDelay?: number; promptSuccess?: boolean; steerSuccess?: boolean; responseDelay?: number; steps?: Step[]; stopSteps?: Step[]; ignoreEOF?: boolean };
 const scenario: Scenario = JSON.parse(process.env.FAKE_PI_SCENARIO ?? "{}");
 const log = (record: unknown) => {
@@ -23,6 +24,14 @@ async function steps(items: Step[]): Promise<void> {
 			case "raw": process.stdout.write(step.text); break;
 			case "sleep": await sleep(step.ms); break;
 			case "exit": process.exit(step.code); break;
+			case "big": {
+				// One oversized record (like a long agent_end), written in pipe-sized chunks.
+				const record = Buffer.from(`{"type":"agent_end","pad":"${"x".repeat(step.bytes)}"}\n`);
+				for (let offset = 0; offset < record.length; offset += 65_536) {
+					if (!process.stdout.write(record.subarray(offset, offset + 65_536))) await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
+				}
+				break;
+			}
 			case "fact": await new Promise<void>((resolve, reject) => {
 				const socket = connect(process.env.RALPH_WATCH_FACT_SOCKET!);
 				socket.on("error", reject);

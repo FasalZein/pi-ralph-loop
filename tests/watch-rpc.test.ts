@@ -69,3 +69,38 @@ test("RPC: EOF rejects pending responses and shutdown terminates an EOF-resistan
 	await pending;
 	assert.throws(() => process.kill(rpc.child.pid!, 0), { code: "ESRCH" });
 });
+
+test("RPC: a 50 MB single record is framed in linear time without blocking the event loop", async () => {
+	const { monitorEventLoopDelay } = await import("node:perf_hooks");
+	const monitor = new RpcMonitor(() => {});
+	const rpc = new PiRpc(process.execPath, ["--import", "tsx", fixture], { env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify({ steps: [{ op: "big", bytes: 50_000_000 }, { op: "emit", record: { type: "agent_settled" } }] }) } }, monitor);
+	const delay = monitorEventLoopDelay({ resolution: 10 });
+	try {
+		await rpc.send({ type: "get_state" });
+		monitor.settled = false;
+		delay.enable();
+		const cpu = process.cpuUsage();
+		await rpc.send({ type: "prompt", message: "go" });
+		const end = Date.now() + 20_000;
+		while (!monitor.settled && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+		delay.disable();
+		const used = process.cpuUsage(cpu);
+		const cpuMs = (used.user + used.system) / 1000;
+		assert.equal(monitor.settled, true);
+		assert.equal(monitor.counters.badRecords, 0);
+		// Quadratic framing (re-concatenating and rescanning the whole buffer per 64 KB
+		// chunk) spends about 2.5 s of CPU on this record; linear framing needs one
+		// join, decode and JSON.parse, well under 1.2 s.
+		assert.ok(cpuMs < 1200, `framing CPU ${Math.round(cpuMs)} ms`);
+		assert.ok(delay.max / 1e6 < 1000, `max event-loop delay ${Math.round(delay.max / 1e6)} ms`);
+	} finally { await rpc.close(100); }
+});
+
+test("RPC: an error notify is reported; info notify is not", () => {
+	const errors: string[] = [];
+	const monitor = new RpcMonitor(() => {});
+	monitor.onErrorNotify = (message) => errors.push(message);
+	monitor.record({ type: "extension_ui_request", id: "1", method: "notify", notifyType: "info", message: "fine" }, () => {});
+	monitor.record({ type: "extension_ui_request", id: "2", method: "notify", notifyType: "error", message: "A Ralph loop is already running" }, () => {});
+	assert.deepEqual(errors, ["A Ralph loop is already running"]);
+});

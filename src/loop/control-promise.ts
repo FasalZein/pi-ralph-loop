@@ -1,4 +1,5 @@
-export type ControlPromise = "NEXT" | "COMPLETE" | "STOP" | "WAIT";
+export const CONTROL_PROMISES = ["NEXT", "COMPLETE", "STOP", "WAIT"] as const;
+export type ControlPromise = (typeof CONTROL_PROMISES)[number];
 
 // Markdown code-fence delimiters (``` or ~~~, optional language tag) are
 // presentation, not content. Models routinely wrap the control tag in a fenced

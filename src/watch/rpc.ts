@@ -18,6 +18,8 @@ export class RpcMonitor {
 	lastPiAt: string | null = null;
 	settled = true;
 	counters = { dialogsCancelled: 0, refusals: 0, badRecords: 0, badFacts: 0, subscriberDrops: 0 };
+	/** Called for an error notify; before launch confirmation it means the command refused. */
+	onErrorNotify: (message: string) => void = () => {};
 	private lastActivity = -Infinity;
 	constructor(private readonly emit: (event: DriverEvent) => void, private readonly now: () => Date = () => new Date()) {}
 	resetIteration(): void { this.tools = []; this.totals = emptyTotals(); }
@@ -34,6 +36,7 @@ export class RpcMonitor {
 			this.totals = { ...this.totals, dialogsCancelled: this.totals.dialogsCancelled + 1 };
 			this.emit({ kind: "dialog-cancelled", method: text(record.method), title: typeof record.title === "string" ? record.title.slice(0, 100) : null });
 		}
+		if (record.type === "extension_ui_request" && record.method === "notify" && record.notifyType === "error") this.onErrorNotify(text(record.message, "pi reported an error").slice(0, 200));
 		if (record.type === "tool_execution_start" && typeof record.toolCallId === "string") {
 			const label = object(record.args) ? JSON.stringify(record.args).slice(0, 120) : "";
 			const tool: ToolEntry = { id: record.toolCallId, name: text(record.toolName), label, startedAt: at, endedAt: null };
@@ -76,7 +79,7 @@ export class PiRpc {
 	private readonly pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>();
 	private readonly queue: string[] = [];
 	private draining = false;
-	private buffer = Buffer.alloc(0);
+	private chunks: Buffer[] = [];
 	constructor(file: string, args: readonly string[], options: SpawnOptionsWithoutStdio, private readonly monitor: RpcMonitor, private readonly log: (line: string) => void = console.error, private readonly onRecord: () => void = () => {}) {
 		this.child = spawn(file, [...args], { ...options, stdio: "pipe" });
 		this.exited = new Promise((resolve) => {
@@ -98,11 +101,15 @@ export class PiRpc {
 		// Drain stderr without persisting model output or mixing it into frames.
 		this.child.stderr.on("data", () => {});
 		this.child.stdout.on("data", (chunk: Buffer) => {
-			this.buffer = Buffer.concat([this.buffer, chunk]);
+			// Linear framing: scan only the new chunk for LF and join once per record.
+			let start = 0;
 			let newline: number;
-			while ((newline = this.buffer.indexOf(10)) >= 0) {
-				const line = this.buffer.subarray(0, newline).toString("utf8").replace(/\r$/, "");
-				this.buffer = this.buffer.subarray(newline + 1);
+			while ((newline = chunk.indexOf(10, start)) >= 0) {
+				this.chunks.push(chunk.subarray(start, newline));
+				const bytes = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks);
+				this.chunks = [];
+				start = newline + 1;
+				const line = bytes.toString("utf8").replace(/\r$/, "");
 				let record: unknown;
 				try { record = JSON.parse(line); } catch { this.monitor.counters.badRecords++; continue; }
 				if (!object(record) || typeof record.type !== "string") { this.monitor.counters.badRecords++; continue; }
@@ -116,6 +123,7 @@ export class PiRpc {
 				}
 				this.onRecord();
 			}
+			if (start < chunk.length) this.chunks.push(chunk.subarray(start));
 		});
 	}
 	private write(record: Record<string, unknown>): void {
