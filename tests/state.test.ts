@@ -7,6 +7,7 @@ import test from "node:test";
 import {
 	getTaskBody,
 	readState,
+	readStateDocument,
 	updateState,
 	writeState,
 } from "../src/state.ts";
@@ -175,4 +176,100 @@ test("old state files parse with default bundle metadata", () => {
 	assert.equal(state?.bundle_rejection_count, 0);
 	assert.equal(state?.limit_reminders, null);
 	assert.equal(getTaskBody(cwd), "legacy task");
+});
+
+
+test("readStateDocument reports missing when no state file exists", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	assert.deepEqual(readStateDocument(cwd), { status: "missing" });
+});
+
+test("readStateDocument returns valid state and body for a written state", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	const state = makeState();
+	writeState(cwd, state, "task");
+	assert.deepEqual(readStateDocument(cwd), { status: "valid", state, body: "task" });
+});
+
+test("readStateDocument reports partial for half-written front matter", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph"));
+	writeFileSync(join(cwd, ".ralph", "loop.md"), "---\nrunning: true\niteration: 2\n");
+	assert.deepEqual(readStateDocument(cwd), {
+		status: "partial", reason: "no front matter", body: null, fields: {},
+	});
+	assert.equal(readState(cwd), null);
+});
+
+test("readStateDocument reports partial, not running:false, when essential fields are absent", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph"));
+	writeFileSync(join(cwd, ".ralph", "loop.md"), "---\niteration: 1\n---\ntask");
+	assert.deepEqual(readStateDocument(cwd), {
+		status: "partial", reason: "missing field: running", body: "task", fields: { iteration: 1 },
+	});
+	assert.equal(readState(cwd)?.running, false);
+});
+
+test("readStateDocument never invents a loop token", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	writeState(cwd, makeState(), "task");
+	writeFileSync(join(cwd, ".ralph", "loop.md"), '---\nrunning: true\niteration: 2\nstarted_at: "2026-04-08"\n---\ntask');
+	const first = readStateDocument(cwd);
+	assert.equal(first.status, "partial");
+	if (first.status !== "partial") assert.fail("expected partial state");
+	assert.equal(first.reason, "missing field: loop_token");
+	assert.equal(first.fields.loop_token, undefined);
+	assert.deepEqual(readStateDocument(cwd), first);
+	assert.ok(readState(cwd)?.loop_token);
+});
+
+test("readStateDocument validates each essential field without coercing raw fields", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph"));
+	const essential = { running: "false", iteration: "0", started_at: '"date"', loop_token: '"token"' };
+	for (const key of ["running", "iteration", "started_at", "loop_token"] as const) {
+		for (const value of [undefined, "null", '""']) {
+			const entries = { ...essential, [key]: value };
+			writeFileSync(join(cwd, ".ralph", "loop.md"), [
+				"---",
+				...Object.entries(entries).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}: ${v}`),
+				"owner_pid: null", "max_iterations: false", "unknown: true", "---", "task",
+			].join("\n"));
+			const result = readStateDocument(cwd);
+			assert.equal(result.status, "partial", `${key}: ${value}`);
+			if (result.status !== "partial") assert.fail("expected partial state");
+			assert.match(result.reason, new RegExp(`field: ${key}$`));
+			assert.equal(result.fields.owner_pid, null);
+			assert.equal(result.fields.max_iterations, undefined);
+			assert.ok(!("unknown" in result.fields));
+			assert.equal(result.fields[key], value === '""' && (key === "started_at" || key === "loop_token") ? "" : undefined);
+		}
+	}
+});
+
+test("readStateDocument defaults only nonessential fields for valid documents", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph"));
+	writeFileSync(join(cwd, ".ralph", "loop.md"), '---\r\nrunning: false\r\niteration: 0\r\nstarted_at: "date"\r\nloop_token: "token"\r\n---\r\ntask');
+	const result = readStateDocument(cwd);
+	assert.equal(result.status, "valid");
+	if (result.status !== "valid") assert.fail("expected valid state");
+	assert.deepEqual(result.state, readState(cwd));
+	assert.equal(result.state.running, false);
+	assert.equal(result.state.max_iterations, 0);
+	assert.equal(result.state.owner_pid, null);
+	assert.equal(result.body, "task");
+});
+
+test("readStateDocument reports read errors as partial", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph", "loop.md"), { recursive: true });
+	const result = readStateDocument(cwd);
+	assert.equal(result.status, "partial");
+	if (result.status !== "partial") assert.fail("expected partial state");
+	assert.match(result.reason, /^read error:/);
+	assert.equal(result.body, null);
+	assert.deepEqual(result.fields, {});
+	assert.equal(readState(cwd), null);
 });

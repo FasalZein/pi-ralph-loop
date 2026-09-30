@@ -132,6 +132,97 @@ function parseValue(
 	return trimmed;
 }
 
+function parseFrontmatter(frontmatter: string): Record<string, unknown> {
+	const data: Record<string, unknown> = {};
+	for (const line of frontmatter.split("\n")) {
+		const colonIndex = line.indexOf(":");
+		if (colonIndex === -1) continue;
+		const key = line.slice(0, colonIndex).trim();
+		const value = line.slice(colonIndex + 1).trim();
+		data[key] = parseValue(value, key);
+	}
+	return data;
+}
+
+function coerceState(data: Record<string, unknown>): RalphLoopState {
+	const state: Record<string, unknown> = {};
+	for (const [key, kind] of STATE_SCHEMA) {
+		state[key] = COERCE[kind](data[key]);
+	}
+	return state as unknown as RalphLoopState;
+}
+
+// These fields establish run identity and liveness. Never default them in observations.
+const ESSENTIAL_FIELDS = [
+	"running",
+	"iteration",
+	"started_at",
+	"loop_token",
+] as const satisfies readonly (keyof RalphLoopState)[];
+
+function hasRawType(kind: FieldKind, value: unknown): boolean {
+	switch (kind) {
+		case "bool":
+			return typeof value === "boolean";
+		case "int":
+			return typeof value === "number";
+		case "intNull":
+			return value === null || typeof value === "number";
+		case "string":
+		case "token":
+			return typeof value === "string";
+		case "stringNull":
+			return value === null || typeof value === "string";
+	}
+}
+
+/** Detailed state-file observation without inventing missing run identity. */
+export type StateDocument =
+	| { status: "missing" }
+	| {
+			status: "partial";
+			reason: string;
+			body: string | null;
+			fields: Partial<RalphLoopState>;
+	  }
+	| { status: "valid"; state: RalphLoopState; body: string };
+
+/** Read the loop state without treating incomplete writes as stopped loops. */
+export function readStateDocument(cwd: string): StateDocument {
+	const filePath = join(cwd, STATE_FILE);
+	if (!existsSync(filePath)) return { status: "missing" };
+	try {
+		const parts = frontmatterParts(readFileSync(filePath, "utf-8"));
+		if (!parts) {
+			return { status: "partial", reason: "no front matter", body: null, fields: {} };
+		}
+		const data = parseFrontmatter(parts.frontmatter);
+		const rawFields: Record<string, unknown> = {};
+		for (const [key, kind] of STATE_SCHEMA) {
+			if (hasRawType(kind, data[key])) rawFields[key] = data[key];
+		}
+		// STATE_SCHEMA ties each key to its raw type, checked above without coercion.
+		const fields = rawFields as Partial<RalphLoopState>;
+		for (const key of ESSENTIAL_FIELDS) {
+			let reason: string | null = null;
+			if (!(key in data)) reason = `missing field: ${key}`;
+			else if (!(key in fields)) reason = `invalid field: ${key}`;
+			else if ((key === "started_at" || key === "loop_token") && data[key] === "") {
+				reason = `empty field: ${key}`;
+			}
+			if (reason) return { status: "partial", reason, body: parts.body, fields };
+		}
+		return { status: "valid", state: coerceState(data), body: parts.body };
+	} catch (error) {
+		return {
+			status: "partial",
+			reason: `read error: ${error instanceof Error ? error.message : String(error)}`,
+			body: null,
+			fields: {},
+		};
+	}
+}
+
 /**
  * Read and parse the Ralph loop state file.
  *
@@ -147,22 +238,7 @@ export function readState(cwd: string): RalphLoopState | null {
 		const parts = frontmatterParts(content);
 		if (!parts) return null;
 
-		const frontmatter = parts.frontmatter;
-		const data: Record<string, unknown> = {};
-
-		for (const line of frontmatter.split("\n")) {
-			const colonIndex = line.indexOf(":");
-			if (colonIndex === -1) continue;
-			const key = line.slice(0, colonIndex).trim();
-			const value = line.slice(colonIndex + 1).trim();
-			data[key] = parseValue(value, key);
-		}
-
-		const state: Record<string, unknown> = {};
-		for (const [key, kind] of STATE_SCHEMA) {
-			state[key] = COERCE[kind](data[key]);
-		}
-		return state as unknown as RalphLoopState;
+		return coerceState(parseFrontmatter(parts.frontmatter));
 	} catch {
 		return null;
 	}

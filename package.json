@@ -13,6 +13,12 @@
 		"test": "node --import tsx --test tests/*.test.ts --test-reporter=spec",
 		"test:live": "PI_RALPH_LIVE=1 node --import tsx --test tests/live-rpc.test.ts"
 	},
+	"bin": {
+		"ralph": "./src/watch/ralph.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-tui": "*"
+	},
 	"pi": {
 		"extensions": [
 			"./src/index.ts"
