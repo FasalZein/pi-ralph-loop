@@ -137,3 +137,84 @@ export type Mission = MissionPolicy & {
 		};
 	}
 );
+
+/** Watch item status. `stopped` means stopped without a newer blocker. */
+export type ItemStatus = "passed" | "working" | "retry" | "blocked" | "stopped" | "pending";
+
+/** A bundle item as currently observed in `.ralph/items.json`. */
+export type ObservedItem = {
+	readonly key: string;
+	readonly index: number;
+	readonly id: string | null;
+	readonly title: string;
+	readonly description: string;
+	readonly passes: boolean;
+	readonly regressionNotes: string;
+	readonly status: ItemStatus;
+};
+
+/** A parsed progress card with commit evidence taken from git, never from `resolvedBy`. */
+export type ObservedAttempt = import("./progress.js").AttemptCard & {
+	/** Commit that introduced this passed entry and flipped its item. */
+	readonly commitSha: string | null;
+	/** For blocked cards: the pass commit of the resolving card. */
+	readonly resolvedCommitSha: string | null;
+};
+
+/** Classification priority: item-pass, then blocker, then approved parent, then other. */
+export type CommitEvent = {
+	readonly sha: string;
+	readonly parents: readonly string[];
+	readonly subject: string;
+	readonly committedAt: string;
+	readonly kind: "item-pass" | "blocker" | "parent" | "other";
+	/** Item keys whose `passes` flipped false to true against the first parent. */
+	readonly passedItems: readonly string[];
+	/** Known item key captured by the configured blocker pattern. */
+	readonly blockerItem: string | null;
+	readonly parentReason: string | null;
+};
+
+/** A run start. Sources other than loop.md (the journal) are a later seam. */
+export type RunStart = {
+	readonly source: "state";
+	readonly loopToken: string;
+	readonly startedAt: string;
+};
+
+export type GitObservation = {
+	readonly head: string;
+	readonly branch: string | null;
+	readonly base: string | null;
+	/** Commits in base..head, oldest first in topological order; null when unavailable. */
+	readonly commits: readonly CommitEvent[] | null;
+};
+
+export type LoopSnapshot = {
+	readonly root: string;
+	readonly observedAt: string;
+	readonly mission: Mission | null;
+	readonly task: "bundle" | "plain" | null;
+	readonly run: RunKey;
+	/** Fresh valid state only; partial or missing state is null with an issue. */
+	readonly state: import("../types.js").RalphLoopState | null;
+	readonly items: readonly ObservedItem[];
+	/** First not-passed item while the loop is running. */
+	readonly currentItem: string | null;
+	/** First not-passed item while the loop is stopped. */
+	readonly stoppedItem: string | null;
+	readonly attempts: readonly ObservedAttempt[];
+	/** Per item key: unresolved blocked cards first, then newest file index first. */
+	readonly itemAttempts: Readonly<Record<string, readonly ObservedAttempt[]>>;
+	readonly runStarts: readonly RunStart[];
+	/** False until durable run history (journal) exists; only starts seen by this reader are listed. */
+	readonly historyComplete: false;
+	/** Fresh, consistent git evidence; null when git failed or changed during the read. */
+	readonly git: GitObservation | null;
+	readonly issues: readonly Issue[];
+};
+
+export type LoopReader = {
+	read(signal?: AbortSignal): Promise<LoopSnapshot>;
+	close(): Promise<void>;
+};
