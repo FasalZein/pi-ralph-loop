@@ -5,6 +5,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 let tried = "PATH lookup for pi";
+let jiti;
 try {
 	const pi = (process.env.PATH ?? "").split(delimiter)
 		.map((entry) => join(entry, "pi"))
@@ -21,12 +22,20 @@ try {
 	}
 	const require = createRequire(join(root, "package.json"));
 	const { createJiti } = require("jiti");
-	const jiti = createJiti(import.meta.url, {
+	jiti = createJiti(import.meta.url, {
 		alias: { "@earendil-works/pi-tui": require.resolve("@earendil-works/pi-tui") },
 	});
-	const { main } = await jiti.import(fileURLToPath(new URL("./cli.ts", import.meta.url)));
-	process.exitCode = main(process.argv.slice(2));
 } catch (error) {
 	console.error(`ralph: cannot find pi installation (tried: ${tried}): ${error instanceof Error ? error.message : String(error)}`);
 	process.exitCode = 1;
+}
+// Command errors are reported as such, never as a missing pi installation.
+if (jiti) {
+	try {
+		const { main } = await jiti.import(fileURLToPath(new URL("./cli.ts", import.meta.url)));
+		process.exitCode = await main(process.argv.slice(2));
+	} catch (error) {
+		console.error(`ralph: ${error instanceof Error ? error.message : String(error)}`);
+		process.exitCode = 1;
+	}
 }

@@ -386,7 +386,8 @@ function thinkingLevel(value: unknown): MissionThinkingLevel {
 
 export async function loadMission(inputRoot: string): Promise<Mission> {
 	const root = boundary("/", () => {
-		const resolved = realpathSync(inputRoot);
+		// native resolves letter case on case-insensitive file systems, like git does.
+		const resolved = realpathSync.native(inputRoot);
 		if (!statSync(resolved).isDirectory()) fail("/", "root must be a directory");
 		accessSync(resolved, constants.R_OK | constants.X_OK);
 		return resolved;
@@ -405,7 +406,7 @@ export async function loadMission(inputRoot: string): Promise<Mission> {
 		budgetAuthority: text(run.budgetAuthority, "/run/budgetAuthority"),
 	};
 	const git = object(doc.git, "/git", ["baseCommit", "branch", "parentCommits"]);
-	const gitRoot = boundary("/", () => realpathSync(gitRead(root, "/git", ["rev-parse", "--show-toplevel"])));
+	const gitRoot = boundary("/", () => realpathSync.native(gitRead(root, "/git", ["rev-parse", "--show-toplevel"])));
 	if (gitRoot !== root) fail("/", "root must be the git worktree top level");
 	const baseCommit = commit(root, git.baseCommit, "/git/baseCommit");
 	const branch = optionalText(git.branch, "/git/branch");

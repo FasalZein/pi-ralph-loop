@@ -8,13 +8,22 @@ import { FactTracker } from "./driver-facts.js";
 import { JournalWriter } from "./journal.js";
 import { PiRpc, RpcMonitor, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
 import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, parseEventFrame, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Broadcast, type Envelope } from "./transport.js";
-import type { Control, DriverState, EventFrame, JournalRecord, Mission, Receipt, RunKey } from "./types.js";
+import { openLoop } from "./loop-state.js";
+import type { Control, DriverState, EventFrame, JournalRecord, LoopReader, LoopSnapshot, Mission, Receipt, RunKey } from "./types.js";
 
 export { ControlError, DriverError, FIFO_ENVELOPE_MAX_BYTES, SUBSCRIBER_QUEUE_LIMIT_BYTES } from "./transport.js";
 export { TOOL_BUFFER_CALLS, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
 export { JOURNAL_CAP_BYTES } from "./journal.js";
 export type LaunchGate = (signal: AbortSignal) => Promise<void>;
-export type LaunchSpec = { readonly mission: Mission; readonly launchId: string; readonly gate: LaunchGate };
+export type LaunchMode = "fresh" | "relaunch" | "resume";
+/**
+ * `managed` is the `ralph launch` lifecycle: once the launch prompt is
+ * dispatched, a loop may be running even without a fact, so stop and launch
+ * failure send `/ralph-stop` and pi is closed only after a fresh state read
+ * proves the loop stopped. The default keeps the T8 contract, which closes pi
+ * on any launch failure.
+ */
+export type LaunchSpec = { readonly mission: Mission; readonly launchId: string; readonly gate: LaunchGate; readonly mode?: LaunchMode; readonly lifecycle?: "default" | "managed" };
 export type DriverRuntime = {
 	readonly piCommand?: { readonly file: string; readonly args: readonly string[] };
 	readonly env?: NodeJS.ProcessEnv;
@@ -26,7 +35,16 @@ export type DriverRuntime = {
 	readonly shutdownGraceMs?: number;
 	readonly settleTimeoutMs?: number;
 	readonly launchTimeoutMs?: number;
+	/** Managed lifecycle: interval between terminal-state reads. */
+	readonly terminalPollMs?: number;
 };
+/** Approximate observer refresh cadence; a cadence, not a limit. */
+export const TERMINAL_POLL_MS = 2_000;
+/** True only for fresh, valid state of the given loop with running=false. */
+export function isTerminal(snapshot: LoopSnapshot, loop: { readonly token: string; readonly startedAt: string }): boolean {
+	const state = snapshot.state;
+	return snapshot.sources.state.status === "fresh" && state !== null && !state.running && state.loop_token === loop.token && state.started_at === loop.startedAt;
+}
 /**
  * Launch-readiness limit (owner decision on #9/#10). pi answers `/ralph-loop`
  * with success even when the extension refuses, so launch is confirmed only by
@@ -138,7 +156,9 @@ async function sendControl(target: ControlTarget, command: Control | { kind: "go
 }
 export function controlLoop(target: ControlTarget, command: Control, signal?: AbortSignal): Promise<Receipt> { return sendControl(target, command, signal); }
 export async function releaseLaunch(target: { root: string; launchId: string }, signal?: AbortSignal): Promise<void> {
-	await sendControl({ root: target.root, run: { launchId: target.launchId, loopToken: null, startedAt: null } }, { kind: "go" }, signal);
+	const receipt = await sendControl({ root: target.root, run: { launchId: target.launchId, loopToken: null, startedAt: null } }, { kind: "go" }, signal);
+	// An aborted wait returns `sent`; only an acknowledgement releases the launch.
+	if (receipt.phase === "sent") throw signal?.reason instanceof Error ? signal.reason : abortError();
 }
 
 export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): Promise<DriverExit> {
@@ -149,7 +169,13 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	const now = runtime.now ?? (() => new Date());
 	const log = runtime.log ?? console.error;
 	const abort = new AbortController();
-	const onAbort = () => { abort.abort(); finish("aborted"); };
+	const managed = spec.lifecycle === "managed";
+	const mode = spec.mode ?? "fresh";
+	let dispatched = false;
+	let failing = false;
+	let terminalPoll: ReturnType<typeof setTimeout> | undefined;
+	// After dispatch a managed driver never ends a possibly running loop by closing pi.
+	const onAbort = () => { if (managed && dispatched) failLaunch("driver aborted after dispatch"); else { abort.abort(); finish("aborted"); } };
 	let rpc: PiRpc | null = null;
 	let fifo: Socket | null = null;
 	let events: EventServer | null = null;
@@ -176,8 +202,38 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	function checkSettled(): void {
 		clearTimeout(settleTimer);
 		if (!ended || finished) return;
-		if (monitor.settled) finish("loop-finished");
-		else settleTimer = setTimeout(() => finish("loop-finished"), runtime.settleTimeoutMs ?? 5000);
+		if (monitor.settled) settledEnd();
+		else settleTimer = setTimeout(settledEnd, runtime.settleTimeoutMs ?? 5000);
+	}
+	function settledEnd(): void {
+		if (!managed) finish("loop-finished");
+		else awaitTerminal();
+	}
+	/** Managed: poll loop state; only fresh running=false for the known loop ends the driver. */
+	const owned: { reader: LoopReader | null } = { reader: null };
+	function awaitTerminal(): void {
+		if (finished || terminalPoll !== undefined) return;
+		const poll = async () => {
+			const loop = tracker.loop;
+			if (finished) return;
+			try {
+				owned.reader ??= openLoop(root);
+				const snapshot = await owned.reader.read(abort.signal);
+				if (loop && isTerminal(snapshot, loop)) { finish(!failing ? "loop-finished" : launched ? "aborted" : "launch-rejected", null, failDetail); return; }
+			} catch (error) { if (!finished) log(`state: ${String(error)}`); }
+			if (!finished) terminalPoll = setTimeout(() => void poll(), runtime.terminalPollMs ?? TERMINAL_POLL_MS);
+		};
+		terminalPoll = setTimeout(() => void poll(), 0);
+	}
+	let failDetail: string | null = null;
+	/** Managed launch failure after dispatch: request a graceful stop and keep control available. */
+	function failLaunch(detail: string): void {
+		if (!managed || !dispatched) { finish("launch-rejected", null, detail); return; }
+		if (failing || finished) return;
+		failing = true; failDetail = detail; tracker.cancelLaunch();
+		publish({ type: "lifecycle", state: "launch-failed", detail: detail.slice(0, 200) });
+		controls.receive("/ralph-stop");
+		awaitTerminal();
 	}
 	const tracker: FactTracker = new FactTracker({
 		launchId: spec.launchId, monitor, journal: () => journal, base, publish, driverFact,
@@ -193,7 +249,13 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			gate.release(); return true;
 		},
 		// Before the first fact no loop exists to stop: closing pi ends the launch instead.
-		stopBeforeLaunch: () => { finish("stopped-before-launch"); return "not-launched"; },
+		stopBeforeLaunch: () => {
+			// After a managed dispatch a loop may already run without a fact yet: send /ralph-stop.
+			if (managed && dispatched) return null;
+			finish("stopped-before-launch"); return "not-launched";
+		},
+		// A lost loop-ended fact must not keep a managed driver alive once state proves the stop.
+		stopAccepted: () => { if (managed) awaitTerminal(); },
 	});
 	let exit: DriverExit | null = null;
 	try {
@@ -228,14 +290,18 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			if (spec.mission.task.kind === "plain" && /--max-iterations/i.test(spec.mission.task.prompt)) finish("launch-rejected", null, "Plain prompt contains reserved --max-iterations option");
 			else {
 				const task = spec.mission.task.kind === "bundle" ? '"@.ralph/prompt.md"' : spec.mission.task.prompt;
-				tracker.expectLaunch(["initialized", "entered"]);
-				monitor.onErrorNotify = (message) => { if (tracker.launchPending) finish("launch-rejected", null, message); };
-				const response = await Promise.race([rpc.send({ type: "prompt", message: `/ralph-loop ${task} --max-iterations=${spec.mission.run.maxIterations}` }).catch(() => null), terminal.then(() => null)]);
-				if (!finished && !response?.success) finish("launch-rejected", null, response?.error ?? "Pi rejected launch");
-				else if (!finished && tracker.launchPending) {
-					const limit = runtime.launchTimeoutMs ?? LAUNCH_CONFIRM_TIMEOUT_MS;
-					launchTimer = setTimeout(() => { if (tracker.launchPending) finish("launch-rejected", null, `No iteration-start fact within ${limit} ms`); }, limit);
-				}
+				// Resume keeps the saved budget; it may start a new pi session (initialized) or reuse one (resumed).
+				const message = mode === "resume" ? "/ralph-resume" : `/ralph-loop ${task} --max-iterations=${spec.mission.run.maxIterations}`;
+				tracker.expectLaunch(mode === "resume" ? ["initialized", "entered", "resumed"] : ["initialized", "entered"]);
+				let answered = false;
+				// Ralph's own refusals come before its answer; later error notifies belong to other work.
+				monitor.onErrorNotify = (notice) => { if (!answered && tracker.launchPending) finish("launch-rejected", null, notice); };
+				const limit = runtime.launchTimeoutMs ?? LAUNCH_CONFIRM_TIMEOUT_MS;
+				dispatched = true;
+				// The bound starts at dispatch so a silent answer cannot hold the launch open.
+				launchTimer = setTimeout(() => { if (tracker.launchPending) failLaunch(`No iteration-start fact within ${limit} ms`); }, limit);
+				const response = await Promise.race([rpc.send({ type: "prompt", message }, () => { answered = true; monitor.onErrorNotify = () => {}; }).catch(() => null), terminal.then(() => null)]);
+				if (!finished && !response?.success && !failing) { clearTimeout(launchTimer); tracker.cancelLaunch(); finish("launch-rejected", null, response?.error ?? "Pi rejected launch"); }
 			}
 		}
 		exit = await terminal;
@@ -243,7 +309,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		if (!rpc) throw error;
 		finish("aborted", null, String(error)); exit = await terminal;
 	} finally {
-		clearTimeout(settleTimer); clearTimeout(launchTimer); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
+		clearTimeout(settleTimer); clearTimeout(launchTimer); clearTimeout(terminalPoll); await owned.reader?.close().catch(() => {}); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
 		state = "closing";
 		if (rpc) {
 			const code = await rpc.close(runtime.shutdownGraceMs ?? PI_SHUTDOWN_GRACE_MS);

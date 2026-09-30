@@ -76,7 +76,7 @@ export class PiRpc {
 	readonly exited: Promise<number | null>;
 	private dead = false;
 	private serial = 0;
-	private readonly pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>();
+	private readonly pending = new Map<string, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void; onResponse?: (value: RpcResponse) => void }>();
 	private readonly queue: string[] = [];
 	private draining = false;
 	private chunks: Buffer[] = [];
@@ -118,7 +118,10 @@ export class PiRpc {
 					if (typeof record.id !== "string" || typeof record.success !== "boolean") { this.monitor.counters.badRecords++; this.log("pi: uncorrelated or invalid response"); }
 					else {
 						const pending = this.pending.get(record.id);
-						if (pending) { this.pending.delete(record.id); pending.resolve({ success: record.success, error: typeof record.error === "string" ? record.error : null }); }
+						if (pending) {
+							const response = { success: record.success, error: typeof record.error === "string" ? record.error : null };
+							this.pending.delete(record.id); pending.onResponse?.(response); pending.resolve(response);
+						}
 					}
 				}
 				this.onRecord();
@@ -136,10 +139,14 @@ export class PiRpc {
 			this.draining = !this.child.stdin.write(this.queue.shift()!);
 		}
 	}
-	send(command: RpcCommand): Promise<RpcResponse> {
+	/**
+	 * `onResponse` runs synchronously at the response record, before any later
+	 * record in the same stdout chunk; a promise continuation would run after them.
+	 */
+	send(command: RpcCommand, onResponse?: (response: RpcResponse) => void): Promise<RpcResponse> {
 		if (this.dead || this.child.stdin.writableEnded) return Promise.reject(new Error("pi-exited"));
 		const id = `d-${++this.serial}`;
-		return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); this.write({ ...command, id }); });
+		return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject, onResponse }); this.write({ ...command, id }); });
 	}
 	async close(graceMs = PI_SHUTDOWN_GRACE_MS): Promise<number | null> {
 		this.child.stdin.end();

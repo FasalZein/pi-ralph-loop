@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, existsSync }
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { runDriver, fifoGate, releaseLaunch, controlLoop, connectEvents, immediateGate } from "../src/watch/driver.ts";
+import { runDriver, fifoGate, releaseLaunch, controlLoop, connectEvents, immediateGate, type LaunchSpec } from "../src/watch/driver.ts";
 import { loadMission } from "../src/watch/config.ts";
 import type { EventFrame } from "../src/watch/types.ts";
 
@@ -31,12 +31,12 @@ function log(root: string): Record<string, unknown>[] {
 	const path = join(root, "pi.log");
 	return existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 }
-async function start(t: test.TestContext, scenario: unknown = {}, gate = immediateGate, extra: Record<string, number> = {}) {
+async function start(t: test.TestContext, scenario: unknown = {}, gate = immediateGate, extra: Record<string, number> = {}, specExtra: Pick<LaunchSpec, "mode" | "lifecycle"> = {}) {
 	const root = temp(t);
 	const m = await mission(root);
 	const abort = new AbortController();
 	const frames: EventFrame[] = [];
-	const result = runDriver({ mission: m, launchId: "launch", gate }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario), FAKE_PI_STDIN_LOG: join(root, "pi.log"), RALPH_BLOCKED_TOOLS: "other" }, signal: abort.signal, tmpDir: root, readyTimeoutMs: 300, shutdownGraceMs: 100, settleTimeoutMs: 100, log: () => {}, ...extra });
+	const result = runDriver({ mission: m, launchId: "launch", gate, ...specExtra }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario), FAKE_PI_STDIN_LOG: join(root, "pi.log"), RALPH_BLOCKED_TOOLS: "other" }, signal: abort.signal, tmpDir: root, readyTimeoutMs: 300, shutdownGraceMs: 100, settleTimeoutMs: 100, log: () => {}, ...extra });
 	t.after(async () => { abort.abort(); await result; rmSync(root, { recursive: true, force: true }); });
 	await waitFor(() => existsSync(join(root, ".ralph/driver.json")));
 	const consume = (async () => { for await (const frame of connectEvents({ root })) frames.push(frame); })();
@@ -270,7 +270,8 @@ test("control: dead driver gives no-driver/no-reader without hanging", async (t)
 });
 
 test("driver: refused /ralph-loop (handled plus error notify) ends launch-rejected and closes pi", async (t) => {
-	const f = await start(t, { steps: [{ op: "sleep", ms: 200 }, { op: "emit", record: { type: "extension_ui_request", id: "n", method: "notify", notifyType: "error", message: "A Ralph loop is already running" } }] });
+	// Ralph refuses before it answers the command (#10 follow-up 1).
+	const f = await start(t, { preSteps: [{ op: "sleep", ms: 200 }, { op: "emit", record: { type: "extension_ui_request", id: "n", method: "notify", notifyType: "error", message: "A Ralph loop is already running" } }] });
 	const exit = await f.result;
 	assert.equal(exit.reason, "launch-rejected");
 	assert.equal(exit.detail, "A Ralph loop is already running");
@@ -353,4 +354,84 @@ test("driver: plain prompt with reserved --max-iterations is refused before pi g
 	assert.equal(exit.reason, "launch-rejected");
 	assert.match(exit.detail ?? "", /--max-iterations/);
 	assert.equal(log(root).some((r) => r.type === "prompt"), false);
+});
+
+const notify = (message: string) => ({ type: "extension_ui_request", id: "n", method: "notify", notifyType: "error", message });
+const managed = { lifecycle: "managed" } as const;
+const noEof = (root: string) => !log(root).some((r) => r.eof === true);
+
+test("driver: error notify after correlated response does not reject even in same chunk", async (t) => {
+	// get_state is d-1, the launch prompt d-2: answer and unrelated error arrive in one write.
+	const f = await start(t, { silentPrompt: true, steps: [
+		{ op: "raw", text: `${JSON.stringify({ type: "response", id: "d-2", command: "prompt", success: true })}\n${JSON.stringify(notify("other extension failed"))}\n` },
+		{ op: "sleep", ms: 50 }, fact(1, { kind: "iteration-start", phase: "initialized" }),
+	] });
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launched"));
+	assert.equal(f.frames.some((r) => r.type === "lifecycle" && r.state === "closed"), false);
+});
+
+test("driver: silent launch response cannot bypass fact deadline", async (t) => {
+	const f = await start(t, { silentPrompt: true }, immediateGate, { launchTimeoutMs: 300 });
+	const exit = await f.result;
+	assert.equal(exit.reason, "launch-rejected");
+	assert.match(exit.detail ?? "", /iteration-start/);
+});
+
+test("driver: resume sends ralph-resume and accepts resumed as confirmation", async (t) => {
+	const f = await start(t, { steps: [{ op: "sleep", ms: 50 }, fact(1, { kind: "iteration-start", phase: "resumed" }, 2)] }, immediateGate, {}, { mode: "resume" });
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launched"));
+	assert.equal(log(f.root).find((r) => r.type === "prompt")?.message, "/ralph-resume");
+});
+
+test("driver: managed stop before dispatch closes idle pi", async (t) => {
+	let release!: () => void;
+	const f = await start(t, {}, () => new Promise<void>((resolve) => { release = resolve; }), {}, managed);
+	const receipt = await controlLoop({ root: f.root, run: { launchId: "launch", loopToken: null, startedAt: null } }, { kind: "stop" });
+	assert.equal(receipt.phase, "completed");
+	assert.equal((await f.result).reason, "stopped-before-launch");
+	assert.ok(log(f.root).some((r) => r.eof === true));
+	release();
+});
+
+test("driver: managed stop after dispatch before fact sends graceful stop", async (t) => {
+	const f = await start(t, { stopSteps: [{ op: "sleep", ms: 300 }, { op: "exit", code: 0 }] }, immediateGate, {}, managed);
+	await waitFor(() => log(f.root).some((r) => r.type === "prompt"));
+	const receipt = await controlLoop({ root: f.root, run: { launchId: "launch", loopToken: null, startedAt: null } }, { kind: "stop" });
+	assert.equal(receipt.phase, "accepted");
+	assert.ok(log(f.root).some((r) => r.message === "/ralph-stop"));
+	assert.ok(noEof(f.root), "pi stdin must stay open after dispatch");
+	assert.equal((await f.result).reason, "pi-exited");
+});
+
+test("driver: managed launch timeout retains running pi and control", async (t) => {
+	const f = await start(t, { stopSteps: [{ op: "sleep", ms: 600 }, { op: "exit", code: 0 }] }, immediateGate, { launchTimeoutMs: 200 }, managed);
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launch-failed"));
+	await waitFor(() => log(f.root).some((r) => r.message === "/ralph-stop"));
+	assert.ok(noEof(f.root));
+	assert.ok(existsSync(join(f.root, ".ralph/driver.json")));
+	assert.equal((await f.result).reason, "pi-exited");
+});
+
+test("driver: managed launch abort after first fact requests stop without kill", async (t) => {
+	const f = await start(t, { steps: [fact(1, { kind: "iteration-start", phase: "initialized" }), { op: "state", running: true }], stopSteps: [{ op: "sleep", ms: 300 }, { op: "state", running: false }] }, immediateGate, { terminalPollMs: 50 }, managed);
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launched") || f.frames.some((r) => r.type === "hello" && r.state === "launched"));
+	f.abort.abort();
+	await waitFor(() => log(f.root).some((r) => r.message === "/ralph-stop"));
+	await new Promise((r) => setTimeout(r, 150));
+	assert.ok(noEof(f.root), "running loop must not be closed");
+	const exit = await f.result;
+	assert.equal(exit.reason, "aborted");
+	assert.ok(log(f.root).some((r) => r.eof === true));
+});
+
+test("driver: managed partial terminal sample never closes pi", async (t) => {
+	const f = await start(t, { steps: [
+		fact(1, { kind: "iteration-start", phase: "initialized" }), { op: "state", running: true },
+		fact(2, { kind: "loop-ended", reason: "complete" }), { op: "emit", record: { type: "agent_settled" } },
+		{ op: "state", running: true, partial: true }, { op: "sleep", ms: 500 }, { op: "state", running: false },
+	] }, immediateGate, { terminalPollMs: 50 }, managed);
+	await waitFor(() => f.frames.some((r) => r.type === "event" && r.event.kind === "fact" && r.event.fact.kind === "loop-ended") || f.frames.some((r) => r.type === "hello" && r.loop !== null));
+	await new Promise((r) => setTimeout(r, 250));
+	assert.ok(noEof(f.root), "partial state is not terminal proof");
+	assert.equal((await f.result).reason, "loop-finished");
 });

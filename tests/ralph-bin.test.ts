@@ -80,3 +80,17 @@ test("ralph names the pi path when the executable is not in a pi package", (t) =
 	assert.ok(result.stderr.includes(`cannot find pi installation (tried: ${pi})`));
 	assert.match(result.stderr, /pi package root not found/);
 });
+
+test("bin awaits async command and reports mission error not installation failure", (t) => {
+	const path = fakePi(t);
+	const root = mkdtempSync(join(tmpdir(), "ralph-bin-root-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const result = spawnSync(process.execPath, [bin, "launch", root], {
+		env: { ...process.env, PATH: path }, encoding: "utf-8", timeout: 20_000,
+	});
+	assert.equal(result.error, undefined);
+	assert.equal(result.status, 1, result.stderr);
+	assert.equal(result.stdout, "");
+	assert.doesNotMatch(result.stderr, /cannot find pi installation/);
+	assert.match(result.stderr, /^ralph: .*mission\.json/m);
+});

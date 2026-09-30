@@ -280,7 +280,7 @@ export type EventFrame =
 	| ({ readonly v: 1; readonly seq: number; readonly at: string } & (
 		| { readonly type: "event"; readonly event: DriverEvent }
 		| { readonly type: "gap"; readonly source: "facts"; readonly from: number; readonly to: number }
-		| { readonly type: "lifecycle"; readonly state: "ready" | "launched" | "pi-exited" | "closed"; readonly code?: number | null; readonly detail?: string }
+		| { readonly type: "lifecycle"; readonly state: "ready" | "launched" | "launch-failed" | "pi-exited" | "closed"; readonly code?: number | null; readonly detail?: string }
 		| { readonly type: "ack"; readonly id: string; readonly op: ControlOp; readonly phase: "accepted" | "completed" | "rejected"; readonly reason?: string; readonly duplicate?: boolean }
 	));
 

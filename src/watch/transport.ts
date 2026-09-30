@@ -23,8 +23,9 @@ const code = (error: unknown): string | undefined => object(error) && typeof err
 export function isAlive(pid: number): boolean {
 	try { process.kill(pid, 0); return true; } catch (error) { return code(error) !== "ESRCH"; }
 }
-export function acquireLock(root: string): () => void {
-	const path = join(root, ".ralph/driver.lock");
+/** Exclusive per-root PID lock; a lock whose PID is dead is recovered. */
+export function acquireLock(root: string, name = "driver.lock"): () => void {
+	const path = join(root, ".ralph", name);
 	for (let attempt = 0; attempt < 2; attempt++) {
 		try {
 			const fd = openSync(path, "wx", 0o600);
@@ -33,7 +34,7 @@ export function acquireLock(root: string): () => void {
 		} catch (error) {
 			if (code(error) !== "EEXIST") throw error;
 			const pid = Number(readFileSync(path, "utf8"));
-			if (!Number.isSafeInteger(pid) || pid <= 0 || isAlive(pid)) throw new DriverError("driver-active", `Driver lock is active: ${path}`);
+			if (!Number.isSafeInteger(pid) || pid <= 0 || isAlive(pid)) throw new DriverError("driver-active", `Lock is active: ${path}`);
 			unlinkSync(path);
 		}
 	}
@@ -253,7 +254,7 @@ function validFrame(value: unknown): value is EventFrame {
 	switch (value.type) {
 		case "event": return validEvent(value.event);
 		case "gap": return value.source === "facts" && Number.isSafeInteger(value.from) && Number.isSafeInteger(value.to) && Number(value.from) > 0 && Number(value.to) >= Number(value.from);
-		case "lifecycle": return ["ready", "launched", "pi-exited", "closed"].includes(String(value.state)) && (value.code === undefined || value.code === null || finite(value.code)) && (value.detail === undefined || typeof value.detail === "string");
+		case "lifecycle": return ["ready", "launched", "launch-failed", "pi-exited", "closed"].includes(String(value.state)) && (value.code === undefined || value.code === null || finite(value.code)) && (value.detail === undefined || typeof value.detail === "string");
 		case "ack": return typeof value.id === "string" && ["stop", "steer", "go"].includes(String(value.op)) && ["accepted", "completed", "rejected"].includes(String(value.phase)) && (value.reason === undefined || typeof value.reason === "string") && (value.duplicate === undefined || typeof value.duplicate === "boolean");
 		default: return false;
 	}

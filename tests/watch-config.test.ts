@@ -353,6 +353,15 @@ test("loadMission canonicalizes symlinked root", async () => {
 		assert.equal(linked.configPath, path.join(f.root, ".ralph/mission.json"));
 	} finally { f.close(); rmSync(linkParent, { recursive: true, force: true }); }
 });
+test("loadMission accepts case-variant worktree root on case-insensitive filesystems", async (t) => {
+	const f = fixture();
+	try {
+		const variant = path.join(path.dirname(f.root), path.basename(f.root).toUpperCase());
+		if (variant === f.root || !existsSync(variant)) { t.skip("file system is case-sensitive"); return; }
+		const mission = await loadMission(variant);
+		assert.equal(mission.root, f.root);
+	} finally { f.close(); }
+});
 test("loadMission rejects mission parent symlink escape", async () => {
 	const f = fixture(); const outside = mkdtempSync(path.join(tmpdir(), "ralph-config-outside-"));
 	try {

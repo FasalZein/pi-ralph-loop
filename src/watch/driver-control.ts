@@ -21,6 +21,8 @@ export type ControlHooks = {
 	readonly releaseGate: () => boolean;
 	/** Stop before any loop exists; returns a reason when the driver ends the launch itself. */
 	readonly stopBeforeLaunch: () => string | null;
+	/** pi accepted `/ralph-stop`. */
+	readonly stopAccepted?: () => void;
 };
 
 function readSteer(root: string, path: string): { path: string; text: string } {
@@ -100,7 +102,10 @@ export class ControlHandler {
 		}
 		const success = await pending;
 		if (!success) this.stopResults.delete(token);
-		else if (id) { const ids = this.acceptedStops.get(token) ?? new Set<string>(); ids.add(id); this.acceptedStops.set(token, ids); }
+		else {
+			hooks.stopAccepted?.();
+			if (id) { const ids = this.acceptedStops.get(token) ?? new Set<string>(); ids.add(id); this.acceptedStops.set(token, ids); }
+		}
 		intervention(success, success ? undefined : "pi-rejected");
 		ack(success ? (tracker.endedTokens.has(token) ? "completed" : "accepted") : "rejected", success ? undefined : "pi-rejected", duplicate && success);
 	}
