@@ -273,3 +273,21 @@ test("readStateDocument reports read errors as partial", () => {
 	assert.deepEqual(result.fields, {});
 	assert.equal(readState(cwd), null);
 });
+
+test("readStateDocument names wrong-type and empty essential fields distinctly", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-state-document-"));
+	mkdirSync(join(cwd, ".ralph"));
+	const cases: [string, string][] = [
+		['running: false\niteration: 0\nstarted_at: ""\nloop_token: "t"', "empty field: started_at"],
+		['running: false\niteration: 0\nstarted_at: 5\nloop_token: "t"', "invalid field: started_at"],
+		['running: "yes"\niteration: 0\nstarted_at: "d"\nloop_token: "t"', "invalid field: running"],
+		['running: false\niteration: 0\nstarted_at: "d"\nloop_token: ""', "empty field: loop_token"],
+	];
+	for (const [front, reason] of cases) {
+		writeFileSync(join(cwd, ".ralph", "loop.md"), `---\n${front}\n---\ntask`);
+		const result = readStateDocument(cwd);
+		assert.equal(result.status === "partial" ? result.reason : result.status, reason);
+	}
+	// Legacy reader still replaces an empty token with a generated one.
+	assert.match(readState(cwd)?.loop_token ?? "", /^[0-9a-f-]{36}$/);
+});

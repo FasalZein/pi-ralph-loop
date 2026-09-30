@@ -13,14 +13,41 @@ const STATE_FILE = join(".ralph", "loop.md");
  */
 type FieldKind = "bool" | "int" | "intNull" | "string" | "stringNull" | "token";
 
-const COERCE: Record<FieldKind, (value: unknown) => unknown> = {
-	bool: (value) => value === true,
-	int: (value) => (typeof value === "number" ? value : 0),
-	intNull: (value) => (typeof value === "number" ? value : null),
-	string: (value) => (typeof value === "string" ? value : ""),
-	stringNull: (value) => (typeof value === "string" ? value : null),
-	token: (value) =>
-		typeof value === "string" && value.length > 0 ? value : randomUUID(),
+/**
+ * One authority per kind: `accepts` is the raw-type check used by the
+ * detailed reader, `coerce` the legacy normalization used by readState.
+ * Strict essential-field checks live in ESSENTIAL_FIELDS, not here.
+ */
+const FIELD_KINDS: Record<
+	FieldKind,
+	{ accepts: (value: unknown) => boolean; coerce: (value: unknown) => unknown }
+> = {
+	bool: {
+		accepts: (value) => typeof value === "boolean",
+		coerce: (value) => value === true,
+	},
+	int: {
+		accepts: (value) => typeof value === "number",
+		coerce: (value) => (typeof value === "number" ? value : 0),
+	},
+	intNull: {
+		accepts: (value) => value === null || typeof value === "number",
+		coerce: (value) => (typeof value === "number" ? value : null),
+	},
+	string: {
+		accepts: (value) => typeof value === "string",
+		coerce: (value) => (typeof value === "string" ? value : ""),
+	},
+	stringNull: {
+		accepts: (value) => value === null || typeof value === "string",
+		coerce: (value) => (typeof value === "string" ? value : null),
+	},
+	token: {
+		// Raw capture keeps empty strings; the legacy reader replaces them.
+		accepts: (value) => typeof value === "string",
+		coerce: (value) =>
+			typeof value === "string" && value.length > 0 ? value : randomUUID(),
+	},
 };
 
 /**
@@ -147,33 +174,38 @@ function parseFrontmatter(frontmatter: string): Record<string, unknown> {
 function coerceState(data: Record<string, unknown>): RalphLoopState {
 	const state: Record<string, unknown> = {};
 	for (const [key, kind] of STATE_SCHEMA) {
-		state[key] = COERCE[kind](data[key]);
+		state[key] = FIELD_KINDS[kind].coerce(data[key]);
 	}
 	return state as unknown as RalphLoopState;
 }
 
-// These fields establish run identity and liveness. Never default them in observations.
-const ESSENTIAL_FIELDS = [
-	"running",
-	"iteration",
-	"started_at",
-	"loop_token",
-] as const satisfies readonly (keyof RalphLoopState)[];
+const nonEmptyString = (value: unknown) =>
+	typeof value === "string" && value.length > 0;
 
-function hasRawType(kind: FieldKind, value: unknown): boolean {
-	switch (kind) {
-		case "bool":
-			return typeof value === "boolean";
-		case "int":
-			return typeof value === "number";
-		case "intNull":
-			return value === null || typeof value === "number";
-		case "string":
-		case "token":
-			return typeof value === "string";
-		case "stringNull":
-			return value === null || typeof value === "string";
+// These fields establish run identity and liveness. Never default them in
+// observations. Each carries its strict check and the reason it reports.
+const ESSENTIAL_FIELDS = [
+	{ key: "running", strict: (value: unknown) => typeof value === "boolean", reason: "invalid" },
+	{ key: "iteration", strict: (value: unknown) => typeof value === "number", reason: "invalid" },
+	{ key: "started_at", strict: nonEmptyString, reason: "empty" },
+	{ key: "loop_token", strict: nonEmptyString, reason: "empty" },
+] as const satisfies readonly {
+	key: keyof RalphLoopState;
+	strict: (value: unknown) => boolean;
+	reason: string;
+}[];
+
+/** A wrong raw type is invalid; a right type that fails the strict check uses the entry reason. */
+function essentialProblem(
+	data: Record<string, unknown>,
+	fields: Record<string, unknown>,
+): string | null {
+	for (const { key, strict, reason } of ESSENTIAL_FIELDS) {
+		if (!(key in data)) return `missing field: ${key}`;
+		if (!(key in fields)) return `invalid field: ${key}`;
+		if (!strict(data[key])) return `${reason} field: ${key}`;
 	}
+	return null;
 }
 
 /** Detailed state-file observation without inventing missing run identity. */
@@ -199,19 +231,12 @@ export function readStateDocument(cwd: string): StateDocument {
 		const data = parseFrontmatter(parts.frontmatter);
 		const rawFields: Record<string, unknown> = {};
 		for (const [key, kind] of STATE_SCHEMA) {
-			if (hasRawType(kind, data[key])) rawFields[key] = data[key];
+			if (FIELD_KINDS[kind].accepts(data[key])) rawFields[key] = data[key];
 		}
 		// STATE_SCHEMA ties each key to its raw type, checked above without coercion.
 		const fields = rawFields as Partial<RalphLoopState>;
-		for (const key of ESSENTIAL_FIELDS) {
-			let reason: string | null = null;
-			if (!(key in data)) reason = `missing field: ${key}`;
-			else if (!(key in fields)) reason = `invalid field: ${key}`;
-			else if ((key === "started_at" || key === "loop_token") && data[key] === "") {
-				reason = `empty field: ${key}`;
-			}
-			if (reason) return { status: "partial", reason, body: parts.body, fields };
-		}
+		const reason = essentialProblem(data, rawFields);
+		if (reason) return { status: "partial", reason, body: parts.body, fields };
 		return { status: "valid", state: coerceState(data), body: parts.body };
 	} catch (error) {
 		return {
