@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import type {
 	ExtensionAPI,
@@ -155,11 +156,9 @@ test("extension contributes bundled skills", async () => {
 
 	const resources = await h.resourcesDiscover();
 
-	assert.ok(
-		resources.skillPaths?.some((skillPath) =>
-			skillPath.endsWith("pi-ralph-loop/skills"),
-		),
-	);
+	assert.deepEqual(resources.skillPaths, [
+		fileURLToPath(new URL("../skills", import.meta.url)),
+	]);
 });
 
 test("ralph-loop rejects invalid args", async () => {
