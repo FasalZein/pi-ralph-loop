@@ -193,13 +193,15 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 	commits?.forEach((c, i) => { if (c.kind === "item-pass") lastPass = i; });
 	const newBlocker = (key: string): CommitEvent | null => {
 		if (!commits || !linear) return null;
+		let unknown: CommitEvent | null = null;
 		for (let i = commits.length - 1; i > lastPass; i--) {
-			// An unknown pass after the last proven pass could move the boundary.
-			if (!commits[i].passesKnown) {
-				issues.push({ source: "git", kind: "partial", detail: `pass evidence unknown at ${commits[i].sha}; retry and blocked cannot be proven` });
+			if (commits[i].kind === "blocker" && commits[i].blockerItem === key) {
+				// An unknown pass between this blocker and HEAD could move the boundary.
+				if (!unknown) return commits[i];
+				issues.push({ source: "git", kind: "partial", detail: `pass evidence unknown at ${unknown.sha}; retry and blocked cannot be proven` });
 				return null;
 			}
-			if (commits[i].kind === "blocker" && commits[i].blockerItem === key) return commits[i];
+			unknown ??= commits[i].passesKnown ? null : commits[i];
 		}
 		return null;
 	};
@@ -716,7 +718,11 @@ function classify(sha: string, facts: CommitFacts, parent: CommitFacts | null, m
 	const committedAt = Number.isFinite(Date.parse(facts.committedAt)) ? facts.committedAt : null;
 	const now = facts.items.kind === "ok" ? facts.items.passes : null;
 	const before = parent?.items.kind === "ok" ? parent.items.passes : null;
-	const passesKnown = facts.items.kind !== "invalid" && parent?.items.kind !== "invalid";
+	// Invalid items, or items.json present in only one of commit and first parent
+	// (deleted or restored), hide whether an item passed here.
+	const presence = (at: CommitFacts | null) => at?.items.kind ?? "absent";
+	const passesKnown = facts.items.kind !== "invalid" && parent?.items.kind !== "invalid"
+		&& (presence(facts) === "absent") === (presence(parent) === "absent");
 	// Only false->true flips on keys present in both versions count as passes.
 	// Merges are not classified: which parent a flip came from is ambiguous.
 	const passedItems = facts.parents.length <= 1 && now && before

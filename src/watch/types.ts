@@ -174,7 +174,7 @@ export type CommitEvent = {
 	/** Known item key captured by the configured blocker pattern. */
 	readonly blockerItem: string | null;
 	readonly parentReason: string | null;
-	/** False when items.json at this commit or its first parent was invalid: a pass there is unknown. */
+	/** False when items.json at this commit or its first parent is invalid, or present in only one: a pass there is unknown. */
 	readonly passesKnown: boolean;
 };
 

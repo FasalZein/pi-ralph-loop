@@ -384,3 +384,24 @@ test("R8: an unreadable dirty file is an inspection error, not a deletion", asyn
 		} finally { await reader.close(); }
 	} finally { chmodSync(dir, 0o755); f.close(); }
 });
+
+// ---- Re-review 2 regression (N1): items.json presence changes ----
+
+for (const running of [false, true]) {
+	test(`N1: a pass restored after items.json was deleted is unknown, not a missed pass (${running ? "running" : "stopped"})`, async () => {
+		const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+		try {
+			f.block("A", T("10:05"));
+			rmSync(path.join(f.root, ".ralph/items.json"));
+			f.commit("drop items", T("10:07"));
+			f.items[1].passes = true;
+			f.writeBundle();
+			f.commit("restore with B passed", T("10:10"));
+			f.state(running, T("10:00"));
+			const s = await readOnce(f);
+			assert.deepEqual(statuses(s), { A: running ? "working" : "stopped", B: "passed" });
+			assert.ok(s.issues.some((i) => i.source === "git" && /pass evidence unknown/.test(i.detail)));
+			assert.equal(s.sources.history.status, "fresh");
+		} finally { f.close(); }
+	});
+}
