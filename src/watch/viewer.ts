@@ -1,8 +1,8 @@
 import path from "node:path";
-import { type Component, isKeyRelease, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
+import { type Component, isKeyRelease, type KeyId, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
 import { openLoop } from "./loop-state.js";
 import type { ItemStatus, LoopReader, LoopSnapshot } from "./types.js";
-import { allocate, clean, Lines, message, Panel, type Region, splitExact, spread, Stack, style } from "./viewer/layout.js";
+import { allocate, clean, fit, Lines, message, Panel, type Region, splitExact, Stack, style } from "./viewer/layout.js";
 
 // Authority: spec #1 story 46 and the thresholds table ("Viewer refresh about 2 s"); design spec Behaviour.
 export const REFRESH_MS = 2_000;
@@ -66,6 +66,31 @@ function badge(snapshot: LoopSnapshot): string {
 	}
 }
 
+/**
+ * The top-level render boundary. pi-tui runs `doRender()` from its own render timer without an
+ * exception handler, so a layout or root failure there would crash the process with the terminal
+ * still in raw mode and on the alternate screen. This catch keeps the viewer alive; the next
+ * requested render (refresh tick or key) retries with a full redraw.
+ */
+class GuardedAltScreen extends TuiAltScreen {
+	constructor(terminal: Terminal, private readonly onRenderError: (error: unknown) => void) {
+		super(terminal, false);
+	}
+
+	protected override doRender(): void {
+		try {
+			super.doRender();
+		} catch (error) {
+			// The screen no longer matches pi-tui's diff state; redraw everything next time.
+			this.resetRenderState();
+			this.onRenderError(error);
+		}
+	}
+}
+
+const QUIT_PROMPT = `Quit Ralph Watch? The loop keeps running.   ${style.bold("y")} quit   ${style.bold("n")} stay`;
+const QUIT_KEYS = ` ${style.bold("⇧Q")} Quit`;
+
 const itemLabel = (snapshot: LoopSnapshot, key: string | null): string | null => {
 	if (key === null) return null;
 	const item = snapshot.items.find((candidate) => candidate.key === key);
@@ -80,7 +105,17 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const reader = runtime.openLoop(root);
 	const { terminal } = runtime;
 	const state: ViewerState = { snapshot: null, error: null, confirmQuit: false, lastCtrlCAt: null };
-	const tui = new TuiAltScreen(terminal, false);
+	// Drawn without pi-tui layout, so it works when the layout itself fails.
+	const drawRenderError = (error: unknown) => {
+		try {
+			const width = Math.max(1, terminal.columns);
+			const lines = [style.red(` ✕ Ralph Watch could not draw: ${clean(message(error))}`), state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS];
+			terminal.write(`\x1b[2J${lines.slice(0, Math.max(1, terminal.rows)).map((line, row) => `\x1b[${row + 1};1H${fit(line, width)}`).join("")}`);
+		} catch {
+			// Nothing more can be drawn; the next render retries.
+		}
+	};
+	const tui = new GuardedAltScreen(terminal, drawRenderError);
 
 	// ---- Regions ----
 	const worktree = clean(path.basename(root));
@@ -98,9 +133,7 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const header = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}  ${worktree}${branch() ? `  ⎇ ${branch()}` : ""}`], "header");
 	const phoneHeader = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}`, ` ${worktree}${branch() ? ` · ${branch()}` : ""}`], "header");
 	const status = new Lines(() => [` ${statusLine()}`], "status");
-	const footer = new Lines(() => [state.confirmQuit
-		? ` Quit Ralph Watch? The loop keeps running.   ${style.bold("y")} quit   ${style.bold("n")} stay`
-		: ` ${style.bold("⇧Q")} Quit`], "footer");
+	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS], "footer");
 	const current = new Panel(() => style.bold("Current item"), () => {
 		const snapshot = state.snapshot;
 		if (!snapshot) return [];
@@ -196,12 +229,14 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 			}
 			return { consume: true };
 		}
+		// matchesKey also decodes Kitty-encoded presses (ProcessTerminal enables Kitty reporting).
+		const key = (...ids: KeyId[]) => ids.some((id) => matchesKey(data, id));
 		if (state.confirmQuit) {
-			if (data === "y" || data === "Y") void quit();
-			else if (data === "n" || data === "N" || matchesKey(data, "escape")) state.confirmQuit = false;
+			if (key("y", "shift+y")) void quit();
+			else if (key("n", "shift+n", "escape")) state.confirmQuit = false;
 			else return { consume: true };
-		} else if (data === "Q") state.confirmQuit = true;
-		else if (data === "q") tui.flash("Shift+Q to quit", HINT_MS);
+		} else if (key("shift+q")) state.confirmQuit = true;
+		else if (key("q")) tui.flash("Shift+Q to quit", HINT_MS);
 		else return undefined;
 		tui.requestRender();
 		return { consume: true };

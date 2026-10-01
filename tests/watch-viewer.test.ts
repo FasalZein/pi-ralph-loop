@@ -242,6 +242,61 @@ test("Kitty key releases are ignored", async (t) => {
 	await quitByKeys(h);
 });
 
+test("Kitty-encoded presses: q shows the hint, Shift+Q asks, n stays, y quits", async (t) => {
+	const f = runningLoop(t);
+	const h = start(f.root, new ReplayTerminal(80, 24));
+	await until(() => h.term.text().includes("RUNNING"), "first frame");
+	// Kitty keyboard protocol presses (CSI codepoint;modifier u): q, Shift+Q, n, y.
+	h.term.send("\x1b[113u");
+	await until(() => h.term.text().includes("Shift+Q to quit"), "q hint");
+	h.term.send("\x1b[113;2u");
+	await until(() => h.term.text().includes("Quit Ralph Watch?"), "quit prompt");
+	h.term.send("\x1b[110u");
+	await until(() => !h.term.text().includes("Quit Ralph Watch?"), "prompt closed");
+	assert.equal(h.resolved(), false);
+	h.term.send("\x1b[113;2u");
+	await until(() => h.term.text().includes("Quit Ralph Watch?"), "quit prompt again");
+	h.term.send("\x1b[121u");
+	await h.done;
+	assert.equal(h.term.stopped, true);
+});
+
+/** A terminal whose size reads fail only inside the viewer's root geometry callback (`regions`). */
+class LayoutFaultTerminal extends ReplayTerminal {
+	fail = false;
+	private check(): void {
+		// Stack line 3 is the caller of the getter (after Error, check and the getter); pi-tui size reads pass.
+		if (this.fail && /\bregions\b/.test(new Error().stack?.split("\n")[3] ?? "")) throw new Error("geometry broke");
+	}
+	override get columns(): number { this.check(); return super.columns; }
+	override get rows(): number { this.check(); return super.rows; }
+}
+
+test("a root layout failure draws an error frame, keeps keys working, recovers and quits cleanly", async (t) => {
+	const f = runningLoop(t);
+	const term = new LayoutFaultTerminal(80, 24);
+	const h = start(f.root, term);
+	await until(() => term.text().includes("RUNNING"), "first frame");
+	term.fail = true;
+	h.tick();
+	await until(() => term.text().includes("Ralph Watch could not draw: geometry broke"), "error frame");
+	assert.equal(h.resolved(), false);
+	assert.equal(term.stopped, false);
+	// Keys still work while the layout fails; the error frame shows the prompt.
+	h.term.send("\x1b[113;2u");
+	await until(() => term.text().includes("Quit Ralph Watch?"), "prompt in error frame");
+	h.term.send("n");
+	await until(() => !term.text().includes("Quit Ralph Watch?"), "prompt closed");
+	term.fail = false;
+	h.tick();
+	await until(() => term.screen()[0].startsWith("╭") && term.text().includes("RUNNING"), "recovered frame");
+	assert.ok(!term.text().includes("could not draw"), term.text());
+	assert.match(term.screen()[23], /^╰─+╯$/);
+	await quitByKeys(h);
+	assert.equal(term.stopped, true);
+	assert.equal(h.closed(), true);
+});
+
 // ---- Errors and refresh ----
 
 test("a panel error shows inline in that panel; the rest of the frame stays", async (t) => {

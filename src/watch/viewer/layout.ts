@@ -75,13 +75,6 @@ export function fit(line: string, width: number): string {
 	return cut + " ".repeat(Math.max(0, width - visibleWidth(cut)));
 }
 
-/** Left and right text on one line of `width` columns; the left side yields first. */
-export function spread(left: string, right: string, width: number): string {
-	const rw = visibleWidth(right);
-	if (!right || rw + 1 > width) return fit(left, width);
-	return fit(left, width - rw - 1) + " " + right;
-}
-
 const sgr = (code: string) => (text: string) => `\x1b[${code}m${text}\x1b[0m`;
 export const style = {
 	// Accent orange, truecolor 236,124,64 (design spec section 1). Status colours come from the terminal theme.

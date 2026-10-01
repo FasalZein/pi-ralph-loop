@@ -1,5 +1,4 @@
 import { execute, runDriverRole, type Request } from "./commands.js";
-import { runViewer } from "./viewer.js";
 
 const USAGE = "Usage: ralph launch <root> [--fresh|--relaunch|--resume]\n       ralph stop <root> [--timeout <seconds>]\n       ralph status <root>\n       ralph watch <root>";
 type Parsed = { readonly kind: "help" } | { readonly kind: "driver"; readonly manifest: string } | { readonly kind: "watch"; readonly root: string } | { readonly kind: "request"; readonly request: Request };
@@ -39,6 +38,8 @@ export async function main(argv: readonly string[]): Promise<number> {
 		return exit.reason === "loop-finished" || exit.reason === "stopped-before-launch" ? 0 : 1;
 	}
 	if (parsed.kind === "watch") {
+		// Loaded here only, so other commands never load pi-tui.
+		const { runViewer } = await import("./viewer.js");
 		await runViewer({ roots: [parsed.root] });
 		return 0;
 	}
