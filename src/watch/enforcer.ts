@@ -128,8 +128,11 @@ export function evaluate(snapshot: LoopSnapshot, mission: Mission, launch: Launc
 					for (const match of source.matchAll(FOCUS_CALLS)) {
 						const from = match.index, to = from + match[0].length;
 						const first = lineAt(from), last = lineAt(to - 1);
+						// An added line must supply a call token: a comment or blank line inserted into an existing call is not a new call.
 						let touchesAdded = false;
-						for (let n = first; n <= last; n++) if (isAdded.has(n)) touchesAdded = true;
+						for (let n = first; n <= last; n++) {
+							if (isAdded.has(n) && source.slice(Math.max(from, starts[n - 1]), Math.min(to, starts[n] - 1)).trim() !== "") touchesAdded = true;
+						}
 						if (!touchesAdded || findings.get(from)?.certain) continue;
 						const certain = isCode && !unsure!.slice(from, to).includes("?");
 						if (certain || !isCode && (code === null || unsure!.slice(from, to).includes("?"))) findings.set(from, { call: match[1], line: first, certain });

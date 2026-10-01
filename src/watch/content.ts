@@ -27,6 +27,7 @@ const JSX_EXTENSIONS: readonly string[] = [".tsx", ".jsx", ".js", ".mjs", ".cjs"
 export const allowsJsx = (file: string): boolean => JSX_EXTENSIONS.includes(path.posix.extname(file).toLowerCase());
 
 const EXPRESSION_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
+const TSX_TYPE_PARAMETERS = /^<\s*[A-Za-z_$][\w$]*\s*(?:,|extends\s+[^\s=>/])/;
 const CONTROL_PAREN_WORDS = new Set(["if", "while", "for", "with"]);
 const EXPRESSION_AFTER_PUNCT = "(,=:[!&|?{};+-*%<>~^.";
 
@@ -74,7 +75,8 @@ export function lexLines(text: string, jsx: boolean): LexedLine[] {
 					if (expression === "unknown") { taint = true; unsure[i] = 1; }
 					mode = "re"; literal(i); continue;
 				}
-				if (jsx && c === "<" && expression !== false && next !== undefined && /[A-Za-z_$>]/.test(next)) {
+				// TSX disambiguates a generic arrow from JSX by `<T,` or `<T extends X`: those are type parameters, so code.
+				if (jsx && c === "<" && expression !== false && next !== undefined && /[A-Za-z_$>]/.test(next) && !TSX_TYPE_PARAMETERS.test(text.slice(i, i + 200))) {
 					if (expression === "unknown") taint = true;
 					mode = "jsxtag"; closingTag = false; jsxDepth = 0; literal(i); unsure[i] = 1; continue;
 				}

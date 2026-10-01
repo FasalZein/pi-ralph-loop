@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
@@ -142,6 +142,33 @@ for (const seam of SEAMS) {
 	});
 }
 
+// Review fix round 2, finding 1: a TSX generic arrow is type parameters, not JSX; later code keeps full coverage.
+const GENERIC_ARROWS = [
+	["concise", "export const identity = <T,>(value: T) => value;"],
+	["block-bodied", "export const wrap = <T extends object>(value: T): T[] => {\n\treturn [value];\n};"],
+] as const;
+for (const [shape, arrow] of GENERIC_ARROWS) {
+	for (const seam of SEAMS) {
+		test(`TSX generic arrow, ${shape} (${seam}): a later suppression comment is HARD`, async () => {
+			const x = scratch();
+			try {
+				const sha = land(x.f, seam, () => write(x.f, "src/generic.tsx", `${arrow}\n// @ts-ignore\nexport const n: number = "x";\n`));
+				const alert = await expectHard(x, seam, sha, "suppression-comment");
+				assert.ok(alert.evidence[0].endsWith(`"src/generic.tsx":${arrow.split("\n").length + 1}: @ts-ignore`), alert.evidence[0]);
+			} finally { x.f.close(); }
+		});
+
+		test(`TSX generic arrow, ${shape} (${seam}): a later focus call is HARD`, async () => {
+			const x = scratch({ scope: { testGlobs: ["**/*.test.tsx"] } });
+			try {
+				const sha = land(x.f, seam, () => write(x.f, "tests/g.test.tsx", `import { it } from "node:test";\n${arrow}\nit.only("focus", () => {});\n`));
+				const alert = await expectHard(x, seam, sha, "test-focus");
+				assert.ok(alert.evidence[0].endsWith(`"tests/g.test.tsx":${arrow.split("\n").length + 2}: .only(`), alert.evidence[0]);
+			} finally { x.f.close(); }
+		});
+	}
+}
+
 test("ambiguous slash after a block is coverage incomplete, never HARD", async () => {
 	const x = scratch();
 	try {
@@ -214,6 +241,25 @@ for (const [name, text, call, line] of [["multiline-only", "it.only\n(\"focus\",
 				const sha = land(x.f, seam, () => append(x.f, "tests/a.test.ts", text));
 				const alert = await expectHard(x, seam, sha, "test-focus");
 				assert.ok(alert.evidence[0].endsWith(`"tests/a.test.ts":${line}: ${call}`), alert.evidence[0]);
+			} finally { x.f.close(); }
+		});
+	}
+}
+
+// Review fix round 2, finding 2: an added comment or blank line inside an existing call adds no call token.
+for (const [kind, inserted] of [["comment-only", "// explain legacy"], ["blank-line-only", ""]] as const) {
+	for (const seam of SEAMS) {
+		test(`existing multiline focus call, ${kind} insertion (${seam}): no alert`, async () => {
+			const x = scratch();
+			try {
+				write(x.f, "tests/b.test.ts", "import { it } from \"node:test\";\nit.only\n(\"legacy\", () => {});\n");
+				// The legacy call predates the mission base, so only the new edit is under review.
+				const base = x.f.commit("approved legacy focus", T("09:40"));
+				const missionFile = path.join(x.f.root, ".ralph/mission.json");
+				writeFileSync(missionFile, JSON.stringify({ ...JSON.parse(readFileSync(missionFile, "utf8")), git: { baseCommit: base } }));
+				x.f.commit("rebase mission", T("09:45"));
+				land(x.f, seam, () => write(x.f, "tests/b.test.ts", `import { it } from "node:test";\nit.only\n${inserted}\n("legacy", () => {});\n`));
+				assert.deepEqual(summary((await run(x)).alerts), []);
 			} finally { x.f.close(); }
 		});
 	}
