@@ -20,9 +20,10 @@ export type HostHandle = {
 export type RoleSpec = { readonly title: "loop"; readonly argv: readonly string[]; readonly env: Readonly<Record<string, string>> };
 export type Host = {
 	/**
-	 * Create the session and start the role. `signal` bounds startup; on any
-	 * failure or abort the adapter removes the session it created, which never
-	 * ran a loop, and rethrows.
+	 * Create the session and start the role. `signal` is the absolute startup
+	 * deadline and also bounds cleanup: on failure the adapter removes the
+	 * session it created, which never ran a loop, and rethrows; if the deadline
+	 * leaves no time for that, it throws HostOpenError instead.
 	 */
 	open(root: string, launchId: string, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle>;
 	/** True when the handle still names the same live session, pane, root and launch on the same server. */
@@ -40,10 +41,13 @@ export type Host = {
 	close(handle: HostHandle, signal?: AbortSignal): Promise<void>;
 };
 /**
- * Bound for host cleanup client calls. It reuses the owner's 30 s readiness
- * limit (#10, #1): cleanup that cannot finish in it is reported, not awaited.
+ * `open` failed and could not remove its session within the caller's startup
+ * deadline. `handle` is the exact creation identity when it was observed, so
+ * the caller can keep a record for the next launch's recovery.
  */
-export const HOST_CLEANUP_TIMEOUT_MS = 30_000;
+export class HostOpenError extends Error {
+	constructor(cause: string, readonly retained: string, readonly handle: HostHandle | null) { super(`${cause}; ${retained}`); this.name = "HostOpenError"; }
+}
 
 const RECORD = ".ralph/watch-host.json";
 function valid(value: unknown): value is HostHandle {

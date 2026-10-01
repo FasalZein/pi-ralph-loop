@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { existsSync } from "node:fs";
-import { HOST_CLEANUP_TIMEOUT_MS, type Host, type HostHandle, type RoleSpec } from "../host.js";
+import { HostOpenError, type Host, type HostHandle, type RoleSpec } from "../host.js";
 
 export type TmuxResult = { readonly code: number; readonly stdout: string; readonly stderr: string };
 /** Runs `tmux <args>` without a shell; `env` is the complete client environment. */
@@ -13,8 +13,6 @@ export type TmuxRuntime = {
 	readonly server?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
 	readonly now?: () => Date;
-	/** Cleanup bound; default HOST_CLEANUP_TIMEOUT_MS. */
-	readonly cleanupMs?: number;
 };
 export const realTmux: TmuxExec = (args, env, signal) => new Promise((resolve) => {
 	execFile("tmux", [...args], { env, encoding: "utf8", signal }, (error, stdout, stderr) => {
@@ -53,22 +51,22 @@ export function tmuxHost(runtime: TmuxRuntime = {}): Host {
 		const result = await exec([...at(handle), "display-message", "-p", "-t", handle.paneId, IDENTITY], clientEnv, signal);
 		return result.code === 0 && result.stdout.replace(/\n$/, "") === identity(handle);
 	}
-	const cleanupSignal = () => AbortSignal.timeout(runtime.cleanupMs ?? HOST_CLEANUP_TIMEOUT_MS);
 	/**
 	 * Remove the session this open created. The role has not dispatched a
 	 * launch yet: open never returned, so no caller could release its gate.
-	 * Returns a description of what may remain when cleanup cannot finish.
+	 * Cleanup shares the startup deadline (one readiness limit, #10); it returns
+	 * a description of what may remain when it cannot finish before it.
 	 */
-	async function rollback(handle: HostHandle | null, server: readonly string[], launchId: string): Promise<string | null> {
-		const signal = cleanupSignal();
+	async function rollback(handle: HostHandle | null, server: readonly string[], launchId: string, signal?: AbortSignal): Promise<string | null> {
+		if (signal?.aborted) return handle ? `tmux session ${handle.sessionId} (launch ${launchId}) may remain: readiness deadline passed before cleanup` : `a tmux session of launch ${launchId} may remain: readiness deadline passed before cleanup`;
 		const kill = async (args: readonly string[], id: string) => {
 			const result = await exec([...args, "kill-session", "-t", id], clientEnv, signal);
-			return result.code === 0 || signal.aborted ? (signal.aborted ? `tmux session ${id} (launch ${launchId}) may remain: cleanup did not finish` : null) : `tmux session ${id} (launch ${launchId}) may remain: ${result.stderr.trim()}`;
+			return result.code === 0 || signal?.aborted ? (signal?.aborted ? `tmux session ${id} (launch ${launchId}) may remain: cleanup did not finish` : null) : `tmux session ${id} (launch ${launchId}) may remain: ${result.stderr.trim()}`;
 		};
 		if (handle) return kill(at(handle), handle.sessionId);
 		// Creation identity was not observed (interrupted client): find the session by its unique launch marker.
 		const listed = await exec([...server, "list-sessions", "-F", "#{session_id}\t#{@ralph_launch}"], clientEnv, signal);
-		if (listed.code !== 0) return signal.aborted ? `a tmux session of launch ${launchId} may remain: cleanup did not finish` : null;
+		if (listed.code !== 0) return signal?.aborted ? `a tmux session of launch ${launchId} may remain: cleanup did not finish` : null;
 		for (const line of listed.stdout.split("\n")) {
 			const [id, marked] = line.split("\t");
 			if (id && marked === launchId) { const left = await kill(server, id); if (left) return left; }
@@ -104,8 +102,8 @@ export function tmuxHost(runtime: TmuxRuntime = {}): Host {
 				await run([...target, "respawn-pane", "-k", "-t", handle.paneId, "-c", root, ...argv], signal);
 				return handle;
 			} catch (error) {
-				const left = await rollback(handle, server, launchId);
-				if (left) throw new Error(`${error instanceof Error ? error.message : String(error)}; ${left}`);
+				const left = await rollback(handle, server, launchId, signal);
+				if (left) throw new HostOpenError(error instanceof Error ? error.message : String(error), left, handle);
 				throw error;
 			}
 		},

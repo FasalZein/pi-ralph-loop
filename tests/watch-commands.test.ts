@@ -85,7 +85,7 @@ test("launch refuses fresh owner; invalid state does not authorize takeover; res
 	assert.deepEqual(calls, []);
 });
 
-test("dead pane and silent driver fail readiness and close only the unused session", async (t) => {
+test("dead pane closes the unused session; a silent driver fails at the deadline and keeps its record", async (t) => {
 	const root = scratch(t);
 	const dead = recordingHost(true);
 	let outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host: dead.host, ...quiet });
@@ -94,10 +94,11 @@ test("dead pane and silent driver fail readiness and close only the unused sessi
 	const silent = recordingHost(false);
 	const started = Date.now();
 	outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host: silent.host, readyTimeoutMs: 300, ...quiet });
-	assert.ok(!outcome.ok && /not ready/.test(outcome.error));
+	assert.ok(!outcome.ok && /not ready within 0.3 s.*may remain: readiness deadline passed before cleanup/.test(outcome.error), JSON.stringify(outcome));
 	assert.ok(Date.now() - started < 2000);
-	assert.deepEqual(silent.calls, ["open", "verify", "close"]);
-	assert.equal(existsSync(join(root, ".ralph/watch-host.json")), false);
+	// The deadline has passed: no cleanup window; the record lets the next launch recover the session.
+	assert.deepEqual(silent.calls, ["open"]);
+	assert.equal(readHostRecord(root)?.sessionId, "$9");
 	assert.equal(existsSync(join(root, ".ralph/launch.lock")), false);
 });
 
@@ -269,4 +270,27 @@ test("launch recovery refuses a previous session whose pane state cannot be read
 	assert.ok(!outcome.ok && /uncertain/.test(outcome.error), JSON.stringify(outcome));
 	assert.equal(calls.some((args) => args.includes("kill-session")), false, "a live role is never closed on a failed query");
 	assert.equal(readHostRecord(root)?.launchId, "old-launch");
+});
+
+test("launch fails at the readiness deadline even when host cleanup stalls (H1)", { timeout: 10_000 }, async (t) => {
+	const root = scratch(t);
+	const socket = join(root, "fake-socket");
+	writeFileSync(socket, "");
+	const calls: (readonly string[])[] = [];
+	// Startup succeeds; afterwards the server stalls every client until its signal ends it.
+	const exec = async (args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
+		calls.push(args);
+		if (args.includes("new-session")) return { code: 0, stdout: `$4\t@4\t%4\t${socket}\n`, stderr: "" };
+		if (args.some((arg) => ["set-option", "show-environment", "respawn-pane"].includes(arg))) return { code: 0, stdout: "", stderr: "" };
+		return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
+	};
+	const readyMs = 400;
+	const started = Date.now();
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host: tmuxHost({ exec, env: {} }), readyTimeoutMs: readyMs, ...quiet });
+	const elapsed = Date.now() - started;
+	assert.ok(!outcome.ok && /not ready within 0.4 s.*\$4.*may remain/.test(outcome.error), JSON.stringify(outcome));
+	// Failure arrives at the one readiness deadline, not deadline plus a cleanup window.
+	assert.ok(elapsed < readyMs + 600, `${elapsed} ms`);
+	assert.equal(calls.some((args) => args.includes("kill-session")), false);
+	assert.equal(readHostRecord(root)?.sessionId, "$4", "record kept for the next launch's recovery");
 });

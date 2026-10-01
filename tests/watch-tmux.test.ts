@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { execute } from "../src/watch/commands.ts";
 import { tmuxHost } from "../src/watch/hosts/tmux.ts";
+import { HostOpenError } from "../src/watch/host.ts";
 import { readStateDocument } from "../src/state.ts";
 
 const roleFixture = fileURLToPath(new URL("./fixtures/driver-role.ts", import.meta.url));
@@ -144,20 +145,31 @@ test("tmux open rolls back its exact session when setup fails (R7)", async () =>
 	assert.equal(calls.some((args) => args.includes("respawn-pane")), false, "the role never started");
 });
 
-test("tmux open stops at the startup deadline and removes only its marked session (R6)", async () => {
+test("tmux open stops at the startup deadline and reports, without a cleanup window, what may remain (R6)", async () => {
 	const calls: (readonly string[])[] = [];
-	// new-session hangs until aborted; the server already created the session with its markers.
+	// new-session hangs until aborted; the server may already have created the session.
 	const exec = async (args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
 		calls.push(args);
 		if (args.includes("new-session")) return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
-		if (args.includes("list-sessions")) return { code: 0, stdout: "$7\tlaunch-1\n$8\tother\n$9\t\n", stderr: "" };
 		return { code: 0, stdout: "", stderr: "" };
 	};
 	const started = Date.now();
-	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", "x"] }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(100)));
+	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", "x"] }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(100)), /a tmux session of launch launch-1 may remain/);
 	assert.ok(Date.now() - started < 1000);
-	assert.deepEqual(calls.filter((args) => args.includes("kill-session")), [["-L", "x", "kill-session", "-t", "$7"]]);
+	assert.equal(calls.length, 1, "no client call after the deadline");
 	assert.ok(calls[0].includes("@ralph_launch") && calls[0].includes(";"), "markers are set in the creating command");
+});
+
+test("tmux open without creation identity removes only the session with its launch marker", async () => {
+	const calls: (readonly string[])[] = [];
+	const exec = async (args: readonly string[]) => {
+		calls.push(args);
+		if (args.includes("new-session")) return { code: 1, stdout: "", stderr: "client failed" };
+		if (args.includes("list-sessions")) return { code: 0, stdout: "$7\tlaunch-1\n$8\tother\n$9\t\n", stderr: "" };
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", "x"] }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }), /client failed/);
+	assert.deepEqual(calls.filter((args) => args.includes("kill-session")), [["-L", "x", "kill-session", "-t", "$7"]]);
 });
 
 test("tmux open keeps the creation identity when an early marker fails (G3)", async () => {
@@ -180,21 +192,27 @@ test("scratch tmux early marker failure leaves no session (G3)", { skip: availab
 	t.after(() => { tmux("kill-server"); rmSync(socket, { force: true }); });
 	const { realTmux } = await import("../src/watch/hosts/tmux.ts");
 	// Real tmux; only the launch-marker command targets a missing session so it fails.
-	const exec = (args: readonly string[], env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
+	let created = "";
+	const exec = async (args: readonly string[], env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
 		const index = args.indexOf("@ralph_launch");
-		return realTmux(index > 0 ? [...args.slice(0, index), "-t", "=missing-session", ...args.slice(index)] : args, env, signal);
+		const result = await realTmux(index > 0 ? [...args.slice(0, index), "-t", "=missing-session", ...args.slice(index)] : args, env, signal);
+		if (args.includes("new-session")) created = result.stdout;
+		return result;
 	};
-	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", server] }).open(tmpdir(), "launch-g3", { title: "loop", argv: ["true"], env: {} }));
+	// The normal environment: tmux must be found and render the tab-separated identity.
+	await assert.rejects(tmuxHost({ exec, server: ["-L", server] }).open(tmpdir(), "launch-g3", { title: "loop", argv: ["true"], env: {} }), /no such session: =missing-session/);
+	assert.match(created, /^\$\d+\t@\d+\t%\d+\t\//, "the chain created a session before the marker failed");
 	assert.deepEqual(tmux("list-sessions", "-F", "#{session_name}").stdout.trim().split("\n"), ["sentinel"]);
 });
 
-test("tmux rollback after the startup deadline is bounded and reports what may remain (G4)", { timeout: 5_000 }, async () => {
+test("tmux rollback shares the startup deadline and reports what may remain (G4, H1)", { timeout: 5_000 }, async () => {
 	const hang = (signal?: AbortSignal) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
 	// The stalled server stalls every client, including cleanup.
 	const exec = async (_args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => hang(signal);
 	const started = Date.now();
-	await assert.rejects(tmuxHost({ exec, env: {}, cleanupMs: 100 }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(50)), /may remain: cleanup did not finish/);
-	assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+	await assert.rejects(tmuxHost({ exec, env: {} }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(200)), (error: unknown) => error instanceof HostOpenError && /may remain: readiness deadline passed/.test(error.message));
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 600, `${elapsed} ms: no cleanup window after the deadline`);
 });
 
 test("pane state is dead only on positive evidence (G2)", async () => {

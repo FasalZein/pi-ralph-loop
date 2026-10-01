@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { readStateDocument } from "../state.js";
 import { loadMission } from "./config.js";
 import { activeOwnerConflict, connectEvents, controlLoop, fifoGate, isTerminal, releaseLaunch, runDriver, TERMINAL_POLL_MS, type DriverExit, type DriverRuntime, type LaunchMode } from "./driver.js";
-import { HOST_CLEANUP_TIMEOUT_MS, readHostRecord, removeHostRecord, writeHostRecord, type Host, type HostHandle } from "./host.js";
+import { HostOpenError, readHostRecord, removeHostRecord, writeHostRecord, type Host, type HostHandle } from "./host.js";
 import { tmuxHost } from "./hosts/tmux.js";
 import { object } from "./journal.js";
 import { openLoop } from "./loop-state.js";
@@ -163,7 +163,13 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 		try {
 			await recoverInactiveHost(root, host, ready);
 			handle = await host.open(root, launchId, { title: "loop", argv: (runtime.driverArgv ?? defaultDriverArgv)(manifest), env: { PATH: env.PATH ?? "", PI_SUBAGENT_MUX: "tmux", RALPH_BLOCKED_TOOLS: blocked } }, ready);
-		} catch (error) { if (existsSync(manifest)) unlinkSync(manifest); throw ready.aborted ? notReady() : error; }
+		} catch (error) {
+			if (existsSync(manifest)) unlinkSync(manifest);
+			if (!(error instanceof HostOpenError)) throw ready.aborted ? notReady() : error;
+			// The session may remain: record it so the next launch's recovery can find it.
+			if (error.handle) writeHostRecord(error.handle);
+			throw ready.aborted ? new Error(`${notReady().message}; ${error.retained}`) : error;
+		}
 		try {
 			writeHostRecord(handle);
 			err(`ralph: waiting for driver in tmux session ${handle.name} (${handle.sessionId})`);
@@ -171,11 +177,13 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 		} catch (error) {
 			// Nothing was dispatched: the unused session holds no loop.
 			const failure = ready.aborted ? notReady() : error;
-			const cleanup = AbortSignal.timeout(HOST_CLEANUP_TIMEOUT_MS);
-			try { if (await host.verify(handle, cleanup)) await host.close(handle, cleanup); }
+			// Cleanup shares the absolute readiness deadline (#10); no second window.
+			const retained = (detail: string) => new Error(`${message(failure)}; tmux session ${handle!.name} (${handle!.sessionId}) may remain: ${detail}`);
+			if (ready.aborted) throw retained("readiness deadline passed before cleanup");
+			try { if (await host.verify(handle, ready)) await host.close(handle, ready); }
 			catch (cleanupError) {
 				// The record stays so the next launch can recover this session.
-				throw new Error(`${message(failure)}; tmux session ${handle.name} (${handle.sessionId}) may remain: ${cleanup.aborted ? "cleanup did not finish" : message(cleanupError)}`);
+				throw retained(ready.aborted ? "cleanup did not finish before the readiness deadline" : message(cleanupError));
 			}
 			removeHostRecord(root, launchId);
 			if (existsSync(manifest)) unlinkSync(manifest);
