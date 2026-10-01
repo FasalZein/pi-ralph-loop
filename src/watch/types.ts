@@ -195,6 +195,48 @@ export type GitObservation = {
 	readonly commits: readonly CommitEvent[] | null;
 };
 
+/** An added line on the new side of a change. `lexed` is null outside JS/TS files. */
+export type AddedLine = {
+	readonly line: number;
+	readonly text: string;
+	readonly lexed: import("./content.js").LexedLine | null;
+};
+
+/**
+ * One changed path in a seam. `skipped`: no generic rule reads this file's
+ * content (not JS/TS and not a discovered test). `unavailable`: content needed
+ * but not readable as text (binary, unmerged, not a regular file).
+ */
+export type FileChange = {
+	readonly path: string;
+	readonly status: "A" | "M" | "D" | "T" | "U";
+	readonly content:
+		| { readonly kind: "lines"; readonly added: readonly AddedLine[] }
+		| { readonly kind: "skipped" }
+		| { readonly kind: "unavailable"; readonly reason: string };
+};
+
+export type SeamEvidence =
+	| { readonly status: "fresh"; readonly changes: readonly FileChange[] }
+	| { readonly status: "unavailable"; readonly error: string };
+
+/**
+ * Content evidence collected inside the consistent git window. Only present
+ * when git is fresh. Commit seams are against the first parent; `index` is
+ * HEAD->INDEX; `worktree` is INDEX->WORKTREE plus untracked files.
+ */
+export type ContentEvidence = {
+	/** False only on proof (exit 1); null when unknown. */
+	readonly baseAncestor: boolean | null;
+	/** Per commit in history; a commit missing here has no evidence. */
+	readonly commits: Readonly<Record<string, SeamEvidence>>;
+	readonly index: SeamEvidence;
+	readonly worktree: SeamEvidence;
+};
+
+/** Branch at launch, captured into the run spec (owner decision on #11). Null means detached HEAD. */
+export type LaunchBaseline = { readonly branch: string | null };
+
 /** `history` is the base..HEAD commit inspection, separate from HEAD/branch (`git`). */
 export type SourceName = "state" | "items" | "progress" | "git" | "history" | "journal";
 
@@ -246,6 +288,8 @@ export type LoopSnapshot = {
 	readonly health: Health;
 	/** Fresh, consistent git evidence; null when git failed or changed during the read. */
 	readonly git: GitObservation | null;
+	/** Content evidence from the same consistent window as `git`; null whenever `git` is null. */
+	readonly evidence: ContentEvidence | null;
 	readonly sources: Readonly<Record<SourceName, SourceReport>>;
 	readonly retained: RetainedValues;
 	readonly issues: readonly Issue[];

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { execute, LAUNCH_READY_TIMEOUT_MS, STOP_ACK_TIMEOUT_MS } from "../src/watch/commands.ts";
+import { readManifest } from "../src/watch/command-lifecycle.ts";
 import { connectEvents, immediateGate, runDriver } from "../src/watch/driver.ts";
 import { loadMission } from "../src/watch/config.ts";
 import { readHostRecord, writeHostRecord, type Host, type HostHandle } from "../src/watch/host.ts";
@@ -59,6 +60,20 @@ test("launch rejects invalid mission before host open", async (t) => {
 	assert.equal(outcome.ok, false);
 	assert.deepEqual(calls, []);
 	assert.equal(existsSync(join(root, ".ralph/launch.lock")), false);
+});
+
+test("launch captures the checked-out branch into the run spec; a detached HEAD is null (#11)", async (t) => {
+	const root = scratch(t);
+	const seen: (string | null)[] = [];
+	const capturing = (): Host => {
+		const { host } = recordingHost(true);
+		return { ...host, async open(r, id, role, signal) { seen.push(readManifest(role.argv.at(-1)!).branch); return host.open(r, id, role, signal); } };
+	};
+	execFileSync("git", ["checkout", "-q", "-b", "loop-branch"], { cwd: root });
+	assert.ok(!(await execute({ kind: "launch", root, mode: "fresh" }, { host: capturing(), ...quiet })).ok);
+	execFileSync("git", ["checkout", "-q", "--detach"], { cwd: root });
+	assert.ok(!(await execute({ kind: "launch", root, mode: "fresh" }, { host: capturing(), ...quiet })).ok);
+	assert.deepEqual(seen, ["loop-branch", null]);
 });
 
 test("launch refuses live driver lock before ready metadata", async (t) => {

@@ -10,12 +10,13 @@ import type { BundleItem } from "../bundle/types.js";
 import { readStateDocument } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
+import { isJsTs, isTestPath, lexLines } from "./content.js";
 import { parseJournal } from "./journal.js";
 import { deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
-	CommitEvent, GitObservation, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
+	AddedLine, CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
 	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
 } from "./types.js";
 
@@ -123,6 +124,8 @@ export type LoopObservation = {
 	readonly progress: Result<readonly AttemptCard[]> | null;
 	readonly git: Result<HeadInfo>;
 	readonly history: Result<readonly CommitEvent[]>;
+	/** Content evidence from the git window; ignored unless git is fresh. */
+	readonly evidence: ContentEvidence | null;
 	readonly journal: Result<JournalView>;
 	readonly counterBaseline: CounterBaseline | null;
 	/** State run starts observed by this reader; fresh journal starts are merged during derivation. */
@@ -294,6 +297,7 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		historyComplete: timing.timeline.coverage.complete,
 		timeline: timing.timeline, health,
 		git: head ? { ...head, commits } : null,
+		evidence: head ? o.evidence : null,
 		sources,
 		retained,
 		issues,
@@ -626,7 +630,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		return blobCards.get(oid)!;
 	}
 
-	async function readHistory(issues: Issue[], signal: AbortSignal, progressOut: Map<string, readonly AttemptCard[] | null>, head: string): Promise<Result<readonly CommitEvent[]>> {
+	async function readHistory(issues: Issue[], signal: AbortSignal, progressOut: Map<string, readonly AttemptCard[] | null>, head: string, ancestry: { baseAncestor: boolean | null }): Promise<Result<readonly CommitEvent[]>> {
 		const base = mission?.git.baseCommit ?? null;
 		if (base === null) {
 			issues.push({ source: "git", kind: "unavailable", detail: "no mission base; commit history unavailable" });
@@ -635,9 +639,11 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		try {
 			try {
 				await rt.git(root, ["merge-base", "--is-ancestor", base, head], signal);
+				ancestry.baseAncestor = true;
 			} catch (error) {
 				// Exit 1 proves non-ancestry; anything else is unknown, not a history fact.
 				if (!(error instanceof GitCommandError && error.exitCode === 1)) throw error;
+				ancestry.baseAncestor = false;
 				const detail = `base ${base} is not an ancestor of HEAD; history incomplete`;
 				issues.push({ source: "git", kind: "partial", detail });
 				return unavailable(detail);
@@ -667,13 +673,110 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		}
 	}
 
+	/** Base flags for every content diff: no external diff, textconv, colour or rename pairing. */
+	const DIFF = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-renames"];
+	// Unified context that carries the whole new file: JS/TS lexing needs every line.
+	const WHOLE_FILE_CONTEXT = "-U2147483647";
+	let emptyTree: string | null = null;
+	const STATUSES = new Set(["A", "M", "D", "T", "U"]);
+
+	/** Generic rules read content of JS/TS files and discovered tests only. */
+	const scanned = (rel: string) => isJsTs(rel) || isTestPath(mission, rel);
+
+	/** Added lines of one path from a single-path unified diff; hunk headers carry the new-side line numbers. */
+	async function diffContent(range: readonly string[], rel: string, signal: AbortSignal): Promise<FileChange["content"]> {
+		const jsTs = isJsTs(rel);
+		const out = await rt.git(root, ["--literal-pathspecs", "diff", jsTs ? WHOLE_FILE_CONTEXT : "-U0", ...DIFF, ...range, "--", rel], signal);
+		const rows = out.split("\n");
+		const added: { line: number; text: string }[] = [];
+		const lines: string[] = [];
+		let hunk = false;
+		let seenHunk = false;
+		let n = 0;
+		for (const row of rows) {
+			const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
+			if (header) { hunk = seenHunk = true; n = Number(header[1]); continue; }
+			if (!hunk) continue;
+			if (row.startsWith("+")) { added.push({ line: n, text: row.slice(1) }); lines[n - 1] = row.slice(1); n++; }
+			else if (row.startsWith(" ")) { lines[n - 1] = row.slice(1); n++; }
+			else if (!row.startsWith("-") && !row.startsWith("\\")) hunk = false;
+		}
+		if (!seenHunk && rows.some((row) => row.startsWith("Binary files ") || row === "GIT binary patch")) return { kind: "unavailable", reason: "binary" };
+		const lexed = jsTs ? lexLines(lines.join("\n")) : null;
+		return { kind: "lines", added: added.map((a): AddedLine => ({ ...a, lexed: lexed?.[a.line - 1] ?? null })) };
+	}
+
+	async function seam(range: readonly string[], signal: AbortSignal): Promise<FileChange[]> {
+		const parts = (await rt.git(root, ["diff", "--name-status", "-z", ...DIFF, ...range], signal)).split("\0");
+		const changes: FileChange[] = [];
+		for (let i = 0; i + 1 < parts.length; i += 2) {
+			const [status, rel] = [parts[i], parts[i + 1]];
+			if (!STATUSES.has(status)) throw new Error(`unexpected diff status ${JSON.stringify(status)} for ${JSON.stringify(rel)}`);
+			const content: FileChange["content"] = status === "D" || !scanned(rel) ? { kind: "skipped" }
+				: status === "U" ? { kind: "unavailable", reason: "unmerged" }
+				: await diffContent(range, rel, signal);
+			changes.push({ path: rel, status: status as FileChange["status"], content });
+		}
+		return changes;
+	}
+
+	/** Untracked, nonignored files are additions in the worktree seam. */
+	async function untracked(signal: AbortSignal): Promise<FileChange[]> {
+		const paths = (await rt.git(root, ["ls-files", "-z", "--others", "--exclude-standard"], signal)).split("\0")
+			.filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl");
+		const changes: FileChange[] = [];
+		for (const rel of paths) {
+			if (!scanned(rel)) { changes.push({ path: rel, status: "A", content: { kind: "skipped" } }); continue; }
+			const full = path.join(root, rel);
+			const info = await lstat(full);
+			if (!info.isFile()) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "not a regular file" } }); continue; }
+			const bytes = await rt.readRange(full, 0);
+			// Git's own heuristic: a NUL in the first 8000 bytes means binary.
+			if (bytes.subarray(0, 8000).includes(0)) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "binary" } }); continue; }
+			const text = bytes.toString("utf8");
+			const rows = text.split("\n");
+			if (text.endsWith("\n")) rows.pop();
+			const lexed = isJsTs(rel) ? lexLines(text) : null;
+			changes.push({ path: rel, status: "A", content: { kind: "lines", added: rows.map((row, i) => ({ line: i + 1, text: row, lexed: lexed?.[i] ?? null })) } });
+		}
+		return changes;
+	}
+
+	const commitEvidence = new Map<string, SeamEvidence>();
+	async function readEvidence(history: Result<readonly CommitEvent[]>, baseAncestor: boolean | null, signal: AbortSignal): Promise<ContentEvidence> {
+		const attempt = async (read: () => Promise<FileChange[]>): Promise<SeamEvidence> => {
+			try {
+				return { status: "fresh", changes: await read() };
+			} catch (error) {
+				if (signal.aborted) throw error;
+				return { status: "unavailable", error: message(error) };
+			}
+		};
+		const commits: Record<string, SeamEvidence> = Object.create(null);
+		for (const c of history.status === "fresh" ? history.value : []) {
+			let found = commitEvidence.get(c.sha);
+			if (!found) {
+				found = await attempt(async () => {
+					emptyTree ??= (await rt.git(root, ["hash-object", "-t", "tree", "/dev/null"], signal)).trim();
+					return seam([c.parents[0] ?? emptyTree, c.sha], signal);
+				});
+				// Commits are immutable: cache evidence, never a failure.
+				if (found.status === "fresh") commitEvidence.set(c.sha, found);
+			}
+			commits[c.sha] = found;
+		}
+		const index = await attempt(() => seam(["--cached", "HEAD"], signal));
+		const worktree = await attempt(async () => [...await seam([], signal), ...await untracked(signal)]);
+		return { baseAncestor, commits, index, worktree };
+	}
+
 	async function observe(signal: AbortSignal): Promise<LoopSnapshot> {
 		const issues: Issue[] = [];
 		const observedAt = rt.now().toISOString();
 		observed = new Map();
 		const failed = (error: string): LoopObservation => ({
 			root, observedAt, mission, state: unavailable(error), items: unavailable(error), progress: unavailable(error),
-			git: unavailable(error), history: unavailable(error), journal: unavailable(error), counterBaseline, runStarts, progressAt: new Map(), lastGood, issues,
+			git: unavailable(error), history: unavailable(error), evidence: null, journal: unavailable(error), counterBaseline, runStarts, progressAt: new Map(), lastGood, issues,
 		});
 		try {
 			signal.throwIfAborted();
@@ -696,8 +799,12 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			const cards = bundle ? await guarded("progress", signal, () => readProgress(issues), issues) : null;
 			const progressAtPass = new Map<string, readonly AttemptCard[] | null>();
 			let history: Result<readonly CommitEvent[]> = unavailable(git.error ?? "git unavailable");
+			let evidence: ContentEvidence | null = null;
 			if (before) {
-				history = await readHistory(issues, signal, progressAtPass, before.head);
+				const ancestry = { baseAncestor: null as boolean | null };
+				history = await readHistory(issues, signal, progressAtPass, before.head, ancestry);
+				// Content is read inside the window, so a change during the read is a retry, never a finding.
+				evidence = await readEvidence(history, ancestry.baseAncestor, signal);
 				let after: typeof before | null = null;
 				try {
 					after = await gitStamp(signal);
@@ -752,7 +859,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			}
 			const snapshot = deriveLoopSnapshot({
 				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
-				git, history, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
+				git, history, evidence, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
 			if (journalResult.status === "fresh") lastGood.journal = { value: journalResult.value, observedAt };
 			if (stateResult.status === "fresh") {
@@ -786,7 +893,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				if (closed) {
 					const error = unavailable("reader closed");
 					return deriveLoopSnapshot({
-						root, observedAt: rt.now().toISOString(), mission, state: error, items: error, progress: error, git: error, history: error, journal: error, counterBaseline,
+						root, observedAt: rt.now().toISOString(), mission, state: error, items: error, progress: error, git: error, history: error, evidence: null, journal: error, counterBaseline,
 						runStarts, progressAt: new Map(), lastGood, issues: [{ source: "observer", kind: "unavailable", detail: "reader closed" }],
 					});
 				}

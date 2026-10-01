@@ -15,7 +15,7 @@ export class Fixture {
 	readonly root = realpathSync(mkdtempSync(path.join(tmpdir(), "ralph-loop-state-")));
 	items: Item[];
 	progress = "";
-	constructor(items: Item[], opts: { mission?: boolean; blocker?: boolean; plain?: boolean } = {}) {
+	constructor(items: Item[], opts: { mission?: boolean; blocker?: boolean; plain?: boolean; extra?: Record<string, unknown> } = {}) {
 		this.items = items;
 		this.git("init", "-q");
 		this.git("commit", "--allow-empty", "-qm", "initial");
@@ -28,6 +28,7 @@ export class Fixture {
 				run: { model: "m", thinking: "off", maxIterations: 9, budgetAuthority: "Test" },
 				git: { baseCommit: this.git("rev-parse", "HEAD") }, rules: {}, host: { prefer: ["tmux"] },
 				blocker: opts.blocker === false ? null : { subjectRegex: "^blocked\\((?<item>[^)]+)\\)", itemGroup: "item" },
+				...opts.extra,
 			}));
 		}
 		this.writeBundle();

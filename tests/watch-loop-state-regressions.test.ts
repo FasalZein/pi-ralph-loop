@@ -350,7 +350,8 @@ test("R7: a failed second git inspection keeps its cause and is not reported as 
 	let lsFiles = 0;
 	const runtime: ObservationRuntime = {
 		...clock(),
-		git: (root, args, signal) => (args[0] === "ls-files" && ++lsFiles === 2 ? Promise.reject(new Error("post-stamp access failure")) : defaultRuntime.git(root, args, signal)),
+		// The stamp's dirty-file listing (`--modified`), not the worktree evidence listing of untracked files.
+		git: (root, args, signal) => (args[0] === "ls-files" && args.includes("--modified") && ++lsFiles === 2 ? Promise.reject(new Error("post-stamp access failure")) : defaultRuntime.git(root, args, signal)),
 	};
 	try {
 		f.state(true, T("10:00"));

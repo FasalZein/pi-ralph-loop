@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -10,7 +11,7 @@ import { tmuxHost } from "./hosts/tmux.js";
 import { object } from "./journal.js";
 import { openLoop } from "./loop-state.js";
 import { acquireLock, ControlError, isAlive, readMetadata } from "./transport.js";
-import type { EventFrame, LoopReader, LoopSnapshot, RunKey } from "./types.js";
+import type { EventFrame, LaunchBaseline, LoopReader, LoopSnapshot, RunKey } from "./types.js";
 
 import type { LifecycleRequest as Request, LifecycleOutcome as Outcome, CommandRuntime } from "./commands.js";
 import { LAUNCH_READY_TIMEOUT_MS, LAUNCH_FACT_TIMEOUT_MS, STOP_ACK_TIMEOUT_MS } from "./commands.js";
@@ -26,7 +27,8 @@ const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, 
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const deadline = (ms: number, signal?: AbortSignal) => signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
 
-type Manifest = { readonly v: 1; readonly launchId: string; readonly root: string; readonly mode: LaunchMode; readonly configHash: string };
+/** The persisted run spec. `branch` is the launch baseline for branch-changed (owner decision on #11). */
+export type Manifest = LaunchBaseline & { readonly v: 1; readonly launchId: string; readonly root: string; readonly mode: LaunchMode; readonly configHash: string };
 const manifestPath = (root: string, launchId: string) => join(root, ".ralph", `launch-${launchId}.json`);
 function writeManifest(manifest: Manifest): string {
 	const path = manifestPath(manifest.root, manifest.launchId);
@@ -35,12 +37,12 @@ function writeManifest(manifest: Manifest): string {
 	finally { if (existsSync(temporary)) unlinkSync(temporary); }
 	return path;
 }
-function readManifest(path: string): Manifest {
+export function readManifest(path: string): Manifest {
 	if (!lstatSync(path).isFile()) throw new Error(`Launch manifest is not a regular file: ${path}`);
 	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 	let value: unknown;
 	try { if (!fstatSync(fd).isFile()) throw new Error("Launch manifest is not a regular file"); value = JSON.parse(readFileSync(fd, "utf8")); } finally { closeSync(fd); }
-	if (!object(value) || value.v !== 1 || typeof value.launchId !== "string" || typeof value.root !== "string" || typeof value.configHash !== "string" || !["fresh", "relaunch", "resume"].includes(String(value.mode))) throw new Error(`Launch manifest is malformed: ${path}`);
+	if (!object(value) || value.v !== 1 || typeof value.launchId !== "string" || typeof value.root !== "string" || typeof value.configHash !== "string" || !(value.branch === null || typeof value.branch === "string") || !["fresh", "relaunch", "resume"].includes(String(value.mode))) throw new Error(`Launch manifest is malformed: ${path}`);
 	return value as Manifest;
 }
 
@@ -50,6 +52,17 @@ export async function runDriverRole(path: string, runtime: DriverRuntime = {}): 
 	const mission = await loadMission(manifest.root);
 	if (mission.root !== manifest.root || mission.configHash !== manifest.configHash) throw new Error("Mission changed after launch preflight; launch again");
 	return runDriver({ mission, launchId: manifest.launchId, gate: fifoGate(mission.root, manifest.launchId), mode: manifest.mode, lifecycle: "managed" }, { readyTimeoutMs: LAUNCH_READY_TIMEOUT_MS, ...runtime });
+}
+
+/** Branch checked out at launch; null for a detached HEAD. Any other git failure refuses the launch. */
+function launchBranch(root: string): string | null {
+	try {
+		return execFileSync("git", ["--no-optional-locks", "symbolic-ref", "-q", "--short", "HEAD"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+	} catch (error) {
+		// `symbolic-ref -q` exits 1 only when HEAD is detached.
+		if ((error as { status?: number | null }).status === 1) return null;
+		throw new Error(`Cannot capture the launch branch: ${message(error)}`);
+	}
 }
 
 const defaultDriverArgv = (manifest: string) => [process.execPath, fileURLToPath(new URL("./ralph.mjs", import.meta.url)), "_driver", manifest];
@@ -136,7 +149,7 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 	try {
 		preflight(root, request.mode);
 		const host = runtime.host ?? tmuxHost({ env: runtime.env });
-		const manifest = writeManifest({ v: 1, launchId, root, mode: request.mode, configHash: mission.configHash });
+		const manifest = writeManifest({ v: 1, launchId, root, mode: request.mode, configHash: mission.configHash, branch: launchBranch(root) });
 		const env = runtime.env ?? process.env;
 		const blocked = [...new Set(["ask_user", ...[env.RALPH_BLOCKED_TOOLS, env.RALPH_EXTRA_BLOCKED_TOOLS].flatMap((list) => (list ?? "").split(",")).map((tool) => tool.trim()).filter(Boolean)])].join(",");
 		const readyMs = runtime.readyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS;
