@@ -294,3 +294,41 @@ test("launch fails at the readiness deadline even when host cleanup stalls (H1)"
 	assert.equal(calls.some((args) => args.includes("kill-session")), false);
 	assert.equal(readHostRecord(root)?.sessionId, "$4", "record kept for the next launch's recovery");
 });
+
+/** tmux exec whose identity query hangs until the deadline cancels it, then fails like a killed client. */
+function cancelledVerify(socket: string, created?: string) {
+	const calls: (readonly string[])[] = [];
+	const exec = async (args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
+		calls.push(args);
+		if (created && args.includes("new-session")) return { code: 0, stdout: created, stderr: "" };
+		if (args.includes("display-message") && (args.at(-1) ?? "").endsWith("#{pane_dead}")) return { code: 0, stdout: "", stderr: "" };
+		if (args.includes("display-message")) return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	return { calls, host: tmuxHost({ exec, env: {} }) };
+}
+
+test("pre-dispatch cleanup cut off by the deadline keeps the record (J1)", { timeout: 10_000 }, async (t) => {
+	const root = scratch(t);
+	const socket = join(root, "fake-socket");
+	writeFileSync(socket, "");
+	// Startup succeeds; the pane-state query is malformed so readiness fails early, before the deadline;
+	// cleanup's identity query then runs until the deadline cancels it.
+	const { calls, host } = cancelledVerify(socket, `$4\t@4\t%4\t${socket}\n`);
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host, readyTimeoutMs: 400, ...quiet });
+	assert.ok(!outcome.ok && /\$4.*may remain: cleanup did not finish before the readiness deadline/.test(outcome.error), JSON.stringify(outcome));
+	assert.equal(calls.some((args) => args.includes("kill-session")), false);
+	assert.equal(readHostRecord(root)?.sessionId, "$4", "record kept for the next launch's recovery");
+});
+
+test("recovery cut off by the deadline keeps the previous record (J1)", { timeout: 10_000 }, async (t) => {
+	const root = scratch(t);
+	const socket = join(root, "fake-socket");
+	writeFileSync(socket, "");
+	writeHostRecord({ ...handleFor(root, "old-launch"), socket });
+	const { calls, host } = cancelledVerify(socket);
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host, readyTimeoutMs: 300, ...quiet });
+	assert.ok(!outcome.ok && /not ready within 0.3 s/.test(outcome.error), JSON.stringify(outcome));
+	assert.equal(calls.some((args) => args.includes("new-session") || args.includes("kill-session")), false);
+	assert.equal(readHostRecord(root)?.launchId, "old-launch");
+});

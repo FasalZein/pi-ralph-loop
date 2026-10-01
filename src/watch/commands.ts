@@ -131,7 +131,10 @@ async function waitConfirmed(frames: AsyncIterator<EventFrame>, signal: AbortSig
 async function recoverInactiveHost(root: string, host: Host, signal: AbortSignal): Promise<void> {
 	const previous = readHostRecord(root);
 	if (!previous) return;
-	if (await host.verify(previous, signal)) {
+	const same = await host.verify(previous, signal);
+	// A query cut off by the deadline answers false; keep the record for a later recovery.
+	if (signal.aborted) throw signal.reason;
+	if (same) {
 		if (!await host.paneDead(previous, signal)) throw new Error(`tmux session ${previous.name} (${previous.sessionId}) of launch ${previous.launchId} still runs a process; inspect or close it first`);
 		if (signal.aborted) throw signal.reason;
 		await host.close(previous, signal);
@@ -180,8 +183,12 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 			// Cleanup shares the absolute readiness deadline (#10); no second window.
 			const retained = (detail: string) => new Error(`${message(failure)}; tmux session ${handle!.name} (${handle!.sessionId}) may remain: ${detail}`);
 			if (ready.aborted) throw retained("readiness deadline passed before cleanup");
-			try { if (await host.verify(handle, ready)) await host.close(handle, ready); }
-			catch (cleanupError) {
+			try {
+				const same = await host.verify(handle, ready);
+				// A query cut off by the deadline answers false; that is not proof the session is gone.
+				if (ready.aborted) throw ready.reason;
+				if (same) await host.close(handle, ready);
+			} catch (cleanupError) {
 				// The record stays so the next launch can recover this session.
 				throw retained(ready.aborted ? "cleanup did not finish before the readiness deadline" : message(cleanupError));
 			}
