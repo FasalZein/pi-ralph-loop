@@ -97,18 +97,19 @@ test("bin awaits async command and reports mission error not installation failur
 });
 
 
-test("packaged status runs on native Node without pi, jiti, pi-tui or node_modules", (t) => {
+for (const install of ["plain", "node_modules"] as const) test(`packaged status runs under ${install} on native Node without pi, jiti or pi-tui`, (t) => {
 	const f = new Fixture([{ id: "A", passes: false }]);
 	t.after(() => f.close());
 	f.state(true, T("10:00"), "run-a", { owner_heartbeat_at: new Date().toISOString() });
 	const root = mkdtempSync(join(tmpdir(), "ralph-native-status-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
-	cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(root, "src"), { recursive: true });
-	writeFileSync(join(root, "package.json"), '{"type":"module"}');
+	const packageRoot = install === "node_modules" ? join(root, "node_modules/pi-ralph-loop") : root;
+	cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(packageRoot, "src"), { recursive: true });
+	writeFileSync(join(packageRoot, "package.json"), '{"type":"module"}');
 	mkdirSync(join(root, "bin"));
 	const git = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
 	symlinkSync(git, join(root, "bin", "git"));
-	const packagedBin = join(root, "src/watch/ralph.mjs");
+	const packagedBin = join(packageRoot, "src/watch/ralph.mjs");
 	const run = (...args: string[]) => spawnSync(process.execPath, [packagedBin, "status", ...args], {
 		cwd: tmpdir(), env: { ...process.env, PATH: join(root, "bin"), NODE_OPTIONS: "" }, encoding: "utf8", timeout: 10_000,
 	});
@@ -128,6 +129,34 @@ test("packaged status runs on native Node without pi, jiti, pi-tui or node_modul
 	assert.equal(failure.status, 1, failure.stderr);
 	assert.equal(failure.stdout, "");
 	assert.doesNotMatch(failure.stderr, /cannot find pi installation/);
+	// Inject warnings at the platform boundary, keeping real type stripping.
+	// An identical warning outside package stripping must also stay visible.
+	const preload = join(root, "warnings.mjs");
+	writeFileSync(preload, `
+import module, { syncBuiltinESMExports } from "node:module";
+const exact = "stripTypeScriptTypes is an experimental feature and might change at any time";
+process.emitWarning(exact, "ExperimentalWarning");
+const strip = module.stripTypeScriptTypes;
+let first = true;
+module.stripTypeScriptTypes = (...args) => {
+	if (first) {
+		first = false;
+		process.emitWarning("unrelated experimental warning", "ExperimentalWarning");
+		process.emitWarning(exact, "DeprecationWarning");
+	}
+	return strip(...args);
+};
+syncBuiltinESMExports();
+`);
+	const warned = spawnSync(process.execPath, ["--import", preload, packagedBin, "status", f.root], {
+		cwd: tmpdir(), env: { ...process.env, PATH: join(root, "bin"), NODE_OPTIONS: "" }, encoding: "utf8", timeout: 10_000,
+	});
+	assert.equal(warned.error, undefined);
+	assert.equal(warned.status, 3, warned.stderr);
+	assert.match(warned.stdout, /^coverage: partial$/m);
+	assert.match(warned.stderr, /ExperimentalWarning: unrelated experimental warning/);
+	assert.match(warned.stderr, /DeprecationWarning: stripTypeScriptTypes is an experimental feature/);
+	assert.equal(warned.stderr.match(/ExperimentalWarning: stripTypeScriptTypes is an experimental feature/g)?.length, 1);
 });
 
 import { execFile } from "node:child_process";
