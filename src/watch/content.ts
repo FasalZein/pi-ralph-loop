@@ -22,12 +22,25 @@ export function isTestPath(mission: Mission | null, file: string): boolean {
  */
 export type LexedLine = { readonly code: string; readonly comment: string; readonly unsure: string };
 
-/** Extensions in which JSX syntax is valid; plain TS and its module variants do not allow it. */
-const JSX_EXTENSIONS: readonly string[] = [".tsx", ".jsx", ".js", ".mjs", ".cjs"];
-export const allowsJsx = (file: string): boolean => JSX_EXTENSIONS.includes(path.posix.extname(file).toLowerCase());
+/**
+ * Grammar per extension. JSX is valid in `tsx` and `jsx`; plain TS and its
+ * module variants do not allow it. Only `tsx` has generic arrows that look
+ * like a JSX start.
+ */
+export type Grammar = "ts" | "tsx" | "jsx";
+export function grammarOf(file: string): Grammar {
+	const ext = path.posix.extname(file).toLowerCase();
+	return ext === ".tsx" ? "tsx" : [".ts", ".mts", ".cts"].includes(ext) ? "ts" : "jsx";
+}
 
 const EXPRESSION_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
-const TSX_TYPE_PARAMETERS = /^<\s*[A-Za-z_$][\w$]*\s*(?:,|extends\s+[^\s=>/])/;
+/**
+ * TSX type parameters, which TypeScript reads as a generic arrow and never as
+ * JSX: an optional `const` modifier and a name, then a `,`, an `extends`
+ * constraint, or a default `= X`. A JSX attribute value is a string or `{`,
+ * so `= X` with anything else is not JSX.
+ */
+const TSX_TYPE_PARAMETERS = /^<\s*(?:const\s+)?[A-Za-z_$][\w$]*\s*(?:,|extends\s+[^\s=>/]|=\s*[^\s"'{])/;
 const CONTROL_PAREN_WORDS = new Set(["if", "while", "for", "with"]);
 const EXPRESSION_AFTER_PUNCT = "(,=:[!&|?{};+-*%<>~^.";
 
@@ -39,7 +52,8 @@ const EXPRESSION_AFTER_PUNCT = "(,=:[!&|?{};+-*%<>~^.";
  * until the lexer is back in top-level code at a line start. An unsure
  * position never proves a comment or a call.
  */
-export function lexLines(text: string, jsx: boolean): LexedLine[] {
+export function lexLines(text: string, grammar: Grammar): LexedLine[] {
+	const jsx = grammar !== "ts";
 	const CODE = 0, COMMENT = 1, LITERAL = 2;
 	const kinds = new Uint8Array(text.length);
 	const unsure = new Uint8Array(text.length);
@@ -75,8 +89,8 @@ export function lexLines(text: string, jsx: boolean): LexedLine[] {
 					if (expression === "unknown") { taint = true; unsure[i] = 1; }
 					mode = "re"; literal(i); continue;
 				}
-				// TSX disambiguates a generic arrow from JSX by `<T,` or `<T extends X`: those are type parameters, so code.
-				if (jsx && c === "<" && expression !== false && next !== undefined && /[A-Za-z_$>]/.test(next) && !TSX_TYPE_PARAMETERS.test(text.slice(i, i + 200))) {
+				// TSX (never plain JSX) disambiguates a generic arrow from JSX by `<T,` or `<T extends X`: those are type parameters, so code.
+				if (jsx && c === "<" && expression !== false && next !== undefined && /[A-Za-z_$>]/.test(next) && !(grammar === "tsx" && TSX_TYPE_PARAMETERS.test(text.slice(i, i + 200)))) {
 					if (expression === "unknown") taint = true;
 					mode = "jsxtag"; closingTag = false; jsxDepth = 0; literal(i); unsure[i] = 1; continue;
 				}

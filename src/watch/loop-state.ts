@@ -10,7 +10,7 @@ import type { BundleItem } from "../bundle/types.js";
 import { readStateDocument } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
-import { allowsJsx, isJsTs, isTestPath, lexLines } from "./content.js";
+import { grammarOf, isJsTs, isTestPath, lexLines } from "./content.js";
 import { parseJournal } from "./journal.js";
 import { deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
@@ -714,7 +714,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 
 	function textContent(rel: string, sparse: readonly string[], added: readonly number[]): FileChange["content"] {
 		const lines = Array.from(sparse, (line) => line ?? "");
-		return { kind: "lines", lines, added, lexed: isJsTs(rel) ? lexLines(lines.join("\n"), allowsJsx(rel)) : null };
+		return { kind: "lines", lines, added, lexed: isJsTs(rel) ? lexLines(lines.join("\n"), grammarOf(rel)) : null };
 	}
 
 	async function seam(range: readonly string[], signal: AbortSignal): Promise<FileChange[]> {

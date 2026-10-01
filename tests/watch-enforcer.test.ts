@@ -146,6 +146,11 @@ for (const seam of SEAMS) {
 const GENERIC_ARROWS = [
 	["concise", "export const identity = <T,>(value: T) => value;"],
 	["block-bodied", "export const wrap = <T extends object>(value: T): T[] => {\n\treturn [value];\n};"],
+	// Review fix round 3, finding 1: default and const type parameters and their combinations.
+	["default", "export const fallback = <T = string,>(value: T) => value;"],
+	["const", "export const keep = <const T,>(value: T) => value;"],
+	["const-extends-default", "export const pick = <const T extends object = {}>(value: T) => value;"],
+	["extends-default", "export const box = <T extends string = \"a\">(value: T) => [value];"],
 ] as const;
 for (const [shape, arrow] of GENERIC_ARROWS) {
 	for (const seam of SEAMS) {
@@ -167,6 +172,23 @@ for (const [shape, arrow] of GENERIC_ARROWS) {
 			} finally { x.f.close(); }
 		});
 	}
+}
+
+// Review fix round 3, finding 2: in plain JSX `<T extends X>` is an element with boolean attributes,
+// so its children are literal text: WARN coverage-incomplete, never HARD.
+for (const seam of SEAMS) {
+	test(`plain JSX element <T extends X> (${seam}): literal child text is never HARD`, async () => {
+		const x = scratch({ scope: { testGlobs: ["**/*.test.jsx"] } });
+		try {
+			land(x.f, seam, () => {
+				write(x.f, "src/note.jsx", "export const note = <T extends X>// @ts-ignore</T>;\n");
+				write(x.f, "tests/n.test.jsx", "export const view = <T extends X>it.only(\"not a call\")</T>;\n");
+			});
+			const { alerts } = await run(x);
+			assert.deepEqual(summary(alerts), ["WARN coverage-incomplete", "WARN coverage-incomplete"], JSON.stringify(alerts, null, 1));
+			assert.deepEqual(alerts.map((a) => a.evidence[1]).sort(), ["rules not checked: suppression-comment", "rules not checked: test-focus"]);
+		} finally { x.f.close(); }
+	});
 }
 
 test("ambiguous slash after a block is coverage incomplete, never HARD", async () => {
