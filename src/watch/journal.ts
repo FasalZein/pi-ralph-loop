@@ -61,7 +61,11 @@ export class JournalWriter {
 	private readonly rotated: string;
 	private size = 0;
 	public errors = 0;
-	constructor(root: string, private readonly header: Extract<JournalRecord, { k: "run" }>, private readonly log: (line: string) => void = console.error) {
+	private readonly header: Extract<JournalRecord, { k: "run" }>;
+	private readonly log: (line: string) => void;
+	constructor(root: string, header: Extract<JournalRecord, { k: "run" }>, log: (line: string) => void = console.error) {
+		this.header = header;
+		this.log = log;
 		this.path = join(root, ".ralph/journal.jsonl");
 		this.rotated = join(root, ".ralph/journal.1.jsonl");
 		this.safe(() => {

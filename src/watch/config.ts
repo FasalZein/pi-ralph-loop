@@ -9,8 +9,12 @@ import { isRecord } from "../bundle/schema.js";
 import type { Mission, MissionBaseline, MissionPolicy, MissionThinkingLevel, RuleLevel } from "./types.js";
 
 export class MissionConfigError extends Error {
-	constructor(readonly field: string, readonly reason: string) {
+	readonly field: string;
+	readonly reason: string;
+	constructor(field: string, reason: string) {
 		super(`Invalid Ralph mission at ${field}: ${reason}`);
+		this.field = field;
+		this.reason = reason;
 		this.name = "MissionConfigError";
 	}
 }

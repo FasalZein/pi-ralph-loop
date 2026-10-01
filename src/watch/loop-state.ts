@@ -30,8 +30,10 @@ export type FileStamp = { readonly dev: number; readonly ino: number; readonly s
 
 /** A git command that ran and exited nonzero. Any other rejection is an operational failure. */
 export class GitCommandError extends Error {
-	constructor(message: string, readonly exitCode: number | null) {
+	readonly exitCode: number | null;
+	constructor(message: string, exitCode: number | null) {
 		super(message);
+		this.exitCode = exitCode;
 	}
 }
 

@@ -1,18 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { connectEvents } from "./events.js";
+export { connectEvents } from "./events.js";
 import { existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
-import { connect, type Socket } from "node:net";
+import type { Socket } from "node:net";
 import { join } from "node:path";
 import { FACT_SOCKET_ENV, LAUNCH_ID_ENV } from "../loop/watch-events.js";
 import { ControlHandler, type StopAuthority } from "./driver-control.js";
 import { FactTracker } from "./driver-facts.js";
 import { JournalWriter } from "./journal.js";
 import { PiRpc, RpcMonitor, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
-import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, parseEventFrame, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Broadcast, type Envelope } from "./transport.js";
+import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Broadcast, type Envelope } from "./transport.js";
 import { randomUUID as foreignSession } from "node:crypto";
 import { isLoopOwnerActive } from "../loop/ownership.js";
 import { readStateDocument } from "../state.js";
 import { openLoop } from "./loop-state.js";
-import type { Control, DriverState, EventFrame, JournalRecord, LoopReader, LoopSnapshot, Mission, Receipt, RunKey } from "./types.js";
+import type { Control, DriverState, JournalRecord, LoopReader, LoopSnapshot, Mission, Receipt, RunKey } from "./types.js";
 
 export { ControlError, DriverError, FIFO_ENVELOPE_MAX_BYTES, SUBSCRIBER_QUEUE_LIMIT_BYTES } from "./transport.js";
 export { TOOL_BUFFER_CALLS, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
@@ -85,43 +87,6 @@ export function fifoGate(root: string, launchId: string): LaunchGate {
 	});
 	gateReleases.set(gate, { root: realpathSync(root), launchId, release });
 	return gate;
-}
-
-/** Read-only replay then live stream. Pull-based reads leave backpressure local. */
-export async function* connectEvents(target: { root: string; run?: RunKey }, signal?: AbortSignal): AsyncIterable<EventFrame> {
-	if (signal?.aborted) return;
-	const metadata = readMetadata(target.root);
-	const socket = connect(metadata.eventSocket);
-	const abort = () => socket.destroy();
-	signal?.addEventListener("abort", abort, { once: true });
-	let buffer = "";
-	let first = true;
-	let closed = false;
-	socket.setEncoding("utf8");
-	try {
-		for await (const chunk of socket) {
-			buffer += chunk;
-			let newline: number;
-			while ((newline = buffer.indexOf("\n")) >= 0) {
-				const frame = parseEventFrame(buffer.slice(0, newline));
-				buffer = buffer.slice(newline + 1);
-				if (!frame) throw new ControlError("disconnected", "Invalid event frame");
-				if (first) {
-					if (frame.type !== "hello") throw new ControlError("disconnected", "Missing hello frame");
-					if (metadata.launchId !== frame.launchId || (target.run?.launchId != null && target.run.launchId !== frame.launchId) || (target.run?.loopToken != null && target.run.loopToken !== frame.loop?.token)) throw new ControlError("wrong-run", "Driver run changed");
-					first = false;
-				} else if (frame.type === "hello") throw new ControlError("disconnected", "Unexpected hello frame");
-				if (frame.type === "lifecycle" && frame.state === "closed") closed = true;
-				yield frame;
-				if (closed) return;
-			}
-		}
-		if (!signal?.aborted && !closed) throw new ControlError("disconnected", "Driver event stream closed unexpectedly");
-	} catch (error) {
-		if (signal?.aborted) return;
-		if (error instanceof ControlError) throw error;
-		throw new ControlError("disconnected", String(error));
-	} finally { signal?.removeEventListener("abort", abort); socket.destroy(); }
 }
 
 type ControlTarget = { root: string; run: RunKey };

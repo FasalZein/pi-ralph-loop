@@ -14,10 +14,12 @@ import type { LoopFact, LoopFactEnvelope } from "../loop/watch-events.js";
 export const FIFO_ENVELOPE_MAX_BYTES = 512;
 export const SUBSCRIBER_QUEUE_LIMIT_BYTES = 1_048_576;
 export class DriverError extends Error {
-	constructor(readonly code: "driver-active" | "fifo-invalid" | "socket-path-too-long" | "bind-failed" | "not-a-ralph-root", detail: string) { super(detail); this.name = "DriverError"; }
+	readonly code: "driver-active" | "fifo-invalid" | "socket-path-too-long" | "bind-failed" | "not-a-ralph-root";
+	constructor(code: "driver-active" | "fifo-invalid" | "socket-path-too-long" | "bind-failed" | "not-a-ralph-root", detail: string) { super(detail); this.code = code; this.name = "DriverError"; }
 }
 export class ControlError extends Error {
-	constructor(readonly code: "no-driver" | "no-reader" | "wrong-run" | "rejected" | "too-large" | "busy" | "disconnected", detail: string) { super(detail); this.name = "ControlError"; }
+	readonly code: "no-driver" | "no-reader" | "wrong-run" | "rejected" | "too-large" | "busy" | "disconnected";
+	constructor(code: "no-driver" | "no-reader" | "wrong-run" | "rejected" | "too-large" | "busy" | "disconnected", detail: string) { super(detail); this.code = code; this.name = "ControlError"; }
 }
 const code = (error: unknown): string | undefined => object(error) && typeof error.code === "string" ? error.code : undefined;
 export function isAlive(pid: number): boolean {
@@ -146,7 +148,9 @@ export class LineServer {
 	private readonly server: Server;
 	private readonly clients = new Set<Socket>();
 	private bound = false;
-	constructor(readonly path: string, onLine: (line: string) => void, onBad: () => void = () => {}) {
+	readonly path: string;
+	constructor(path: string, onLine: (line: string) => void, onBad: () => void = () => {}) {
+		this.path = path;
 		this.server = createServer((socket) => {
 			this.clients.add(socket);
 			socket.on("error", () => {});
@@ -168,7 +172,15 @@ export class EventServer {
 	private readonly clients = new Set<Socket>();
 	private bound = false;
 	nextSeq = 1;
-	constructor(readonly path: string, private readonly hello: () => Extract<EventFrame, { type: "hello" }>, private readonly dropped: () => void, private readonly now: () => Date = () => new Date()) {
+	readonly path: string;
+	private readonly hello: () => Extract<EventFrame, { type: "hello" }>;
+	private readonly dropped: () => void;
+	private readonly now: () => Date;
+	constructor(path: string, hello: () => Extract<EventFrame, { type: "hello" }>, dropped: () => void, now: () => Date = () => new Date()) {
+		this.hello = hello;
+		this.dropped = dropped;
+		this.now = now;
+		this.path = path;
 		this.server = createServer((socket) => {
 			socket.on("error", () => this.clients.delete(socket));
 			socket.on("close", () => this.clients.delete(socket));

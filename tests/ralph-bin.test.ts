@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { Fixture, T } from "./fixtures/loop-state.ts";
 
 const bin = fileURLToPath(new URL("../src/watch/ralph.mjs", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -55,7 +56,7 @@ test("ralph fails clearly when pi is not on PATH", (t) => {
 
 test("ralph rejects unimplemented commands and extra help arguments", (t) => {
 	const path = fakePi(t);
-	for (const args of [["status", "."], ["--help", "extra"]]) {
+	for (const args of [["watch", "."], ["--help", "extra"]]) {
 		const result = spawnSync(process.execPath, [bin, ...args], {
 			env: { ...process.env, PATH: path }, encoding: "utf-8", timeout: 10_000,
 		});
@@ -93,4 +94,79 @@ test("bin awaits async command and reports mission error not installation failur
 	assert.equal(result.stdout, "");
 	assert.doesNotMatch(result.stderr, /cannot find pi installation/);
 	assert.match(result.stderr, /^ralph: .*mission\.json/m);
+});
+
+
+test("packaged status runs on native Node without pi, jiti, pi-tui or node_modules", (t) => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	t.after(() => f.close());
+	f.state(true, T("10:00"), "run-a", { owner_heartbeat_at: new Date().toISOString() });
+	const root = mkdtempSync(join(tmpdir(), "ralph-native-status-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(root, "src"), { recursive: true });
+	writeFileSync(join(root, "package.json"), '{"type":"module"}');
+	mkdirSync(join(root, "bin"));
+	const git = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+	symlinkSync(git, join(root, "bin", "git"));
+	const packagedBin = join(root, "src/watch/ralph.mjs");
+	const run = (...args: string[]) => spawnSync(process.execPath, [packagedBin, "status", ...args], {
+		cwd: tmpdir(), env: { ...process.env, PATH: join(root, "bin"), NODE_OPTIONS: "" }, encoding: "utf8", timeout: 10_000,
+	});
+	const partial = run(f.root);
+	assert.equal(partial.error, undefined);
+	assert.equal(partial.status, 3, partial.stderr);
+	assert.equal(partial.stderr, "");
+	assert.match(partial.stdout, /^items: 0\/1 passed$/m);
+	assert.match(partial.stdout, /^health: RUNNING$/m);
+	assert.match(partial.stdout, /^coverage: partial$/m);
+	assert.doesNotMatch(partial.stdout, /\x1b/);
+	const usage = run(f.root, "extra");
+	assert.equal(usage.status, 2, usage.stderr);
+	assert.equal(usage.stdout, "");
+	assert.match(usage.stderr, /Usage: ralph/);
+	const failure = run(join(root, "missing"));
+	assert.equal(failure.status, 1, failure.stderr);
+	assert.equal(failure.stdout, "");
+	assert.doesNotMatch(failure.stderr, /cannot find pi installation/);
+});
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { EventServer, writeMetadata } from "../src/watch/transport.ts";
+
+// Use async subprocess I/O so the real event socket can answer the native bin.
+test("native status prints complete evidence on stdout and exits 0 without pi", async (t) => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	t.after(() => f.close());
+	f.state(true, T("10:00"), "run-a", { owner_heartbeat_at: new Date().toISOString() });
+	f.journal([
+		{ v: 1, k: "run", r: "L1", t: T("10:00"), m: "m", th: "off", mx: 9, tk: "b" },
+		{ v: 1, k: "loop", r: "L1", t: T("10:00"), tok: "run-a", sa: T("10:00"), i: 1, ph: "initialized" },
+	]);
+	f.pass("A", T("10:30"));
+	const directory = mkdtempSync(join(tmpdir(), "rs-bin-"));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const socket = join(directory, "events.sock");
+	const server = new EventServer(socket, () => ({
+		v: 1, type: "hello", launchId: "L1", pid: process.pid, nextSeq: 1, lastPiAt: new Date().toISOString(),
+		loop: { token: "run-a", startedAt: T("10:00"), iteration: 1 }, tools: [], state: "launched",
+		totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, messages: 0, dialogsCancelled: 0, refusals: 0 },
+		counters: { dialogsCancelled: 0, refusals: 0, badRecords: 0, badFacts: 0, subscriberDrops: 0 },
+	}), () => {});
+	await server.listen();
+	t.after(() => server.close());
+	writeMetadata(f.root, { v: 1, pid: process.pid, launchId: "L1", eventSocket: socket, factSocket: socket, fifo: join(directory, "fifo"), startedAt: T("10:00") });
+	const git = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+	mkdirSync(join(directory, "bin"));
+	symlinkSync(git, join(directory, "bin/git"));
+	const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, "status", f.root], {
+		env: { ...process.env, PATH: join(directory, "bin"), NODE_OPTIONS: "" }, cwd: tmpdir(), timeout: 10_000,
+	});
+	assert.equal(stderr, "");
+	assert.match(stdout, /^items: 1\/2 passed$/m);
+	assert.match(stdout, /^current item: B .*$/m);
+	assert.match(stdout, /^health: RUNNING$/m);
+	assert.match(stdout, /^ETA: estimate 1800000 ms; n=1$/m);
+	assert.match(stdout, /^coverage: complete$/m);
+	assert.doesNotMatch(stdout, /^warning:/m);
 });

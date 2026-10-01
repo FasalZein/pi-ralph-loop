@@ -4,6 +4,36 @@ import { createRequire } from "node:module";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Status contract: Node >=22.18 with native TypeScript stripping and module
+// hooks. It does not resolve pi, jiti or pi-tui. Other commands keep pi's loader.
+if (process.argv[2] === "status") {
+	try {
+		const [major, minor] = process.versions.node.split(".").map(Number);
+		const { registerHooks } = await import("node:module");
+		if (major < 22 || (major === 22 && minor < 18) || !process.features.typescript || typeof registerHooks !== "function") {
+			throw new Error("status requires Node 22.18 or later with native TypeScript support");
+		}
+		const sourceRoot = new URL("../", import.meta.url).href;
+		// Existing source uses .js specifiers for TypeScript. Map only relative
+		// imports inside this package's source, never external package imports.
+		const hooks = registerHooks({
+			resolve(specifier, context, nextResolve) {
+				if (context.parentURL?.startsWith(sourceRoot) && specifier.startsWith(".") && specifier.endsWith(".js")) {
+					const candidate = new URL(specifier.slice(0, -3) + ".ts", context.parentURL);
+					if (candidate.href.startsWith(sourceRoot) && existsSync(candidate)) return nextResolve(candidate.href, context);
+				}
+				return nextResolve(specifier, context);
+			},
+		});
+		try {
+			const { main } = await import("./cli.ts");
+			process.exitCode = await main(process.argv.slice(2));
+		} finally { hooks.deregister(); }
+	} catch (error) {
+		console.error(`ralph: ${error instanceof Error ? error.message : String(error)}`);
+		process.exitCode = 1;
+	}
+} else {
 let tried = "PATH lookup for pi";
 let jiti;
 try {
@@ -38,4 +68,6 @@ if (jiti) {
 		console.error(`ralph: ${error instanceof Error ? error.message : String(error)}`);
 		process.exitCode = 1;
 	}
+}
+
 }

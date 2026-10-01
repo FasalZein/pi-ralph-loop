@@ -20,7 +20,7 @@ test("stopped from fresh state with reason; retained state never gives stopped o
 	const reader = openLoop(f.root, { runtime: clock() });
 	try {
 		f.state(false, T("10:00"), "run-a", { completed_at: T("11:00"), stop_reason: "manual_stop", error_count: 3 });
-		const good = await reader.read(); assert.equal(good.health.state, "stopped");
+		const good = await reader.read(); assert.equal(good.health.state, "stopped"); assert.equal(good.health.stale, false);
 		assert.deepEqual(good.health.stopped, { reason: "manual_stop", at: T("11:00") });
 		writeFileSync(path.join(f.root, ".ralph/loop.md"), "---\nrunning: false\n");
 		const torn = await reader.read(); assert.equal(torn.sources.state.status, "retained");

@@ -11,7 +11,7 @@ const age = (at: string | null, now: number): number | null => at !== null && Nu
 export function deriveHealth(state: RalphLoopState | null, missing: boolean, journal: JournalView | null, now: number, previous: CounterBaseline | null, launchId: string | null): Health {
 	const baseline = state && previous && previous.launchId === launchId && previous.loopToken === state.loop_token && previous.startedAt === state.started_at ? previous : null;
 	const counter = (value: number, before: number | null): Counter => ({ value, previous: before, rising: before !== null && value > before });
-	const stale = state ? isHeartbeatStale(state.owner_heartbeat_at, now, LOOP_OWNER_STALE_AFTER_MS) : null;
+	const stale = state ? state.running && isHeartbeatStale(state.owner_heartbeat_at, now, LOOP_OWNER_STALE_AFTER_MS) : null;
 	return {
 		state: !state ? missing ? "not-started" : "unknown" : !state.running ? "stopped" : stale ? "stale" : "running",
 		heartbeatAgeMs: state ? age(state.owner_heartbeat_at, now) : null,
