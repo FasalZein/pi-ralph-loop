@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -11,7 +11,7 @@ import { Fixture, T } from "./fixtures/loop-state.ts";
 const bin = fileURLToPath(new URL("../src/watch/ralph.mjs", import.meta.url));
 const require = createRequire(import.meta.url);
 
-function fakePi(t: test.TestContext): string {
+function fakePi(t: test.TestContext, omit?: "jiti" | "pi-tui"): string {
 	const root = mkdtempSync(join(tmpdir(), "ralph-bin-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
@@ -20,9 +20,9 @@ function fakePi(t: test.TestContext): string {
 	const cli = join(piRoot, "dist", "bundle", "cli.js");
 	writeFileSync(cli, "#!/usr/bin/env node\n", { mode: 0o755 });
 	// Mirror a hoisted pi installation, using real installed loaders and UI code.
-	symlinkSync(join(require.resolve("jiti/package.json"), ".."), join(root, "node_modules", "jiti"), "dir");
+	if (omit !== "jiti") symlinkSync(join(require.resolve("jiti/package.json"), ".."), join(root, "node_modules", "jiti"), "dir");
 	const tuiRoot = fileURLToPath(new URL("../node_modules/@earendil-works/pi-tui", import.meta.url));
-	symlinkSync(tuiRoot, join(root, "node_modules", "@earendil-works", "pi-tui"), "dir");
+	if (omit !== "pi-tui") symlinkSync(tuiRoot, join(root, "node_modules", "@earendil-works", "pi-tui"), "dir");
 	mkdirSync(join(root, "bin"));
 	symlinkSync(cli, join(root, "bin", "pi"));
 	return join(root, "bin");
@@ -54,9 +54,9 @@ test("ralph fails clearly when pi is not on PATH", (t) => {
 	assert.match(result.stderr, /pi executable not found on PATH/);
 });
 
-test("ralph rejects unimplemented commands and extra help arguments", (t) => {
+test("ralph rejects unknown commands, a missing root and extra help arguments", (t) => {
 	const path = fakePi(t);
-	for (const args of [["watch", "."], ["--help", "extra"]]) {
+	for (const args of [["frobnicate", "."], ["watch"], ["--help", "extra"]]) {
 		const result = spawnSync(process.execPath, [bin, ...args], {
 			env: { ...process.env, PATH: path }, encoding: "utf-8", timeout: 10_000,
 		});
@@ -198,4 +198,33 @@ test("native status prints complete evidence on stdout and exits 0 without pi", 
 	assert.match(stdout, /^ETA: estimate 1800000 ms; n=1$/m);
 	assert.match(stdout, /^coverage: complete$/m);
 	assert.doesNotMatch(stdout, /^warning:/m);
+});
+
+for (const module of ["jiti", "pi-tui"] as const) {
+	test(`ralph names ${module} and the pi package root it tried when ${module} is missing`, (t) => {
+		const path = fakePi(t, module);
+		// The bin follows the real path of pi, so the tried root is the real package directory.
+		const piRoot = realpathSync(join(path, "..", "node_modules", "@earendil-works", "pi-coding-agent"));
+		const result = spawnSync(process.execPath, [bin, "--help"], {
+			env: { ...process.env, PATH: path }, encoding: "utf-8", timeout: 10_000,
+		});
+		assert.equal(result.error, undefined);
+		assert.equal(result.status, 1);
+		assert.equal(result.stdout, "");
+		const name = module === "jiti" ? "jiti" : "@earendil-works/pi-tui";
+		assert.ok(result.stderr.includes(`ralph: cannot find ${name} (tried: ${piRoot} (resolving from the pi package root))`), result.stderr);
+		assert.doesNotMatch(result.stderr, /cannot find pi installation/);
+	});
+}
+
+test("ralph watch loads the viewer through pi and reports a bad root as a command error", (t) => {
+	const path = fakePi(t);
+	const result = spawnSync(process.execPath, [bin, "watch", "/nonexistent/ralph-watch-root"], {
+		env: { ...process.env, PATH: path }, encoding: "utf-8", timeout: 20_000,
+	});
+	assert.equal(result.error, undefined);
+	assert.equal(result.status, 1, result.stderr);
+	assert.equal(result.stdout, "");
+	assert.doesNotMatch(result.stderr, /cannot find/);
+	assert.match(result.stderr, /^ralph: ENOENT: .*'\/nonexistent'/m);
 });

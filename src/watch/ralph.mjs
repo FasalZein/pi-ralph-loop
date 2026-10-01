@@ -56,6 +56,8 @@ async function runNativeStatus() {
 }
 
 async function runWithPiLoader() {
+	// Each step names what it looks for and the path it tries, so an install error says what to fix.
+	let missing = "pi installation";
 	let tried = "PATH lookup for pi";
 	let jiti;
 	try {
@@ -73,12 +75,15 @@ async function runWithPiLoader() {
 			root = parent;
 		}
 		const require = createRequire(join(root, "package.json"));
+		// Both modules resolve from the pi package root, so one copy matches the host pi.
+		tried = `${root} (resolving from the pi package root)`;
+		missing = "jiti";
 		const { createJiti } = require("jiti");
-		jiti = createJiti(import.meta.url, {
-			alias: { "@earendil-works/pi-tui": require.resolve("@earendil-works/pi-tui") },
-		});
+		missing = "@earendil-works/pi-tui";
+		const tui = require.resolve("@earendil-works/pi-tui");
+		jiti = createJiti(import.meta.url, { alias: { "@earendil-works/pi-tui": tui } });
 	} catch (error) {
-		console.error(`ralph: cannot find pi installation (tried: ${tried}): ${error instanceof Error ? error.message : String(error)}`);
+		console.error(`ralph: cannot find ${missing} (tried: ${tried}): ${error instanceof Error ? error.message : String(error)}`);
 		process.exitCode = 1;
 	}
 	// Command errors are reported as such, never as a missing pi installation.

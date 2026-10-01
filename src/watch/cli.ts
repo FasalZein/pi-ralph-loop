@@ -1,7 +1,8 @@
 import { execute, runDriverRole, type Request } from "./commands.js";
+import { runViewer } from "./viewer.js";
 
-const USAGE = "Usage: ralph launch <root> [--fresh|--relaunch|--resume]\n       ralph stop <root> [--timeout <seconds>]\n       ralph status <root>\n       ralph watch <root> (not implemented yet)";
-type Parsed = { readonly kind: "help" } | { readonly kind: "driver"; readonly manifest: string } | { readonly kind: "request"; readonly request: Request };
+const USAGE = "Usage: ralph launch <root> [--fresh|--relaunch|--resume]\n       ralph stop <root> [--timeout <seconds>]\n       ralph status <root>\n       ralph watch <root>";
+type Parsed = { readonly kind: "help" } | { readonly kind: "driver"; readonly manifest: string } | { readonly kind: "watch"; readonly root: string } | { readonly kind: "request"; readonly request: Request };
 
 /** Parse argv; null means a usage error. */
 export function parse(argv: readonly string[]): Parsed | null {
@@ -15,6 +16,7 @@ export function parse(argv: readonly string[]): Parsed | null {
 		if (modes.length > 1 || modes.some((mode) => mode === undefined)) return null;
 		return { kind: "request", request: { kind: "launch", root, mode: modes[0] ?? "fresh" } };
 	}
+	if (command === "watch") return rest.length === 0 ? { kind: "watch", root } : null;
 	if (command === "stop") {
 		if (rest.length === 0) return { kind: "request", request: { kind: "stop", root, timeoutMs: null } };
 		const seconds = Number(rest[1]);
@@ -35,6 +37,10 @@ export async function main(argv: readonly string[]): Promise<number> {
 		const exit = await runDriverRole(parsed.manifest, { signal: abort.signal });
 		console.error(`ralph driver: ${exit.reason}${exit.detail ? `: ${exit.detail}` : ""}`);
 		return exit.reason === "loop-finished" || exit.reason === "stopped-before-launch" ? 0 : 1;
+	}
+	if (parsed.kind === "watch") {
+		await runViewer({ roots: [parsed.root] });
+		return 0;
 	}
 	const outcome = await execute(parsed.request);
 	if (!outcome.ok) { console.error(`ralph: ${outcome.error}`); return 1; }
