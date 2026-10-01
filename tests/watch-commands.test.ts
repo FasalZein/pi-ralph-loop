@@ -10,6 +10,7 @@ import { connectEvents, immediateGate, runDriver } from "../src/watch/driver.ts"
 import { loadMission } from "../src/watch/config.ts";
 import { readHostRecord, writeHostRecord, type Host, type HostHandle } from "../src/watch/host.ts";
 import { writeState } from "../src/state.ts";
+import { tmuxHost } from "../src/watch/hosts/tmux.ts";
 import type { RalphLoopState } from "../src/types.ts";
 
 const fakePi = fileURLToPath(new URL("./fixtures/fake-pi-rpc.ts", import.meta.url));
@@ -246,4 +247,26 @@ test("resume refuses an exhausted budget", async (t) => {
 	const outcome = await execute({ kind: "launch", root, mode: "resume" }, { host, ...quiet });
 	assert.ok(!outcome.ok && /past its iteration budget/.test(outcome.error), JSON.stringify(outcome));
 	assert.deepEqual(calls, []);
+});
+
+test("launch recovery refuses a previous session whose pane state cannot be read (G2)", async (t) => {
+	const root = scratch(t);
+	const socket = join(root, "fake-socket");
+	writeFileSync(socket, "");
+	const previous = { ...handleFor(root, "old-launch"), socket };
+	writeHostRecord(previous);
+	const calls: (readonly string[])[] = [];
+	const identity = `$1\t@1\t%1\t${socket}\t${root}\told-launch\n`;
+	const exec = async (args: readonly string[]) => {
+		calls.push(args);
+		const format = args.at(-1) ?? "";
+		if (args.includes("display-message") && format.endsWith("#{pane_dead}")) return { code: 1, stdout: "", stderr: "injected query failure" };
+		if (args.includes("display-message")) return { code: 0, stdout: identity, stderr: "" };
+		if (args.includes("list-panes")) return { code: 0, stdout: "%1\n", stderr: "" };
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host: tmuxHost({ exec, env: {} }), ...quiet });
+	assert.ok(!outcome.ok && /uncertain/.test(outcome.error), JSON.stringify(outcome));
+	assert.equal(calls.some((args) => args.includes("kill-session")), false, "a live role is never closed on a failed query");
+	assert.equal(readHostRecord(root)?.launchId, "old-launch");
 });

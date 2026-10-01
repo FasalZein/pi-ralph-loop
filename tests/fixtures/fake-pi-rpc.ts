@@ -13,7 +13,8 @@ type Step =
 	| { op: "exit"; code: number }
 	| { op: "big"; bytes: number }
 	// Scratch loop state in the pi cwd (a temp root). `partial` writes an incomplete document.
-	| { op: "state"; running: boolean; iteration?: number; maxIterations?: number; stopRequested?: boolean; stopReason?: string | null; partial?: boolean };
+	// `foreign`: a run owned by another live process (this fake's parent) and session.
+	| { op: "state"; running: boolean; iteration?: number; maxIterations?: number; stopRequested?: boolean; stopReason?: string | null; partial?: boolean; foreign?: boolean };
 type Scenario = { ready?: "silent" | "exit"; readyDelay?: number; promptSuccess?: boolean; steerSuccess?: boolean; responseDelay?: number; silentPrompt?: boolean; preSteps?: Step[]; steps?: Step[]; stopSteps?: Step[]; ignoreEOF?: boolean };
 const TOKEN = "token";
 const STARTED_AT = "2026-09-30T00:00:00.000Z";
@@ -34,7 +35,7 @@ async function steps(items: Step[]): Promise<void> {
 			case "exit": process.exit(step.code); break;
 			case "state":
 				if (step.partial) writeFileSync(join(process.cwd(), ".ralph/loop.md"), "---\nrunning: false\niteration: 1\n");
-				else writeState(process.cwd(), { running: step.running, iteration: step.iteration ?? 1, max_iterations: step.maxIterations ?? 3, started_at: STARTED_AT, completed_at: step.running ? null : STARTED_AT, stop_reason: (step.stopReason ?? (step.running ? null : "manual_stop")) as never, session_id: "fake-session", last_session_file: null, owner_pid: step.running ? process.pid : null, owner_heartbeat_at: step.running ? new Date().toISOString() : null, error_count: 0, transitioning: false, cancel_requested: false, stop_requested: step.stopRequested ?? false, bundle_mode: false, loop_token: TOKEN, model_provider: null, model_id: null, thinking_level: null, bundle_snapshot_hash: null, items_snapshot_hash: null, progress_size: null, progress_hash: null, progress_snapshot: null, source_doc_hashes: null, bundle_items_snapshot: null, git_head: null, bundle_rejection_count: 0, provider_recovery_fresh_fallback_used: false, limit_reminders: null }, "Do the task.");
+				else writeState(process.cwd(), { running: step.running, iteration: step.iteration ?? 1, max_iterations: step.maxIterations ?? 3, started_at: STARTED_AT, completed_at: step.running ? null : STARTED_AT, stop_reason: (step.stopReason ?? (step.running ? null : "manual_stop")) as never, session_id: step.foreign ? "foreign" : "fake-session", last_session_file: null, owner_pid: step.running ? (step.foreign ? process.ppid : process.pid) : null, owner_heartbeat_at: step.running ? new Date().toISOString() : null, error_count: 0, transitioning: false, cancel_requested: false, stop_requested: step.stopRequested ?? false, bundle_mode: false, loop_token: step.foreign ? "foreign-token" : TOKEN, model_provider: null, model_id: null, thinking_level: null, bundle_snapshot_hash: null, items_snapshot_hash: null, progress_size: null, progress_hash: null, progress_snapshot: null, source_doc_hashes: null, bundle_items_snapshot: null, git_head: null, bundle_rejection_count: 0, provider_recovery_fresh_fallback_used: false, limit_reminders: null }, "Do the task.");
 				break;
 			case "big": {
 				// One oversized record (like a long agent_end), written in pipe-sized chunks.

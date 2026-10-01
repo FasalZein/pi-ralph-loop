@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { readStateDocument } from "../state.js";
 import { loadMission } from "./config.js";
 import { activeOwnerConflict, connectEvents, controlLoop, fifoGate, isTerminal, releaseLaunch, runDriver, TERMINAL_POLL_MS, type DriverExit, type DriverRuntime, type LaunchMode } from "./driver.js";
-import { readHostRecord, removeHostRecord, writeHostRecord, type Host, type HostHandle } from "./host.js";
+import { HOST_CLEANUP_TIMEOUT_MS, readHostRecord, removeHostRecord, writeHostRecord, type Host, type HostHandle } from "./host.js";
 import { tmuxHost } from "./hosts/tmux.js";
 import { object } from "./journal.js";
 import { openLoop } from "./loop-state.js";
@@ -134,7 +134,7 @@ async function recoverInactiveHost(root: string, host: Host, signal: AbortSignal
 	if (await host.verify(previous, signal)) {
 		if (!await host.paneDead(previous, signal)) throw new Error(`tmux session ${previous.name} (${previous.sessionId}) of launch ${previous.launchId} still runs a process; inspect or close it first`);
 		if (signal.aborted) throw signal.reason;
-		await host.close(previous);
+		await host.close(previous, signal);
 	}
 	removeHostRecord(root, previous.launchId);
 	const manifest = manifestPath(root, previous.launchId);
@@ -170,10 +170,16 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 			await waitReady(root, launchId, host, handle, ready);
 		} catch (error) {
 			// Nothing was dispatched: the unused session holds no loop.
-			if (await host.verify(handle)) await host.close(handle);
+			const failure = ready.aborted ? notReady() : error;
+			const cleanup = AbortSignal.timeout(HOST_CLEANUP_TIMEOUT_MS);
+			try { if (await host.verify(handle, cleanup)) await host.close(handle, cleanup); }
+			catch (cleanupError) {
+				// The record stays so the next launch can recover this session.
+				throw new Error(`${message(failure)}; tmux session ${handle.name} (${handle.sessionId}) may remain: ${cleanup.aborted ? "cleanup did not finish" : message(cleanupError)}`);
+			}
 			removeHostRecord(root, launchId);
 			if (existsSync(manifest)) unlinkSync(manifest);
-			throw ready.aborted ? notReady() : error;
+			throw failure;
 		}
 		const watch = new AbortController();
 		const frames = connectEvents({ root, run: { launchId, loopToken: null, startedAt: null } }, watch.signal)[Symbol.asyncIterator]();
@@ -231,7 +237,11 @@ async function stop(request: Extract<Request, { kind: "stop" }>, runtime: Comman
 	const poll = () => sleep(runtime.pollMs ?? TERMINAL_POLL_MS, wait).catch(() => {});
 	/** Wait for the driver role to exit so the session holds no process when it closes. */
 	async function roleExited(handle: HostHandle): Promise<void> {
-		while (!await host.paneDead(handle, wait)) {
+		const dead = async () => {
+			try { return await host.paneDead(handle, wait); }
+			catch (error) { if (wait?.aborted) throw stillStopping(); throw new Error(`${message(error)}; the host was left open`); }
+		};
+		while (!await dead()) {
 			if (wait?.aborted) throw stillStopping();
 			err(`ralph: loop stopped; waiting for the driver to exit; waited ${waited()}`);
 			await poll();

@@ -463,3 +463,41 @@ test("driver: managed launch refuses an owner that appears at the gate without l
 	assert.match(exit.detail ?? "", /live owner/);
 	assert.equal(log(rootDir).some((r) => r.type === "prompt"), false, "neither /ralph-loop nor /ralph-stop reaches pi");
 });
+
+/** End this test's own fake pi; a managed driver without stop authority keeps it otherwise. Call in the test body: `start` hooks await the driver. */
+function endPi(root: string): void {
+	try { process.kill(Number(log(root)[0].pid), "SIGTERM"); } catch { /* already gone */ }
+}
+
+test("driver: managed refusal by a foreign owner sends no stop and keeps pi (G1)", async (t) => {
+	const f = await start(t, { preSteps: [{ op: "state", running: true, foreign: true }, { op: "sleep", ms: 200 }, { op: "emit", record: notify("A Ralph loop is already running") }], responseDelay: 100 }, immediateGate, { terminalPollMs: 50 }, managed);
+	try {
+		await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launch-failed" && /no stop sent/.test(r.detail ?? "")));
+		await new Promise((r) => setTimeout(r, 300));
+		assert.equal(log(f.root).some((r) => r.message === "/ralph-stop"), false, "the foreign run is not stopped");
+		assert.ok(noEof(f.root), "a possibly running pi is not closed");
+		const { readStateDocument } = await import("../src/state.ts");
+		const state = readStateDocument(f.root);
+		assert.ok(state.status === "valid" && state.state.running && !state.state.stop_requested);
+	} finally { endPi(f.root); }
+});
+
+test("driver: client stop is refused while a foreign owner runs the workspace loop (G1)", async (t) => {
+	const f = await start(t, { steps: [{ op: "sleep", ms: 100 }, { op: "state", running: true, foreign: true }] }, immediateGate, {}, managed);
+	try {
+		await waitFor(() => existsSync(join(f.root, ".ralph/loop.md")));
+		await assert.rejects(controlLoop({ root: f.root, run: { launchId: "launch", loopToken: null, startedAt: null } }, { kind: "stop" }, AbortSignal.timeout(3000)), /foreign-owner/);
+		assert.equal(log(f.root).some((r) => r.message === "/ralph-stop"), false);
+	} finally { endPi(f.root); }
+});
+
+test("driver: managed failure stops its own unconfirmed run and closes pi after proof (G1)", { timeout: 10_000 }, async (t) => {
+	// No fact names the run; its state owner is this launch's pi process.
+	const f = await start(t, { steps: [{ op: "state", running: true }], stopSteps: [{ op: "sleep", ms: 200 }, { op: "state", running: false }] }, immediateGate, { launchTimeoutMs: 300, terminalPollMs: 50 }, managed);
+	const timer = setTimeout(() => endPi(f.root), 5000);
+	const exit = await f.result;
+	clearTimeout(timer);
+	assert.equal(exit.reason, "launch-rejected");
+	assert.ok(log(f.root).some((r) => r.message === "/ralph-stop"));
+	assert.ok(log(f.root).some((r) => r.eof === true), "pi closes only after terminal proof");
+});

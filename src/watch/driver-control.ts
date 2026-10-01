@@ -5,6 +5,7 @@ import { object, type JournalWriter } from "./journal.js";
 import type { PiRpc, RpcMonitor } from "./rpc.js";
 import { ControlError, parseEnvelope, type Broadcast, type Envelope } from "./transport.js";
 
+export type StopAuthority = { readonly kind: "ours" | "none" } | { readonly kind: "foreign" | "unknown"; readonly detail: string };
 export type ControlHooks = {
 	readonly root: string;
 	readonly launchId: string;
@@ -21,6 +22,11 @@ export type ControlHooks = {
 	readonly releaseGate: () => boolean;
 	/** Stop before any loop exists; returns a reason when the driver ends the launch itself. */
 	readonly stopBeforeLaunch: () => string | null;
+	/**
+	 * Whether this driver may send `/ralph-stop`. pi's stop acts on whatever loop
+	 * runs in the workspace, so it is refused for a foreign or unknown run.
+	 */
+	readonly stopAuthority: () => StopAuthority;
 	/** pi accepted `/ralph-stop`. */
 	readonly stopAccepted?: () => void;
 };
@@ -94,6 +100,11 @@ export class ControlHandler {
 			if (reason) { intervention(true, reason); ack("completed", reason); return; }
 		}
 		if (tracker.endedTokens.has(token)) { intervention(true, "already-ended"); ack("completed"); return; }
+		const authority = hooks.stopAuthority();
+		if (authority.kind === "foreign" || authority.kind === "unknown") {
+			const reason = authority.kind === "foreign" ? "foreign-owner" : "run-unknown";
+			intervention(false, `${reason}: ${authority.detail}`); ack("rejected", `${reason}: ${authority.detail}`); return;
+		}
 		const duplicate = this.stopResults.has(token);
 		let pending = this.stopResults.get(token);
 		if (!pending) {

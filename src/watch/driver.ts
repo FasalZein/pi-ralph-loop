@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync, writeFileSy
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import { FACT_SOCKET_ENV, LAUNCH_ID_ENV } from "../loop/watch-events.js";
-import { ControlHandler } from "./driver-control.js";
+import { ControlHandler, type StopAuthority } from "./driver-control.js";
 import { FactTracker } from "./driver-facts.js";
 import { JournalWriter } from "./journal.js";
 import { PiRpc, RpcMonitor, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
@@ -235,7 +235,8 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	function awaitTerminal(): void {
 		if (finished || terminalPoll !== undefined) return;
 		const poll = async () => {
-			const loop = tracker.loop;
+			if (!tracker.loop && !ownLoop) stopAuthority();
+			const loop = tracker.loop ?? ownLoop;
 			if (finished) return;
 			try {
 				owned.reader ??= openLoop(root);
@@ -247,13 +248,45 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		terminalPoll = setTimeout(() => void poll(), 0);
 	}
 	let failDetail: string | null = null;
+	/** This launch's loop learned from state its own pi owns, when no fact named it. */
+	let ownLoop: { token: string; startedAt: string } | null = null;
+	/**
+	 * Who owns the loop that pi's workspace-wide `/ralph-stop` would stop. Ours:
+	 * our facts name it, or its owner is our pi process. Foreign: another live
+	 * owner. None: nothing runs. Unknown: incomplete state or a stale owner.
+	 */
+	function stopAuthority(): StopAuthority {
+		const document = readStateDocument(root);
+		if (document.status === "partial") return { kind: "unknown", detail: `loop state is incomplete (${document.reason})` };
+		const current = document.status === "valid" ? document.state : null;
+		if (!current?.running) return tracker.loop ? { kind: "ours" } : { kind: "none" };
+		const loop = { token: current.loop_token, startedAt: current.started_at };
+		if (current.owner_pid !== null && current.owner_pid === rpc?.child.pid) { ownLoop ??= loop; return { kind: "ours" }; }
+		if (tracker.loop && tracker.loop.token === loop.token && tracker.loop.startedAt === loop.startedAt) return { kind: "ours" };
+		if (isLoopOwnerActive(current, `ralph-launch-${foreignSession()}`)) return { kind: "foreign", detail: `loop ${loop.token} has a live owner outside this launch` };
+		return { kind: "unknown", detail: `loop ${loop.token} runs without a live owner` };
+	}
+	let stopRetry: ReturnType<typeof setTimeout> | undefined;
+	/** Send `/ralph-stop` only under this launch's authority; recheck while it is unknown. */
+	function requestStop(): void {
+		if (finished) return;
+		const authority = stopAuthority();
+		if (authority.kind === "ours" || authority.kind === "none") { controls.receive("/ralph-stop"); return; }
+		if (authority.kind === "foreign") {
+			// pi kept: its state is uncertain and the foreign run must not be stopped.
+			log(`launch failed; no stop sent: ${authority.detail}`);
+			publish({ type: "lifecycle", state: "launch-failed", detail: `no stop sent: ${authority.detail}`.slice(0, 200) });
+			return;
+		}
+		stopRetry = setTimeout(requestStop, runtime.terminalPollMs ?? TERMINAL_POLL_MS);
+	}
 	/** Managed launch failure after dispatch: request a graceful stop and keep control available. */
 	function failLaunch(detail: string): void {
 		if (!managed || !dispatched) { finish("launch-rejected", null, detail); return; }
 		if (failing || finished) return;
 		failing = true; failDetail = detail; tracker.cancelLaunch();
 		publish({ type: "lifecycle", state: "launch-failed", detail: detail.slice(0, 200) });
-		controls.receive("/ralph-stop");
+		requestStop();
 		awaitTerminal();
 	}
 	const tracker: FactTracker = new FactTracker({
@@ -277,6 +310,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		},
 		// A lost loop-ended fact must not keep a managed driver alive once state proves the stop.
 		stopAccepted: () => { if (managed) awaitTerminal(); },
+		stopAuthority,
 	});
 	let exit: DriverExit | null = null;
 	try {
@@ -333,7 +367,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		if (!rpc) throw error;
 		finish("aborted", null, String(error)); exit = await terminal;
 	} finally {
-		clearTimeout(settleTimer); clearTimeout(launchTimer); clearTimeout(terminalPoll); await owned.reader?.close().catch(() => {}); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
+		clearTimeout(settleTimer); clearTimeout(launchTimer); clearTimeout(terminalPoll); clearTimeout(stopRetry); await owned.reader?.close().catch(() => {}); runtime.signal?.removeEventListener("abort", onAbort); abort.abort();
 		state = "closing";
 		if (rpc) {
 			const code = await rpc.close(runtime.shutdownGraceMs ?? PI_SHUTDOWN_GRACE_MS);

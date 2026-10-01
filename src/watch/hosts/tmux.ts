@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
-import type { Host, HostHandle, RoleSpec } from "../host.js";
+import { existsSync } from "node:fs";
+import { HOST_CLEANUP_TIMEOUT_MS, type Host, type HostHandle, type RoleSpec } from "../host.js";
 
 export type TmuxResult = { readonly code: number; readonly stdout: string; readonly stderr: string };
 /** Runs `tmux <args>` without a shell; `env` is the complete client environment. */
@@ -12,6 +13,8 @@ export type TmuxRuntime = {
 	readonly server?: readonly string[];
 	readonly env?: NodeJS.ProcessEnv;
 	readonly now?: () => Date;
+	/** Cleanup bound; default HOST_CLEANUP_TIMEOUT_MS. */
+	readonly cleanupMs?: number;
 };
 export const realTmux: TmuxExec = (args, env, signal) => new Promise((resolve) => {
 	execFile("tmux", [...args], { env, encoding: "utf8", signal }, (error, stdout, stderr) => {
@@ -44,58 +47,91 @@ export function tmuxHost(runtime: TmuxRuntime = {}): Host {
 		return result.stdout;
 	}
 	const at = (handle: HostHandle) => ["-S", handle.socket];
+	const IDENTITY = "#{session_id}\t#{window_id}\t#{pane_id}\t#{socket_path}\t#{@ralph_root}\t#{@ralph_launch}";
+	const identity = (handle: HostHandle) => [handle.sessionId, handle.windowId, handle.paneId, handle.socket, handle.root, handle.launchId].join("\t");
 	async function verify(handle: HostHandle, signal?: AbortSignal): Promise<boolean> {
-		const result = await exec([...at(handle), "display-message", "-p", "-t", handle.paneId, "#{session_id}\t#{window_id}\t#{pane_id}\t#{socket_path}\t#{@ralph_root}\t#{@ralph_launch}"], clientEnv, signal);
-		return result.code === 0 && result.stdout.replace(/\n$/, "") === [handle.sessionId, handle.windowId, handle.paneId, handle.socket, handle.root, handle.launchId].join("\t");
+		const result = await exec([...at(handle), "display-message", "-p", "-t", handle.paneId, IDENTITY], clientEnv, signal);
+		return result.code === 0 && result.stdout.replace(/\n$/, "") === identity(handle);
 	}
+	const cleanupSignal = () => AbortSignal.timeout(runtime.cleanupMs ?? HOST_CLEANUP_TIMEOUT_MS);
 	/**
 	 * Remove the session this open created. The role has not dispatched a
 	 * launch yet: open never returned, so no caller could release its gate.
+	 * Returns a description of what may remain when cleanup cannot finish.
 	 */
-	async function rollback(handle: HostHandle | null, server: readonly string[], root: string, launchId: string): Promise<void> {
-		try {
-			if (handle) { await exec([...at(handle), "kill-session", "-t", handle.sessionId], clientEnv); return; }
-			const listed = await exec([...server, "list-sessions", "-F", "#{session_id}\t#{@ralph_root}\t#{@ralph_launch}"], clientEnv);
-			for (const line of listed.code === 0 ? listed.stdout.split("\n") : []) {
-				const [id, markedRoot, markedLaunch] = line.split("\t");
-				if (id && markedRoot === root && markedLaunch === launchId) await exec([...server, "kill-session", "-t", id], clientEnv);
-			}
-		} catch { /* The original failure is reported; a leftover session carries this launch's markers. */ }
+	async function rollback(handle: HostHandle | null, server: readonly string[], launchId: string): Promise<string | null> {
+		const signal = cleanupSignal();
+		const kill = async (args: readonly string[], id: string) => {
+			const result = await exec([...args, "kill-session", "-t", id], clientEnv, signal);
+			return result.code === 0 || signal.aborted ? (signal.aborted ? `tmux session ${id} (launch ${launchId}) may remain: cleanup did not finish` : null) : `tmux session ${id} (launch ${launchId}) may remain: ${result.stderr.trim()}`;
+		};
+		if (handle) return kill(at(handle), handle.sessionId);
+		// Creation identity was not observed (interrupted client): find the session by its unique launch marker.
+		const listed = await exec([...server, "list-sessions", "-F", "#{session_id}\t#{@ralph_launch}"], clientEnv, signal);
+		if (listed.code !== 0) return signal.aborted ? `a tmux session of launch ${launchId} may remain: cleanup did not finish` : null;
+		for (const line of listed.stdout.split("\n")) {
+			const [id, marked] = line.split("\t");
+			if (id && marked === launchId) { const left = await kill(server, id); if (left) return left; }
+		}
+		return null;
 	}
 	return {
 		async open(root: string, launchId: string, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle> {
 			const name = sessionName(root, launchId);
 			const server = runtime.server ?? [];
-			// Markers are set in the same tmux command as the session, so even an
-			// interrupted creation leaves a session this launch can find by its full id.
-			const marked = ["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}\t#{socket_path}", "-s", name, "-n", role.title, "-c", root, "-x", WIDTH, "-y", HEIGHT, ...BOOTSTRAP, ";", "set-option", "@ralph_root", root, ";", "set-option", "@ralph_launch", launchId];
+			// The launch marker is set first in the creating command, so an
+			// interrupted creation leaves a session findable by its unique launch id.
+			const marked = ["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}\t#{socket_path}", "-s", name, "-n", role.title, "-c", root, "-x", WIDTH, "-y", HEIGHT, ...BOOTSTRAP, ";", "set-option", "@ralph_launch", launchId, ";", "set-option", "@ralph_root", root];
 			let handle: HostHandle | null = null;
 			try {
-				const created = (await run([...server, ...marked], signal)).trim().split("\n")[0].split("\t");
-				if (created.length !== 4 || !created.every(Boolean)) throw new Error("tmux new-session returned no identity");
-				const [sessionId, windowId, paneId, socket] = created;
-				handle = { v: 1, kind: "tmux", root, launchId, name, socket, sessionId, windowId, paneId, createdAt: now().toISOString() };
+				if (signal?.aborted) throw signal.reason;
+				const result = await exec([...server, ...marked], clientEnv, signal);
+				// A failed later command in the chain still printed the creation identity: keep it for rollback.
+				const created = result.stdout.trim().split("\n")[0].split("\t");
+				if (created.length === 4 && created.every(Boolean)) {
+					const [sessionId, windowId, paneId, socket] = created;
+					handle = { v: 1, kind: "tmux", root, launchId, name, socket, sessionId, windowId, paneId, createdAt: now().toISOString() };
+				}
+				if (signal?.aborted) throw signal.reason;
+				if (result.code !== 0) throw new Error(`tmux new-session failed: ${result.stderr.trim() || `exit ${result.code}`}`);
+				if (!handle) throw new Error("tmux new-session returned no identity");
 				const target = at(handle);
 				// Keep the exited role visible for diagnostics.
-				await run([...target, "set-option", "-w", "-t", windowId, "remain-on-exit", "on"], signal);
+				await run([...target, "set-option", "-w", "-t", handle.windowId, "remain-on-exit", "on"], signal);
 				const global = await run([...target, "show-environment", "-g"], signal);
 				const names = new Set([...Object.keys(runtime.env ?? process.env), ...global.split("\n").map((line) => line.replace(/^-/, "").split("=")[0])].filter((variable) => HERDR.test(variable)));
 				const argv = ["env", ...[...names].sort().flatMap((variable) => ["-u", variable]), ...Object.entries(role.env).map(([key, value]) => `${key}=${value}`), ...role.argv];
-				await run([...target, "respawn-pane", "-k", "-t", paneId, "-c", root, ...argv], signal);
+				await run([...target, "respawn-pane", "-k", "-t", handle.paneId, "-c", root, ...argv], signal);
 				return handle;
 			} catch (error) {
-				await rollback(handle, server, root, launchId);
+				const left = await rollback(handle, server, launchId);
+				if (left) throw new Error(`${error instanceof Error ? error.message : String(error)}; ${left}`);
 				throw error;
 			}
 		},
 		verify,
 		async paneDead(handle: HostHandle, signal?: AbortSignal): Promise<boolean> {
-			const result = await exec([...at(handle), "display-message", "-p", "-t", handle.paneId, "#{pane_dead}"], clientEnv, signal);
-			return result.code !== 0 || result.stdout.trim() === "1";
+			const uncertain = (detail: string) => new Error(`tmux pane ${handle.paneId} of launch ${handle.launchId}: state uncertain (${detail})`);
+			if (signal?.aborted) throw signal.reason;
+			// The server's socket is gone: the server and all its panes are gone.
+			if (!existsSync(handle.socket)) return true;
+			const result = await exec([...at(handle), "display-message", "-p", "-t", handle.paneId, `${IDENTITY}\t#{pane_dead}`], clientEnv, signal);
+			if (signal?.aborted) throw signal.reason;
+			if (result.code === 0) {
+				const line = result.stdout.replace(/\n$/, "");
+				if (line === `${identity(handle)}\t1`) return true;
+				if (line === `${identity(handle)}\t0`) return false;
+				throw uncertain("pane does not match this launch or output is malformed");
+			}
+			// The query failed: only a server listing without this pane proves absence.
+			const panes = await exec([...at(handle), "list-panes", "-a", "-F", "#{pane_id}"], clientEnv, signal);
+			if (signal?.aborted) throw signal.reason;
+			if (panes.code === 0 && !panes.stdout.split("\n").includes(handle.paneId)) return true;
+			throw uncertain(result.stderr.trim() || `exit ${result.code}`);
 		},
-		async close(handle: HostHandle): Promise<void> {
-			if (!await verify(handle)) throw new Error(`tmux session ${handle.sessionId} no longer matches launch ${handle.launchId}`);
-			await run([...at(handle), "kill-session", "-t", handle.sessionId]);
+		async close(handle: HostHandle, signal?: AbortSignal): Promise<void> {
+			if (!await verify(handle, signal)) throw new Error(`tmux session ${handle.sessionId} no longer matches launch ${handle.launchId}`);
+			await run([...at(handle), "kill-session", "-t", handle.sessionId], signal);
 		},
 	};
 }

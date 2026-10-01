@@ -27,13 +27,23 @@ export type Host = {
 	open(root: string, launchId: string, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle>;
 	/** True when the handle still names the same live session, pane, root and launch on the same server. */
 	verify(handle: HostHandle, signal?: AbortSignal): Promise<boolean>;
+	/**
+	 * True only on positive evidence: this launch's pane reports its process
+	 * exited, or the server proves the pane absent. Throws when the answer is
+	 * uncertain (query failure, malformed or mismatched output).
+	 */
 	paneDead(handle: HostHandle, signal?: AbortSignal): Promise<boolean>;
 	/**
 	 * Close the exact session after it verifies. Callers authorize it: either
 	 * the role never dispatched a launch, or fresh state proves the loop idle.
 	 */
-	close(handle: HostHandle): Promise<void>;
+	close(handle: HostHandle, signal?: AbortSignal): Promise<void>;
 };
+/**
+ * Bound for host cleanup client calls. It reuses the owner's 30 s readiness
+ * limit (#10, #1): cleanup that cannot finish in it is reported, not awaited.
+ */
+export const HOST_CLEANUP_TIMEOUT_MS = 30_000;
 
 const RECORD = ".ralph/watch-host.json";
 function valid(value: unknown): value is HostHandle {

@@ -150,7 +150,7 @@ test("tmux open stops at the startup deadline and removes only its marked sessio
 	const exec = async (args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
 		calls.push(args);
 		if (args.includes("new-session")) return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
-		if (args.includes("list-sessions")) return { code: 0, stdout: "$7\t/r\tlaunch-1\n$8\t/r\tother\n$9\t/elsewhere\tlaunch-1\n", stderr: "" };
+		if (args.includes("list-sessions")) return { code: 0, stdout: "$7\tlaunch-1\n$8\tother\n$9\t\n", stderr: "" };
 		return { code: 0, stdout: "", stderr: "" };
 	};
 	const started = Date.now();
@@ -158,4 +158,57 @@ test("tmux open stops at the startup deadline and removes only its marked sessio
 	assert.ok(Date.now() - started < 1000);
 	assert.deepEqual(calls.filter((args) => args.includes("kill-session")), [["-L", "x", "kill-session", "-t", "$7"]]);
 	assert.ok(calls[0].includes("@ralph_launch") && calls[0].includes(";"), "markers are set in the creating command");
+});
+
+test("tmux open keeps the creation identity when an early marker fails (G3)", async () => {
+	const calls: (readonly string[])[] = [];
+	const exec = async (args: readonly string[]) => {
+		calls.push(args);
+		// The chain created the session and printed its identity, then the launch marker failed.
+		if (args.includes("new-session")) return { code: 1, stdout: "$3\t@4\t%5\t/tmp/tmux-1/s\n", stderr: "injected launch-marker failure" };
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	await assert.rejects(tmuxHost({ exec, env: {} }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }), /injected launch-marker failure/);
+	assert.deepEqual(calls.at(-1), ["-S", "/tmp/tmux-1/s", "kill-session", "-t", "$3"]);
+});
+
+test("scratch tmux early marker failure leaves no session (G3)", { skip: available ? false : "tmux unavailable" }, async (t) => {
+	const server = `rw-t9-g3-${process.pid}-${randomUUID().slice(0, 8)}`;
+	const tmux = (...args: string[]) => spawnSync("tmux", ["-L", server, ...args], { encoding: "utf8" });
+	assert.equal(tmux("new-session", "-d", "-s", "sentinel", "sh", "-c", "exec tail -f /dev/null").status, 0);
+	const socket = tmux("display-message", "-p", "#{socket_path}").stdout.trim();
+	t.after(() => { tmux("kill-server"); rmSync(socket, { force: true }); });
+	const { realTmux } = await import("../src/watch/hosts/tmux.ts");
+	// Real tmux; only the launch-marker command targets a missing session so it fails.
+	const exec = (args: readonly string[], env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
+		const index = args.indexOf("@ralph_launch");
+		return realTmux(index > 0 ? [...args.slice(0, index), "-t", "=missing-session", ...args.slice(index)] : args, env, signal);
+	};
+	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", server] }).open(tmpdir(), "launch-g3", { title: "loop", argv: ["true"], env: {} }));
+	assert.deepEqual(tmux("list-sessions", "-F", "#{session_name}").stdout.trim().split("\n"), ["sentinel"]);
+});
+
+test("tmux rollback after the startup deadline is bounded and reports what may remain (G4)", { timeout: 5_000 }, async () => {
+	const hang = (signal?: AbortSignal) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
+	// The stalled server stalls every client, including cleanup.
+	const exec = async (_args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => hang(signal);
+	const started = Date.now();
+	await assert.rejects(tmuxHost({ exec, env: {}, cleanupMs: 100 }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(50)), /may remain: cleanup did not finish/);
+	assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+});
+
+test("pane state is dead only on positive evidence (G2)", async () => {
+	const socket = join(tmpdir(), `rw-t9-g2-${process.pid}`);
+	writeFileSync(socket, "");
+	try {
+		const handle = { v: 1, kind: "tmux", root: "/r", launchId: "L", name: "n", socket, sessionId: "$1", windowId: "@1", paneId: "%1", createdAt: "x" } as const;
+		const id = `$1\t@1\t%1\t${socket}\t/r\tL`;
+		const host = (display: { code: number; stdout: string }, panes: { code: number; stdout: string }) => tmuxHost({ env: {}, exec: async (args) => args.includes("list-panes") ? { ...panes, stderr: "" } : { ...display, stderr: "query failed" } });
+		assert.equal(await host({ code: 0, stdout: `${id}\t1\n` }, { code: 0, stdout: "" }).paneDead(handle), true);
+		assert.equal(await host({ code: 0, stdout: `${id}\t0\n` }, { code: 0, stdout: "" }).paneDead(handle), false);
+		assert.equal(await host({ code: 1, stdout: "" }, { code: 0, stdout: "%2\n" }).paneDead(handle), true, "server proves the pane absent");
+		await assert.rejects(host({ code: 1, stdout: "" }, { code: 0, stdout: "%1\n" }).paneDead(handle), /uncertain/);
+		await assert.rejects(host({ code: 1, stdout: "" }, { code: 1, stdout: "" }).paneDead(handle), /uncertain/);
+		await assert.rejects(host({ code: 0, stdout: "garbage\n" }, { code: 0, stdout: "" }).paneDead(handle), /uncertain/);
+	} finally { rmSync(socket, { force: true }); }
 });
