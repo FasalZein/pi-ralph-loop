@@ -4,7 +4,7 @@ import type { Alert, CommitEvent, FileChange, LaunchBaseline, LoopSnapshot, Miss
 /** Injection cases 6-9 (spec #1): suppression tokens, matched inside JS/TS comment tokens only. */
 export const SUPPRESSION_TOKENS: readonly string[] = ["oxlint-disable", "eslint-disable", "@ts-ignore", "@ts-expect-error"];
 /** Injection cases 10-11 (spec #1): a `.skip(` or `.only(` call in test code, never in a string or comment. */
-const FOCUS_CALL = /\.\s*(skip|only)\s*\(/;
+const FOCUS_CALLS = /\.\s*(skip|only)\s*\(/g;
 
 const CONTENT_RULES = ["suppression-comment", "test-focus", "deleted-test"] as const;
 const HISTORY_RULES = ["nonlinear-history", ...CONTENT_RULES] as const;
@@ -16,8 +16,8 @@ const branchName = (branch: string | null) => branch === null ? "(detached HEAD)
 /**
  * Pure generic-rule evaluation over one snapshot. History guards come first,
  * then every commit in base..HEAD oldest first against its first parent, then
- * the index and the worktree. Only fresh evidence is read: a torn observation
- * gives one `observation-retry` WARN and a missing section gives a
+ * the index and the worktree. Only fresh evidence is read: an observation with
+ * any concurrent-change issue gives one `observation-retry` WARN and a missing section gives a
  * `coverage-incomplete` WARN, never silence. `launch` is the branch captured at
  * launch; it is the baseline when the mission sets no branch.
  */
@@ -41,12 +41,17 @@ export function evaluate(snapshot: LoopSnapshot, mission: Mission, launch: Launc
 		if (enabled.length) emit("coverage-incomplete", "WARN", null, commit, [`${section}: ${cause}`, `rules not checked: ${enabled.join(", ")}`]);
 	};
 
+	// Any source that changed during the read makes the whole observation torn,
+	// including its run key: retry, never a finding.
+	const torn = snapshot.issues.filter((issue) => issue.kind === "concurrent");
+	if (torn.length) {
+		emit("observation-retry", "WARN", null, null, torn.map((issue) => `${issue.source}: ${issue.detail}`));
+		return [...alerts.values()];
+	}
 	const git = snapshot.git;
 	const evidence = snapshot.evidence;
 	if (!git || !evidence) {
-		const torn = snapshot.issues.find((issue) => issue.source === "git" && issue.kind === "concurrent");
-		if (torn) emit("observation-retry", "WARN", null, null, [torn.detail]);
-		else incomplete("git", GENERIC_RULES, snapshot.sources.git.error ?? "git unavailable");
+		incomplete("git", GENERIC_RULES, snapshot.sources.git.error ?? "git unavailable");
 		return [...alerts.values()];
 	}
 
@@ -91,16 +96,48 @@ export function evaluate(snapshot: LoopSnapshot, mission: Mission, launch: Launc
 				incomplete(`${seam} ${file}`, rules, change.content.kind === "unavailable" ? change.content.reason : "content not collected", commit);
 				continue;
 			}
-			for (const added of change.content.added) {
-				const where = `${seam}: ${file}:${added.line}`;
-				if (suppression && added.lexed) {
+			const { lines, added, lexed } = change.content;
+			const isAdded = new Set(added);
+			const unclassified = (rule: GenericRule, line: number, what: string, reason: string) =>
+				emit("coverage-incomplete", "WARN", item, commit, [`${seam}: ${file}:${line}: ${what} ${reason}`, `rules not checked: ${rule}`]);
+			if (suppression && lexed) {
+				for (const n of added) {
+					const raw = lines[n - 1];
+					const { comment, unsure } = lexed[n - 1];
 					for (const token of SUPPRESSION_TOKENS) {
-						if (added.lexed.comments.some((comment) => comment.includes(token))) raise("suppression-comment", item, commit, [`${where}: ${token}`, added.text.trim()]);
+						for (let at = raw.indexOf(token); at >= 0; at = raw.indexOf(token, at + 1)) {
+							if (unsure.slice(at, at + token.length).includes("?")) unclassified("suppression-comment", n, token, "in syntax the lexer cannot classify");
+							else if (comment.slice(at, at + token.length) === token) raise("suppression-comment", item, commit, [`${seam}: ${file}:${n}: ${token}`, raw.trim()]);
+						}
 					}
 				}
-				if (focus) {
-					const call = FOCUS_CALL.exec(added.lexed ? added.lexed.code : added.text);
-					if (call) raise("test-focus", item, commit, [`${where}: .${call[1]}(`, added.text.trim()]);
+			}
+			if (focus) {
+				// Whole-file text: whitespace between member and call may cross lines.
+				const join = (pick: (line: number) => string) => lines.map((_, i) => pick(i)).join("\n");
+				const raw = join((i) => lines[i]);
+				const code = lexed ? join((i) => lexed[i].code) : null;
+				const unsure = lexed ? join((i) => lexed[i].unsure) : null;
+				const starts = [0];
+				for (const line of lines) starts.push(starts[starts.length - 1] + line.length + 1);
+				const lineAt = (offset: number) => { let n = 1; while (starts[n] <= offset) n++; return n; };
+				const findings = new Map<number, { call: string; line: number; certain: boolean }>();
+				// Code matches prove a call; raw matches that touch unsure or unlexed text cannot be classified.
+				for (const [source, isCode] of [[code, true], [raw, false]] as const) {
+					if (source === null) continue;
+					for (const match of source.matchAll(FOCUS_CALLS)) {
+						const from = match.index, to = from + match[0].length;
+						const first = lineAt(from), last = lineAt(to - 1);
+						let touchesAdded = false;
+						for (let n = first; n <= last; n++) if (isAdded.has(n)) touchesAdded = true;
+						if (!touchesAdded || findings.get(from)?.certain) continue;
+						const certain = isCode && !unsure!.slice(from, to).includes("?");
+						if (certain || !isCode && (code === null || unsure!.slice(from, to).includes("?"))) findings.set(from, { call: match[1], line: first, certain });
+					}
+				}
+				for (const { call, line, certain } of findings.values()) {
+					if (certain) raise("test-focus", item, commit, [`${seam}: ${file}:${line}: .${call}(`, lines[line - 1].trim()]);
+					else unclassified("test-focus", line, `.${call}(`, lexed ? "in syntax the lexer cannot classify" : "in a test language without code evidence");
 				}
 			}
 		}

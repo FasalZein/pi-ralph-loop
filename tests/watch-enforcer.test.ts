@@ -112,6 +112,45 @@ for (const seam of SEAMS) {
 	});
 }
 
+// Review fix round 1, finding 1: valid literal syntax never proves a comment.
+for (const seam of SEAMS) {
+	test(`literal syntax (${seam}): continued strings and control-flow regexes raise nothing`, async () => {
+		const x = scratch();
+		try {
+			land(x.f, seam, () => append(x.f, "src/a.ts", [
+				"export const s = \"a\\",
+				"// @ts-ignore\";",
+				"if (true) /[/* eslint-disable */]/.test(\"x\");",
+				"while (false) /\\/\\/ oxlint-disable/.exec(\"y\");",
+			].join("\n")));
+			assert.deepEqual(summary((await run(x)).alerts), []);
+		} finally { x.f.close(); }
+	});
+
+	test(`JSX text (${seam}): a token in JSX text is coverage incomplete, never HARD; a JSX comment expression is HARD`, async () => {
+		const x = scratch();
+		try {
+			const sha = land(x.f, seam, () => write(x.f, "src/view.tsx", "export const note = <div>// @ts-ignore</div>;\n"));
+			let alerts = (await run(x)).alerts;
+			assert.deepEqual(summary(alerts), ["WARN coverage-incomplete"], JSON.stringify(alerts, null, 1));
+			assert.equal(alerts[0].evidence[0], `${seamLabel(seam, sha)} "src/view.tsx":1: @ts-ignore in syntax the lexer cannot classify`);
+			land(x.f, seam, () => write(x.f, "src/view.tsx", "export const note = <div>{/* eslint-disable */}</div>;\n"));
+			alerts = (await run(x)).alerts;
+			assert.ok(summary(alerts).includes("HARD suppression-comment"), JSON.stringify(alerts, null, 1));
+			assert.ok(alerts.some((a) => a.level === "HARD" && a.evidence[0].endsWith(`"src/view.tsx":1: eslint-disable`)));
+		} finally { x.f.close(); }
+	});
+}
+
+test("ambiguous slash after a block is coverage incomplete, never HARD", async () => {
+	const x = scratch();
+	try {
+		append(x.f, "src/a.ts", "{ }\n/[/* eslint-disable */]/.test(\"x\");");
+		const { alerts } = await run(x);
+		assert.deepEqual(summary(alerts), ["WARN coverage-incomplete"], JSON.stringify(alerts, null, 1));
+	} finally { x.f.close(); }
+});
+
 // ---- Injection cases 10-11: focused or skipped tests ----
 
 for (const [name, line, call] of [["test-skip", "describe.skip(\"later\", () => {});", ".skip("], ["test-only", "it.only(\"focus\", () => {});", ".only("]] as const) {
@@ -140,11 +179,54 @@ for (const seam of SEAMS) {
 	});
 }
 
-test("test-focus in a new test discovered by testRegex in a non-JS language is HARD", async () => {
-	const x = scratch({ scope: { testRegex: "^spec/.*_spec\\.rb$" } });
+// Review fix round 1, finding 2: raw text in a test language without a lexer
+// cannot prove a call. A possible call is WARN coverage-incomplete, never HARD.
+for (const seam of SEAMS) {
+	test(`non-JS tests (${seam}): focus text without code evidence is coverage incomplete, not HARD`, async () => {
+		const x = scratch({ scope: { testRegex: "^.*_spec\\.rb$" } });
+		try {
+			write(x.f, "spec/a_spec.rb", "describe \"a\" do\nend\n");
+			x.f.commit("ruby spec", T("09:40"));
+			land(x.f, seam, () => append(x.f, "spec/a_spec.rb", "example = \"describe.only( is not a call\"\n# it.skip( was removed\nputs 1"));
+			const { alerts } = await run(x);
+			assert.deepEqual(summary(alerts), ["WARN coverage-incomplete", "WARN coverage-incomplete"], JSON.stringify(alerts, null, 1));
+			assert.match(alerts[0].evidence[0], /"spec\/a_spec\.rb":3: \.only\( in a test language without code evidence$/);
+			assert.equal(alerts[0].evidence[1], "rules not checked: test-focus");
+			assert.match(alerts[1].evidence[0], /"spec\/a_spec\.rb":4: \.skip\(/);
+		} finally { x.f.close(); }
+	});
+}
+
+test("non-JS tests: added lines without focus text raise nothing", async () => {
+	const x = scratch({ scope: { testRegex: "^.*_spec\\.rb$" } });
 	try {
-		write(x.f, "spec/a_spec.rb", "describe.only(\"x\") do\nend\n");
-		await expectHard(x, "worktree", null, "test-focus");
+		write(x.f, "spec/a_spec.rb", "describe \"a\" do\n  it \"works\" do\n  end\nend\n");
+		assert.deepEqual(summary((await run(x)).alerts), []);
+	} finally { x.f.close(); }
+});
+
+// Review fix round 1, finding 3: whitespace between member and call may cross lines.
+for (const [name, text, call, line] of [["multiline-only", "it.only\n(\"focus\", () => {});", ".only(", 3], ["multiline-skip", "describe\n  .skip\n  (\"later\", () => {});", ".skip(", 4]] as const) {
+	for (const seam of SEAMS) {
+		test(`${name} (${seam}): a focus call split across lines is HARD`, async () => {
+			const x = scratch();
+			try {
+				const sha = land(x.f, seam, () => append(x.f, "tests/a.test.ts", text));
+				const alert = await expectHard(x, seam, sha, "test-focus");
+				assert.ok(alert.evidence[0].endsWith(`"tests/a.test.ts":${line}: ${call}`), alert.evidence[0]);
+			} finally { x.f.close(); }
+		});
+	}
+}
+
+test("multiline focus: a call completed by an added line on an existing member is HARD", async () => {
+	const x = scratch();
+	try {
+		write(x.f, "tests/b.test.ts", "import { it } from \"node:test\";\nit.only\n");
+		x.f.commit("dangling member", T("09:40"));
+		const sha = land(x.f, "commit", () => append(x.f, "tests/b.test.ts", "(\"x\", () => {});"));
+		const alert = await expectHard(x, "commit", sha, "test-focus");
+		assert.ok(alert.evidence[0].endsWith(`"tests/b.test.ts":2: .only(`), alert.evidence[0]);
 	} finally { x.f.close(); }
 });
 
@@ -343,6 +425,64 @@ test("torn observation: a violation written during the read gives a retry, not H
 		assert.deepEqual(summary(alerts), ["HARD suppression-comment"]);
 	} finally { await reader.close(); x.f.close(); }
 });
+
+// Review fix round 1, finding 4: any concurrent source makes the observation torn.
+test("relaunch during the read: a rewritten loop.md gives a retry, not HARD with a null run key", async () => {
+	const x = scratch();
+	x.f.state(false, T("09:45"), "run-a");
+	const reader = openLoop(x.f.root, { runtime: midRead(() => x.f.state(true, T("10:20"), "run-b")) });
+	try {
+		append(x.f, "src/a.ts", "// @ts-ignore");
+		let s = await reader.read();
+		let alerts = evaluate(s, s.mission!, x.launch);
+		assert.deepEqual(summary(alerts), ["WARN observation-retry"], JSON.stringify(alerts, null, 1));
+		assert.match(alerts[0].evidence.join("\n"), /^state: /m);
+		s = await reader.read();
+		alerts = evaluate(s, s.mission!, x.launch);
+		assert.deepEqual(summary(alerts), ["HARD suppression-comment"]);
+		assert.equal(alerts[0].run.loopToken, "run-b");
+	} finally { await reader.close(); x.f.close(); }
+});
+
+// Review fix round 1, finding 5: an A-to-B-to-A edit during evidence collection.
+const CLEAN = "export const a = 1;\nexport const d = 4;\n";
+const DIRTY = "export const a = 1;\n// @ts-ignore\n";
+for (const kind of ["dirty tracked", "untracked"] as const) {
+	test(`A-B-A (${kind}): a temporary violation restored before the second stamp gives a retry, not HARD`, async () => {
+		const x = scratch();
+		const rel = kind === "untracked" ? "src/new.ts" : "src/a.ts";
+		const full = path.join(x.f.root, rel);
+		write(x.f, rel, CLEAN);
+		const base = clock();
+		let armed = true;
+		const flip = async <T>(read: () => Promise<T>): Promise<T> => {
+			armed = false;
+			writeFileSync(full, DIRTY);
+			try { return await read(); } finally { writeFileSync(full, CLEAN); }
+		};
+		const runtime: ObservationRuntime = {
+			...base,
+			git(root, args, signal) {
+				const worktreeDiff = args[1] === "diff" && args.at(-1) === rel && args[args.indexOf("--") - 1] === "--no-renames";
+				return armed && kind !== "untracked" && worktreeDiff ? flip(() => base.git(root, args, signal)) : base.git(root, args, signal);
+			},
+			readRange(file, start, end) {
+				return armed && kind === "untracked" && file === full ? flip(() => base.readRange(file, start, end)) : base.readRange(file, start, end);
+			},
+		};
+		const reader = openLoop(x.f.root, { runtime });
+		try {
+			// Warm the untracked file's stamp read so the flip lands in the evidence read, not the git stamp.
+			if (kind === "untracked") { armed = false; await reader.read(); armed = true; }
+			let s = await reader.read();
+			assert.equal(armed, false, "the flip ran");
+			let alerts = evaluate(s, s.mission!, x.launch);
+			assert.deepEqual(summary(alerts), ["WARN observation-retry"], JSON.stringify(alerts, null, 1));
+			s = await reader.read();
+			assert.deepEqual(evaluate(s, s.mission!, x.launch), []);
+		} finally { await reader.close(); x.f.close(); }
+	});
+}
 
 test("incomplete: an unreadable index seam is coverage incomplete, and other seams still raise", async () => {
 	const x = scratch();

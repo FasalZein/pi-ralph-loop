@@ -195,13 +195,6 @@ export type GitObservation = {
 	readonly commits: readonly CommitEvent[] | null;
 };
 
-/** An added line on the new side of a change. `lexed` is null outside JS/TS files. */
-export type AddedLine = {
-	readonly line: number;
-	readonly text: string;
-	readonly lexed: import("./content.js").LexedLine | null;
-};
-
 /**
  * One changed path in a seam. `skipped`: no generic rule reads this file's
  * content (not JS/TS and not a discovered test). `unavailable`: content needed
@@ -211,7 +204,15 @@ export type FileChange = {
 	readonly path: string;
 	readonly status: "A" | "M" | "D" | "T" | "U";
 	readonly content:
-		| { readonly kind: "lines"; readonly added: readonly AddedLine[] }
+		| {
+			readonly kind: "lines";
+			/** Every line of the new side, so a construct may span into context lines. */
+			readonly lines: readonly string[];
+			/** 1-based numbers of the added lines, ascending. */
+			readonly added: readonly number[];
+			/** Per line, for JS/TS files only. */
+			readonly lexed: readonly import("./content.js").LexedLine[] | null;
+		}
 		| { readonly kind: "skipped" }
 		| { readonly kind: "unavailable"; readonly reason: string };
 };

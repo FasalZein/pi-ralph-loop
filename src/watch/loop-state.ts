@@ -10,13 +10,13 @@ import type { BundleItem } from "../bundle/types.js";
 import { readStateDocument } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
-import { isJsTs, isTestPath, lexLines } from "./content.js";
+import { allowsJsx, isJsTs, isTestPath, lexLines } from "./content.js";
 import { parseJournal } from "./journal.js";
 import { deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
-	AddedLine, CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
+	CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
 	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
 } from "./types.js";
 
@@ -565,7 +565,8 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		}
 		const indexPath = path.resolve(root, (await rt.git(root, ["rev-parse", "--git-path", "index"], signal)).trim());
 		const indexStamp = await rt.stat(indexPath);
-		const index = indexStamp ? sha256(await rt.readRange(indexPath, 0)) : "absent";
+		// The index version is part of the stamp: a staged A-to-B-to-A edit in the window is a change.
+		const index = indexStamp ? [sha256(await rt.readRange(indexPath, 0)), indexStamp.ino, indexStamp.size, String(indexStamp.mtimeNs)] : "absent";
 		const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl"))].sort();
 		const content: string[] = [];
 		for (const rel of dirty) {
@@ -675,7 +676,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 
 	/** Base flags for every content diff: no external diff, textconv, colour or rename pairing. */
 	const DIFF = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-renames"];
-	// Unified context that carries the whole new file: JS/TS lexing needs every line.
+	// Unified context that carries the whole new file: lexing and calls that span lines need every line.
 	const WHOLE_FILE_CONTEXT = "-U2147483647";
 	let emptyTree: string | null = null;
 	const STATUSES = new Set(["A", "M", "D", "T", "U"]);
@@ -683,12 +684,18 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	/** Generic rules read content of JS/TS files and discovered tests only. */
 	const scanned = (rel: string) => isJsTs(rel) || isTestPath(mission, rel);
 
-	/** Added lines of one path from a single-path unified diff; hunk headers carry the new-side line numbers. */
+	/** New-side content of one path from a single-path whole-file diff. */
 	async function diffContent(range: readonly string[], rel: string, signal: AbortSignal): Promise<FileChange["content"]> {
-		const jsTs = isJsTs(rel);
-		const out = await rt.git(root, ["--literal-pathspecs", "diff", jsTs ? WHOLE_FILE_CONTEXT : "-U0", ...DIFF, ...range, "--", rel], signal);
+		const diff = () => rt.git(root, ["--literal-pathspecs", "diff", WHOLE_FILE_CONTEXT, ...DIFF, ...range, "--", rel], signal);
+		// An empty range compares the index with the live worktree file.
+		const out = range.length === 0 ? await liveRead(path.join(root, rel), diff) : await diff();
+		return parseDiff(rel, out);
+	}
+
+	/** Hunk headers carry the new-side line numbers; context and added rows give every new-side line. */
+	function parseDiff(rel: string, out: string): FileChange["content"] {
 		const rows = out.split("\n");
-		const added: { line: number; text: string }[] = [];
+		const added: number[] = [];
 		const lines: string[] = [];
 		let hunk = false;
 		let seenHunk = false;
@@ -697,13 +704,17 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
 			if (header) { hunk = seenHunk = true; n = Number(header[1]); continue; }
 			if (!hunk) continue;
-			if (row.startsWith("+")) { added.push({ line: n, text: row.slice(1) }); lines[n - 1] = row.slice(1); n++; }
+			if (row.startsWith("+")) { added.push(n); lines[n - 1] = row.slice(1); n++; }
 			else if (row.startsWith(" ")) { lines[n - 1] = row.slice(1); n++; }
 			else if (!row.startsWith("-") && !row.startsWith("\\")) hunk = false;
 		}
 		if (!seenHunk && rows.some((row) => row.startsWith("Binary files ") || row === "GIT binary patch")) return { kind: "unavailable", reason: "binary" };
-		const lexed = jsTs ? lexLines(lines.join("\n")) : null;
-		return { kind: "lines", added: added.map((a): AddedLine => ({ ...a, lexed: lexed?.[a.line - 1] ?? null })) };
+		return textContent(rel, lines, added);
+	}
+
+	function textContent(rel: string, sparse: readonly string[], added: readonly number[]): FileChange["content"] {
+		const lines = Array.from(sparse, (line) => line ?? "");
+		return { kind: "lines", lines, added, lexed: isJsTs(rel) ? lexLines(lines.join("\n"), allowsJsx(rel)) : null };
 	}
 
 	async function seam(range: readonly string[], signal: AbortSignal): Promise<FileChange[]> {
@@ -730,20 +741,44 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			const full = path.join(root, rel);
 			const info = await lstat(full);
 			if (!info.isFile()) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "not a regular file" } }); continue; }
-			const bytes = await rt.readRange(full, 0);
+			const bytes = await liveRead(full, () => rt.readRange(full, 0));
 			// Git's own heuristic: a NUL in the first 8000 bytes means binary.
 			if (bytes.subarray(0, 8000).includes(0)) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "binary" } }); continue; }
 			const text = bytes.toString("utf8");
 			const rows = text.split("\n");
 			if (text.endsWith("\n")) rows.pop();
-			const lexed = isJsTs(rel) ? lexLines(text) : null;
-			changes.push({ path: rel, status: "A", content: { kind: "lines", added: rows.map((row, i) => ({ line: i + 1, text: row, lexed: lexed?.[i] ?? null })) } });
+			changes.push({ path: rel, status: "A", content: textContent(rel, rows, rows.map((_, i) => i + 1)) });
 		}
 		return changes;
 	}
 
+	/**
+	 * Version of every live worktree file whose content became evidence. The
+	 * content-hash stamp cannot see an A-to-B-to-A edit, so each live read is
+	 * bracketed by file stamps and rechecked at the end of the window.
+	 */
+	let liveReads = new Map<string, FileStamp | null>();
+	let liveRaced = false;
+	async function liveRead<T>(full: string, read: () => Promise<T>): Promise<T> {
+		const before = await rt.stat(full);
+		const value = await read();
+		if (!sameFile(before, await rt.stat(full))) liveRaced = true;
+		const seen = liveReads.get(full);
+		if (seen !== undefined && !sameFile(seen, before)) liveRaced = true;
+		liveReads.set(full, before);
+		return value;
+	}
+	/** True when a live content read raced a write, or a file changed after it was read. */
+	async function liveEvidenceChanged(): Promise<boolean> {
+		if (liveRaced) return true;
+		for (const [full, stamp] of liveReads) if (!sameFile(stamp, await rt.stat(full))) return true;
+		return false;
+	}
+
 	const commitEvidence = new Map<string, SeamEvidence>();
 	async function readEvidence(history: Result<readonly CommitEvent[]>, baseAncestor: boolean | null, signal: AbortSignal): Promise<ContentEvidence> {
+		liveReads = new Map();
+		liveRaced = false;
 		const attempt = async (read: () => Promise<FileChange[]>): Promise<SeamEvidence> => {
 			try {
 				return { status: "fresh", changes: await read() };
@@ -815,7 +850,18 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 					issues.push({ source: "git", kind: "unavailable", detail });
 					git = unavailable(detail);
 				}
-				if (after && after.digest !== before.digest) {
+				let changed = !!after && after.digest !== before.digest;
+				if (after && !changed) {
+					try {
+						changed = await liveEvidenceChanged();
+					} catch (error) {
+						if (signal.aborted) throw error;
+						const detail = `live evidence recheck failed: ${message(error)}`;
+						issues.push({ source: "git", kind: "unavailable", detail });
+						git = unavailable(detail);
+					}
+				}
+				if (changed) {
 					// No tight retry loop: the next read retries and publishes one coherent result.
 					const detail = "HEAD, index or worktree changed during read; retry next poll";
 					issues.push({ source: "git", kind: "concurrent", detail });
