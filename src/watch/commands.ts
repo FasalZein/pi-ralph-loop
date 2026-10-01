@@ -2,16 +2,15 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isLoopOwnerActive } from "../loop/ownership.js";
 import { readStateDocument } from "../state.js";
 import { loadMission } from "./config.js";
-import { connectEvents, controlLoop, fifoGate, isTerminal, releaseLaunch, runDriver, TERMINAL_POLL_MS, type DriverExit, type DriverRuntime, type LaunchMode } from "./driver.js";
+import { activeOwnerConflict, connectEvents, controlLoop, fifoGate, isTerminal, releaseLaunch, runDriver, TERMINAL_POLL_MS, type DriverExit, type DriverRuntime, type LaunchMode } from "./driver.js";
 import { readHostRecord, removeHostRecord, writeHostRecord, type Host, type HostHandle } from "./host.js";
 import { tmuxHost } from "./hosts/tmux.js";
 import { object } from "./journal.js";
 import { openLoop } from "./loop-state.js";
 import { acquireLock, ControlError, isAlive, readMetadata } from "./transport.js";
-import type { EventFrame, LoopSnapshot, RunKey } from "./types.js";
+import type { EventFrame, LoopReader, LoopSnapshot, RunKey } from "./types.js";
 
 /** Owner decisions on #10. */
 export const LAUNCH_READY_TIMEOUT_MS = 30_000;
@@ -83,10 +82,9 @@ function preflight(root: string, mode: LaunchMode): void {
 		if (!Number.isSafeInteger(pid) || pid <= 0 || isAlive(pid)) throw new Error(`A driver is active (${lock})`);
 	}
 	try { readMetadata(root); throw new Error("A driver is active (driver.json)"); } catch (error) { if (!(error instanceof ControlError)) throw error; }
+	const conflict = activeOwnerConflict(root);
+	if (conflict) throw new Error(conflict);
 	const document = readStateDocument(root);
-	if (document.status === "partial") throw new Error(`Loop state is incomplete (${document.reason}); it cannot authorize a launch`);
-	// A foreign session identity: any live owner, including legacy session-file evidence, blocks.
-	if (document.status === "valid" && document.state.running && isLoopOwnerActive(document.state, `ralph-launch-${randomUUID()}`)) throw new Error("A Ralph loop is running with a live owner");
 	if (mode === "resume") {
 		if (document.status !== "valid") throw new Error("No resumable loop state in .ralph/loop.md");
 		const state = document.state;
@@ -95,17 +93,16 @@ function preflight(root: string, mode: LaunchMode): void {
 	}
 }
 
-async function waitReady(root: string, launchId: string, host: Host, handle: HostHandle, until: number, signal?: AbortSignal): Promise<void> {
+async function waitReady(root: string, launchId: string, host: Host, handle: HostHandle, signal: AbortSignal): Promise<void> {
 	while (true) {
-		if (signal?.aborted) throw signal.reason;
+		if (signal.aborted) throw signal.reason;
 		try {
 			const metadata = readMetadata(root);
 			if (metadata.launchId !== launchId) throw new Error("Another driver owns this root");
 			return;
 		} catch (error) { if (!(error instanceof ControlError)) throw error; }
-		if (await host.paneDead(handle)) throw new Error("Driver role exited before it was ready");
-		if (Date.now() >= until) throw new Error(`Driver not ready within ${LAUNCH_READY_TIMEOUT_MS / 1000} s`);
-		await sleep(Math.min(READY_POLL_MS, Math.max(0, until - Date.now())), signal);
+		if (await host.paneDead(handle, signal)) { if (signal.aborted) throw signal.reason; throw new Error("Driver role exited before it was ready"); }
+		await sleep(READY_POLL_MS, signal);
 	}
 }
 
@@ -125,6 +122,25 @@ async function waitConfirmed(frames: AsyncIterator<EventFrame>, signal: AbortSig
 	}
 }
 
+/**
+ * A host record left by natural completion or a crash must not block the next
+ * launch. Preflight already proved that no driver and no live owner exist; the
+ * old session closes only when it verifies and its role has exited. A live or
+ * uncertain session is refused.
+ */
+async function recoverInactiveHost(root: string, host: Host, signal: AbortSignal): Promise<void> {
+	const previous = readHostRecord(root);
+	if (!previous) return;
+	if (await host.verify(previous, signal)) {
+		if (!await host.paneDead(previous, signal)) throw new Error(`tmux session ${previous.name} (${previous.sessionId}) of launch ${previous.launchId} still runs a process; inspect or close it first`);
+		if (signal.aborted) throw signal.reason;
+		await host.close(previous);
+	}
+	removeHostRecord(root, previous.launchId);
+	const manifest = manifestPath(root, previous.launchId);
+	if (existsSync(manifest)) unlinkSync(manifest);
+}
+
 async function launch(request: Extract<Request, { kind: "launch" }>, runtime: CommandRuntime): Promise<Outcome> {
 	const err = runtime.err ?? console.error;
 	const mission = await loadMission(request.root);
@@ -140,15 +156,24 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 		const manifest = writeManifest({ v: 1, launchId, root, mode: request.mode, configHash: mission.configHash });
 		const env = runtime.env ?? process.env;
 		const blocked = [...new Set(["ask_user", ...[env.RALPH_BLOCKED_TOOLS, env.RALPH_EXTRA_BLOCKED_TOOLS].flatMap((list) => (list ?? "").split(",")).map((tool) => tool.trim()).filter(Boolean)])].join(",");
-		const readyUntil = Date.now() + (runtime.readyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS);
-		handle = await host.open(root, launchId, { title: "loop", argv: (runtime.driverArgv ?? defaultDriverArgv)(manifest), env: { PATH: env.PATH ?? "", PI_SUBAGENT_MUX: "tmux", RALPH_BLOCKED_TOOLS: blocked } });
-		writeHostRecord(handle);
-		err(`ralph: waiting for driver in tmux session ${handle.name} (${handle.sessionId})`);
-		try { await waitReady(root, launchId, host, handle, readyUntil, runtime.signal); }
-		catch (error) {
+		const readyMs = runtime.readyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS;
+		// One absolute readiness deadline covers host startup and the driver's ready metadata.
+		const ready = deadline(readyMs, runtime.signal);
+		const notReady = () => runtime.signal?.aborted ? new Error("Launch aborted before dispatch") : new Error(`Driver not ready within ${readyMs / 1000} s`);
+		try {
+			await recoverInactiveHost(root, host, ready);
+			handle = await host.open(root, launchId, { title: "loop", argv: (runtime.driverArgv ?? defaultDriverArgv)(manifest), env: { PATH: env.PATH ?? "", PI_SUBAGENT_MUX: "tmux", RALPH_BLOCKED_TOOLS: blocked } }, ready);
+		} catch (error) { if (existsSync(manifest)) unlinkSync(manifest); throw ready.aborted ? notReady() : error; }
+		try {
+			writeHostRecord(handle);
+			err(`ralph: waiting for driver in tmux session ${handle.name} (${handle.sessionId})`);
+			await waitReady(root, launchId, host, handle, ready);
+		} catch (error) {
 			// Nothing was dispatched: the unused session holds no loop.
-			if (await host.verify(handle)) { await host.close(handle); removeHostRecord(root, launchId); if (existsSync(manifest)) unlinkSync(manifest); }
-			throw error;
+			if (await host.verify(handle)) await host.close(handle);
+			removeHostRecord(root, launchId);
+			if (existsSync(manifest)) unlinkSync(manifest);
+			throw ready.aborted ? notReady() : error;
 		}
 		const watch = new AbortController();
 		const frames = connectEvents({ root, run: { launchId, loopToken: null, startedAt: null } }, watch.signal)[Symbol.asyncIterator]();
@@ -156,7 +181,7 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 			const first = frames.next();
 			// From here the go command may reach the driver: failure must stop gracefully, never close.
 			dispatched = true;
-			await releaseLaunch({ root, launchId }, deadline(Math.max(1, readyUntil - Date.now()), runtime.signal));
+			await releaseLaunch({ root, launchId }, ready);
 			const factDeadline = deadline(runtime.factTimeoutMs ?? LAUNCH_FACT_TIMEOUT_MS, runtime.signal);
 			const onDeadline = () => watch.abort();
 			factDeadline.addEventListener("abort", onDeadline, { once: true });
@@ -198,44 +223,87 @@ async function stop(request: Extract<Request, { kind: "stop" }>, runtime: Comman
 		throw new Error(`Stop failed: ${message(error)}`);
 	}
 	if (receipt.phase === "sent") throw new Error(`No stop acknowledgement within ${ackMs / 1000} s; the stop may already have been sent`);
-	err(`ralph: stop ${receipt.phase}; waiting for running=false`);
-	// Without a fact the loop is pinned by the first fresh state seen after the acknowledgement.
-	let loop = receipt.run.loopToken && receipt.run.startedAt ? { token: receipt.run.loopToken, startedAt: receipt.run.startedAt } : null;
 	const wait = request.timeoutMs === null ? runtime.signal : deadline(request.timeoutMs, runtime.signal);
-	const reader = openLoop(root);
 	const started = Date.now();
+	const waited = () => `${Math.round((Date.now() - started) / 1000)} s`;
+	const stillStopping = () => new Error(`Loop still stopping after ${waited()}; the host was left open`);
+	const host = runtime.host ?? tmuxHost({ env: runtime.env });
+	const poll = () => sleep(runtime.pollMs ?? TERMINAL_POLL_MS, wait).catch(() => {});
+	/** Wait for the driver role to exit so the session holds no process when it closes. */
+	async function roleExited(handle: HostHandle): Promise<void> {
+		while (!await host.paneDead(handle, wait)) {
+			if (wait?.aborted) throw stillStopping();
+			err(`ralph: loop stopped; waiting for the driver to exit; waited ${waited()}`);
+			await poll();
+		}
+		if (wait?.aborted) throw stillStopping();
+	}
+	if (receipt.phase === "completed" && receipt.reason === "not-launched") {
+		// Stopped before dispatch: the driver closes its idle pi and no loop ever ran in this session.
+		err("ralph: stopped before launch");
+		const handle = readHostRecord(root);
+		if (!handle || handle.launchId !== launchId) return { ok: true, handle: null };
+		await roleExited(handle);
+		if (!await host.verify(handle)) throw new Error(`tmux session ${handle.sessionId} no longer matches this launch; left open`);
+		await host.close(handle);
+		forget(root, launchId);
+		return { ok: true, handle };
+	}
+	err(`ralph: stop ${receipt.phase}; waiting for running=false`);
+	// Terminal proof needs this launch's loop identity, which only its own facts provide.
+	let loop = receipt.run.loopToken && receipt.run.startedAt ? { token: receipt.run.loopToken, startedAt: receipt.run.startedAt } : null;
+	const reader = openLoop(root);
 	let driverGone = false;
 	try {
 		while (true) {
-			if (wait?.aborted) throw new Error(`Loop still stopping after ${Math.round((Date.now() - started) / 1000)} s; the host was left open`);
+			if (wait?.aborted) throw stillStopping();
+			loop ??= await driverLoop(root, launchId, wait);
 			let snapshot: LoopSnapshot;
 			try { snapshot = await reader.read(wait); }
 			catch (error) { if (wait?.aborted) continue; throw error; }
-			if (!loop && snapshot.state && snapshot.sources.state.status === "fresh") loop = { token: snapshot.state.loop_token, startedAt: snapshot.state.started_at };
 			if (loop && isTerminal(snapshot, loop)) break;
 			// The managed driver exits only after terminal proof or pi exit; allow one more read for teardown order.
 			let live = true;
 			try { live = readMetadata(root).launchId === launchId; } catch { live = false; }
-			if (!live && driverGone) throw new Error("Driver exited while the loop state is not terminal; the host was left open");
+			if (!live && driverGone) throw new Error(loop ? "Driver exited while the loop state is not terminal; the host was left open" : "Driver exited before this launch reported its loop; the stop cannot be proven and the host was left open");
 			driverGone = !live;
-			err(progress(snapshot, Date.now() - started));
-			try { await sleep(runtime.pollMs ?? TERMINAL_POLL_MS, wait); } catch { /* checked at loop start */ }
+			err(loop ? progress(snapshot, Date.now() - started) : `ralph: stopping; waiting for this launch's first loop fact; waited ${waited()}`);
+			await poll();
 		}
 		const handle = readHostRecord(root);
 		if (!handle || handle.launchId !== launchId) return { ok: true, handle: null };
-		const host = runtime.host ?? tmuxHost({ env: runtime.env });
-		// Re-read immediately before closing: a new run on this root must not lose its session.
-		const again = await reader.read(runtime.signal);
-		if (!loop || !isTerminal(again, loop) || readHostRecord(root)?.launchId !== launchId) throw new Error("Loop state changed after stop; the host was left open");
-		if (!await host.verify(handle)) throw new Error(`tmux session ${handle.sessionId} no longer matches this launch; left open`);
-		// Let the driver finish its own teardown (it closes pi after the same proof) before the session goes.
-		for (const until = Date.now() + (runtime.stopAckTimeoutMs ?? STOP_ACK_TIMEOUT_MS); !await host.paneDead(handle) && Date.now() < until;) await sleep(READY_POLL_MS);
-		await host.close(handle);
-		removeHostRecord(root, launchId);
-		const manifest = manifestPath(root, launchId);
-		if (existsSync(manifest)) unlinkSync(manifest);
+		await roleExited(handle);
+		await closeIdle(host, handle, reader, loop);
+		forget(root, launchId);
 		return { ok: true, handle };
 	} finally { await reader.close(); }
+}
+
+/** This launch's loop identity from the live driver, or null while it has none or is gone. */
+async function driverLoop(root: string, launchId: string, signal?: AbortSignal): Promise<{ token: string; startedAt: string } | null> {
+	try {
+		for await (const frame of connectEvents({ root, run: { launchId, loopToken: null, startedAt: null } }, signal)) {
+			return frame.type === "hello" && frame.loop ? { token: frame.loop.token, startedAt: frame.loop.startedAt } : null;
+		}
+	} catch { /* Driver gone or changed: no identity. */ }
+	return null;
+}
+
+/**
+ * Guarded idle close: a new fresh read, at the close boundary, must show this
+ * launch's loop stopped, and the host record and session must still be this launch's.
+ */
+async function closeIdle(host: Host, handle: HostHandle, reader: LoopReader, loop: { token: string; startedAt: string }): Promise<void> {
+	const snapshot = await reader.read();
+	if (!isTerminal(snapshot, loop) || readHostRecord(handle.root)?.launchId !== handle.launchId) throw new Error("Loop state changed after stop; the host was left open");
+	if (!await host.verify(handle)) throw new Error(`tmux session ${handle.sessionId} no longer matches this launch; left open`);
+	await host.close(handle);
+}
+
+function forget(root: string, launchId: string): void {
+	removeHostRecord(root, launchId);
+	const manifest = manifestPath(root, launchId);
+	if (existsSync(manifest)) unlinkSync(manifest);
 }
 
 /** Run one launch or stop request. Errors return `ok: false` with a message. */

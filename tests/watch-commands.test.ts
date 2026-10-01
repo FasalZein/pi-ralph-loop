@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,7 @@ import test from "node:test";
 import { execute, LAUNCH_READY_TIMEOUT_MS, STOP_ACK_TIMEOUT_MS } from "../src/watch/commands.ts";
 import { connectEvents, immediateGate, runDriver } from "../src/watch/driver.ts";
 import { loadMission } from "../src/watch/config.ts";
-import type { Host, HostHandle } from "../src/watch/host.ts";
+import { readHostRecord, writeHostRecord, type Host, type HostHandle } from "../src/watch/host.ts";
 import { writeState } from "../src/state.ts";
 import type { RalphLoopState } from "../src/types.ts";
 
@@ -24,16 +24,23 @@ function scratch(t: test.TestContext, mission = true, removeAfter = true): strin
 	return root;
 }
 /** Recording host: no tmux; records calls and scripts pane liveness. */
-function recordingHost(dead = false) {
+function recordingHost(dead: boolean | ((handle: HostHandle) => boolean) = false, openDelayMs = 0) {
 	const calls: string[] = [];
+	const closed: string[] = [];
 	const host: Host = {
-		async open(root, launchId) { calls.push("open"); return { v: 1, kind: "tmux", root, launchId, name: "n", socket: "/tmp/none", sessionId: "$9", windowId: "@9", paneId: "%9", createdAt: "x" } satisfies HostHandle; },
+		async open(root, launchId, _role, signal) {
+			calls.push("open");
+			// Honors the startup signal like the tmux adapter, which then removes its session.
+			if (openDelayMs) await new Promise<void>((resolve, reject) => { const timer = setTimeout(resolve, openDelayMs); signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true }); });
+			return { v: 1, kind: "tmux", root, launchId, name: "n", socket: "/tmp/none", sessionId: "$9", windowId: "@9", paneId: "%9", createdAt: "x" } satisfies HostHandle;
+		},
 		async verify() { calls.push("verify"); return true; },
-		async paneDead() { return dead; },
-		async close() { calls.push("close"); },
+		async paneDead(handle) { return typeof dead === "function" ? dead(handle) : dead; },
+		async close(handle) { calls.push("close"); closed.push(handle.launchId); },
 	};
-	return { host, calls };
+	return { host, calls, closed };
 }
+const handleFor = (root: string, launchId: string): HostHandle => ({ v: 1, kind: "tmux", root, launchId, name: "n", socket: "/tmp/none", sessionId: "$1", windowId: "@1", paneId: "%1", createdAt: "x" });
 function state(root: string, patch: Partial<RalphLoopState>): void {
 	writeState(root, { running: true, iteration: 1, max_iterations: 3, started_at: "2026-09-30T00:00:00.000Z", completed_at: null, stop_reason: null, session_id: "s", last_session_file: null, owner_pid: process.pid, owner_heartbeat_at: new Date().toISOString(), error_count: 0, transitioning: false, cancel_requested: false, stop_requested: false, bundle_mode: false, loop_token: "token", model_provider: null, model_id: null, thinking_level: null, bundle_snapshot_hash: null, items_snapshot_hash: null, progress_size: null, progress_hash: null, progress_snapshot: null, source_doc_hashes: null, bundle_items_snapshot: null, git_head: null, bundle_rejection_count: 0, provider_recovery_fresh_fallback_used: false, limit_reminders: null, ...patch }, "Do the task.");
 }
@@ -104,13 +111,23 @@ test("dead driver stop never writes state", async (t) => {
 	assert.deepEqual(calls, []);
 });
 
-async function driver(t: test.TestContext, root: string, scenario: unknown) {
+const piLog = (root: string) => join(root, "pi.log");
+async function driver(t: test.TestContext, root: string, scenario: unknown, until: "launched" | "dispatched" | "ready" = "launched", gate = immediateGate) {
 	const abort = new AbortController();
-	const result = runDriver({ mission: await loadMission(root), launchId: "launch", gate: immediateGate, lifecycle: "managed" }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fakePi] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario) }, signal: abort.signal, tmpDir: root, shutdownGraceMs: 100, terminalPollMs: 50, log: () => {} });
-	// Hooks run in order: the driver must exit before its root is removed.
-	t.after(async () => { abort.abort(); await result; rmSync(root, { recursive: true, force: true }); });
+	const result = runDriver({ mission: await loadMission(root), launchId: "launch", gate, lifecycle: "managed" }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fakePi] }, env: { ...process.env, FAKE_PI_SCENARIO: JSON.stringify(scenario), FAKE_PI_STDIN_LOG: piLog(root) }, signal: abort.signal, tmpDir: root, shutdownGraceMs: 100, terminalPollMs: 50, log: () => {} });
+	// Hooks run in order: the driver must exit before its root is removed. A managed
+	// driver without terminal proof keeps pi; ending this test's own fake pi ends it.
+	t.after(async () => {
+		abort.abort();
+		const pid = JSON.parse(readFileSync(piLog(root), "utf8").split("\n")[0]).pid;
+		const timer = setTimeout(() => { try { process.kill(pid, "SIGTERM"); } catch { /* gone */ } }, 500);
+		await result; clearTimeout(timer); rmSync(root, { recursive: true, force: true });
+	});
 	for (const end = Date.now() + 5000; ;) {
-		try { for await (const frame of connectEvents({ root })) { if (frame.type === "hello" && frame.state === "launched") return { result }; break; } } catch { /* not ready */ }
+		const prompted = existsSync(piLog(root)) && readFileSync(piLog(root), "utf8").includes('"type":"prompt"');
+		if (until === "dispatched" && prompted) return { result };
+		if (until === "ready" && existsSync(join(root, ".ralph/driver.json"))) return { result };
+		try { for await (const frame of connectEvents({ root })) { if (until === "launched" && frame.type === "hello" && frame.state === "launched") return { result }; break; } } catch { /* not ready */ }
 		if (Date.now() > end) throw new Error("driver did not launch");
 		await new Promise((r) => setTimeout(r, 20));
 	}
@@ -131,13 +148,102 @@ test("stop ack times out and a sent receipt is failure", async (t) => {
 
 test("stop accepted is not terminal; timeout bounds only the terminal wait and leaves the host", async (t) => {
 	const root = scratch(t, true, false);
-	await driver(t, root, { steps: [{ op: "state", running: true }, launchFact], stopSteps: [{ op: "state", running: true, stopRequested: true }, { op: "sleep", ms: 2000 }, { op: "exit", code: 0 }] });
+	await driver(t, root, { steps: [{ op: "state", running: true }, launchFact], stopSteps: [{ op: "state", running: true, stopRequested: true }, { op: "sleep", ms: 10000 }, { op: "exit", code: 0 }] });
 	const { host, calls } = recordingHost();
 	const lines: string[] = [];
-	const outcome = await execute({ kind: "stop", root, timeoutMs: 400 }, { host, pollMs: 50, err: (line) => lines.push(line) });
+	// The bound covers reads under suite load; pi stays running far longer, so the wait must time out.
+	const outcome = await execute({ kind: "stop", root, timeoutMs: 1500 }, { host, pollMs: 50, err: (line) => lines.push(line) });
 	assert.ok(!outcome.ok && /still stopping/.test(outcome.error), JSON.stringify(outcome));
 	assert.ok(lines.some((line) => /stop accepted/.test(line)));
 	assert.ok(lines.some((line) => /running=true, stop_requested=true/.test(line)));
 	assert.deepEqual(calls, []);
 	assert.ok(existsSync(join(root, ".ralph/driver.json")), "driver keeps running");
+});
+
+test("stop refuses closure when the run resumes during the cleanup wait (R2)", async (t) => {
+	const root = scratch(t, true, false);
+	await driver(t, root, { steps: [{ op: "state", running: true }, launchFact], stopSteps: [{ op: "state", running: false }] });
+	writeHostRecord(handleFor(root, "launch"));
+	let calls = 0;
+	// The same run resumes after the command saw running=false, before the role exits.
+	const { host, closed } = recordingHost(() => { if (++calls === 1) { state(root, { running: true }); return false; } return true; });
+	const outcome = await execute({ kind: "stop", root, timeoutMs: null }, { host, pollMs: 50, ...quiet });
+	assert.ok(!outcome.ok && /changed after stop/.test(outcome.error), JSON.stringify(outcome));
+	assert.deepEqual(closed, []);
+	assert.equal(readHostRecord(root)?.launchId, "launch");
+});
+
+test("stop without a launch fact never adopts a previous run's state (R3)", async (t) => {
+	const root = scratch(t, true, false);
+	state(root, { running: false, loop_token: "old-token", stop_reason: "manual_stop", owner_pid: null, owner_heartbeat_at: null });
+	await driver(t, root, {}, "dispatched");
+	writeHostRecord(handleFor(root, "launch"));
+	const { host, closed } = recordingHost(false);
+	const lines: string[] = [];
+	const outcome = await execute({ kind: "stop", root, timeoutMs: 1500 }, { host, pollMs: 50, stopAckTimeoutMs: 200, err: (line) => lines.push(line) });
+	assert.ok(!outcome.ok && /still stopping/.test(outcome.error), JSON.stringify(outcome));
+	assert.ok(lines.some((line) => /first loop fact/.test(line)), lines.join("\n"));
+	assert.deepEqual(closed, []);
+});
+
+test("stop before dispatch closes the unused session after the driver exits", async (t) => {
+	const root = scratch(t, true, false);
+	await driver(t, root, {}, "ready", () => new Promise<void>(() => {}));
+	writeHostRecord(handleFor(root, "launch"));
+	const { host, closed } = recordingHost(() => !existsSync(join(root, ".ralph/driver.json")));
+	const outcome = await execute({ kind: "stop", root, timeoutMs: null }, { host, pollMs: 50, ...quiet });
+	assert.ok(outcome.ok, JSON.stringify(outcome));
+	assert.deepEqual(closed, ["launch"]);
+	assert.equal(readHostRecord(root), null);
+});
+
+test("relaunch after natural completion recovers the inactive host record (R4)", async (t) => {
+	const root = scratch(t);
+	state(root, { running: false, stop_reason: "complete", owner_pid: null, owner_heartbeat_at: null });
+	writeHostRecord(handleFor(root, "old-launch"));
+	const { host, calls, closed } = recordingHost(true);
+	const outcome = await execute({ kind: "launch", root, mode: "relaunch" }, { host, ...quiet });
+	// No driver starts behind the recording host, so readiness fails after the recovery.
+	assert.ok(!outcome.ok && /exited before it was ready/.test(outcome.error), JSON.stringify(outcome));
+	assert.deepEqual(calls.slice(0, 3), ["verify", "close", "open"]);
+	assert.equal(closed[0], "old-launch");
+	assert.equal(readHostRecord(root), null);
+});
+
+test("launch refuses a previous session that still runs a process", async (t) => {
+	const root = scratch(t);
+	writeHostRecord(handleFor(root, "old-launch"));
+	const { host, calls } = recordingHost(false);
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host, ...quiet });
+	assert.ok(!outcome.ok && /still runs a process/.test(outcome.error), JSON.stringify(outcome));
+	assert.deepEqual(calls, ["verify"]);
+	assert.equal(readHostRecord(root)?.launchId, "old-launch");
+});
+
+test("launch readiness deadline bounds slow host startup (R6)", async (t) => {
+	const root = scratch(t);
+	const { host, calls } = recordingHost(false, 2000);
+	const started = Date.now();
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host, readyTimeoutMs: 100, ...quiet });
+	assert.ok(!outcome.ok && /not ready within 0.1 s/.test(outcome.error), JSON.stringify(outcome));
+	assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`);
+	assert.deepEqual(calls, ["open"]);
+	assert.equal(readdirSync(join(root, ".ralph")).filter((name) => name.startsWith("launch-")).length, 0, "manifest removed");
+});
+
+test("concurrent launches open one host", async (t) => {
+	const root = scratch(t);
+	const { host, calls } = recordingHost(true, 100);
+	const outcomes = await Promise.all([execute({ kind: "launch", root, mode: "fresh" }, { host, ...quiet }), execute({ kind: "launch", root, mode: "fresh" }, { host, ...quiet })]);
+	assert.equal(calls.filter((call) => call === "open").length, 1);
+	assert.ok(outcomes.some((outcome) => !outcome.ok && /Lock is active/.test(outcome.error)), JSON.stringify(outcomes));
+});
+
+test("resume refuses an exhausted budget", async (t) => {
+	const root = scratch(t);
+	state(root, { running: false, iteration: 4, max_iterations: 3, stop_reason: "max_iterations", owner_pid: null, owner_heartbeat_at: null });
+	const { host, calls } = recordingHost();
+	const outcome = await execute({ kind: "launch", root, mode: "resume" }, { host, ...quiet });
+	assert.ok(!outcome.ok && /past its iteration budget/.test(outcome.error), JSON.stringify(outcome));
+	assert.deepEqual(calls, []);
 });

@@ -8,6 +8,9 @@ import { FactTracker } from "./driver-facts.js";
 import { JournalWriter } from "./journal.js";
 import { PiRpc, RpcMonitor, PI_READY_TIMEOUT_MS, PI_SHUTDOWN_GRACE_MS } from "./rpc.js";
 import { acquireLock, ControlError, DriverError, ensureFifo, EventServer, LineServer, parseEventFrame, readFifo, readMetadata, socketPaths, writeFifo, writeMetadata, type Broadcast, type Envelope } from "./transport.js";
+import { randomUUID as foreignSession } from "node:crypto";
+import { isLoopOwnerActive } from "../loop/ownership.js";
+import { readStateDocument } from "../state.js";
 import { openLoop } from "./loop-state.js";
 import type { Control, DriverState, EventFrame, JournalRecord, LoopReader, LoopSnapshot, Mission, Receipt, RunKey } from "./types.js";
 
@@ -40,6 +43,17 @@ export type DriverRuntime = {
 };
 /** Approximate observer refresh cadence; a cadence, not a limit. */
 export const TERMINAL_POLL_MS = 2_000;
+/**
+ * Reason a launch must not dispatch: incomplete state, or a running loop with a
+ * live owner. Any owner is foreign before this launch dispatches, so a fresh
+ * session identity checks it, including legacy session-file evidence.
+ */
+export function activeOwnerConflict(root: string): string | null {
+	const document = readStateDocument(root);
+	if (document.status === "partial") return `Loop state is incomplete (${document.reason}); it cannot authorize a launch`;
+	if (document.status === "valid" && document.state.running && isLoopOwnerActive(document.state, `ralph-launch-${foreignSession()}`)) return "A Ralph loop is running with a live owner";
+	return null;
+}
 /** True only for fresh, valid state of the given loop with running=false. */
 export function isTerminal(snapshot: LoopSnapshot, loop: { readonly token: string; readonly startedAt: string }): boolean {
 	const state = snapshot.state;
@@ -147,7 +161,7 @@ async function sendControl(target: ControlTarget, command: Control | { kind: "go
 			if (next.value.type !== "ack" || next.value.id !== id) continue;
 			acknowledged = true;
 			if (next.value.phase === "rejected") throw new ControlError("rejected", next.value.reason ?? "Driver rejected control");
-			return { id, run, phase: next.value.phase };
+			return { id, run, phase: next.value.phase, ...(next.value.reason ? { reason: next.value.reason } : {}) };
 		}
 	} finally {
 		await iterator.return?.();
@@ -172,10 +186,11 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	const managed = spec.lifecycle === "managed";
 	const mode = spec.mode ?? "fresh";
 	let dispatched = false;
+	let piExited = false;
 	let failing = false;
 	let terminalPoll: ReturnType<typeof setTimeout> | undefined;
-	// After dispatch a managed driver never ends a possibly running loop by closing pi.
-	const onAbort = () => { if (managed && dispatched) failLaunch("driver aborted after dispatch"); else { abort.abort(); finish("aborted"); } };
+	// After dispatch a managed driver turns this into a graceful stop (see finish).
+	const onAbort = () => finish("aborted");
 	let rpc: PiRpc | null = null;
 	let fifo: Socket | null = null;
 	let events: EventServer | null = null;
@@ -191,8 +206,14 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 	let settleTimer: ReturnType<typeof setTimeout> | undefined;
 	let resolveExit!: (exit: DriverExit) => void;
 	const terminal = new Promise<DriverExit>((resolve) => { resolveExit = resolve; });
-	function finish(reason: DriverExit["reason"], code: number | null = null, detail: string | null = null): void {
+	/**
+	 * The only termination boundary. A managed driver that dispatched its launch
+	 * closes pi only after terminal proof or after pi itself exited; every other
+	 * failure route becomes a graceful stop that keeps control available.
+	 */
+	function finish(reason: DriverExit["reason"], code: number | null = null, detail: string | null = null, proven = false): void {
 		if (finished) return;
+		if (managed && dispatched && !proven && !piExited) { failLaunch(detail ?? reason); return; }
 		finished = true; resolveExit({ reason, code, detail }); abort.abort();
 	}
 	const base = () => ({ v: 1 as const, t: now().toISOString(), r: spec.launchId });
@@ -219,7 +240,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			try {
 				owned.reader ??= openLoop(root);
 				const snapshot = await owned.reader.read(abort.signal);
-				if (loop && isTerminal(snapshot, loop)) { finish(!failing ? "loop-finished" : launched ? "aborted" : "launch-rejected", null, failDetail); return; }
+				if (loop && isTerminal(snapshot, loop)) { finish(!failing ? "loop-finished" : launched ? "aborted" : "launch-rejected", null, failDetail, true); return; }
 			} catch (error) { if (!finished) log(`state: ${String(error)}`); }
 			if (!finished) terminalPoll = setTimeout(() => void poll(), runtime.terminalPollMs ?? TERMINAL_POLL_MS);
 		};
@@ -272,7 +293,7 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 		const blocked = [...new Set([...(env.RALPH_BLOCKED_TOOLS ?? "").split(",").map((tool) => tool.trim()).filter(Boolean), "ask_user"])].join(",");
 		const command = runtime.piCommand ?? { file: "pi", args: [] };
 		rpc = new PiRpc(command.file, [...command.args, "--mode", "rpc", "--model", spec.mission.run.model, "--thinking", spec.mission.run.thinking], { cwd: root, env: { ...env, [FACT_SOCKET_ENV]: paths.factSocket, [LAUNCH_ID_ENV]: spec.launchId, RALPH_BLOCKED_TOOLS: blocked } }, monitor, log, checkSettled);
-		void rpc.exited.then((code) => { driverFact("pi-exit", undefined, code); if (ready) events?.publish({ type: "lifecycle", state: "pi-exited", code }); finish(ready ? "pi-exited" : "pi-not-ready", code); });
+		void rpc.exited.then((code) => { piExited = true; driverFact("pi-exit", undefined, code); if (ready) events?.publish({ type: "lifecycle", state: "pi-exited", code }); finish(ready ? "pi-exited" : "pi-not-ready", code); });
 		runtime.signal?.addEventListener("abort", onAbort, { once: true });
 		if (runtime.signal?.aborted) onAbort();
 		let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -286,6 +307,9 @@ export async function runDriver(spec: LaunchSpec, runtime: DriverRuntime = {}): 
 			events.publish({ type: "lifecycle", state: "ready" }); driverFact("ready"); driverFact("gate-wait");
 			await Promise.race([spec.gate(abort.signal), terminal]).catch((error) => { if (!finished) finish("launch-rejected", null, String(error)); });
 		}
+		// The launcher checked the owner before startup; a loop can start while the driver waits at its gate.
+		const conflict = managed && !finished ? activeOwnerConflict(root) : null;
+		if (conflict) finish("launch-rejected", null, conflict);
 		if (!finished) {
 			if (spec.mission.task.kind === "plain" && /--max-iterations/i.test(spec.mission.task.prompt)) finish("launch-rejected", null, "Plain prompt contains reserved --max-iterations option");
 			else {

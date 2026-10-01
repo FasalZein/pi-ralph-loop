@@ -22,6 +22,8 @@ export type Receipt = {
 	readonly id: string;
 	readonly run: RunKey;
 	readonly phase: "sent" | "accepted" | "completed";
+	/** Driver's reason, e.g. `not-launched` when stop completed before dispatch. */
+	readonly reason?: string;
 };
 
 /** Evidence from a watch rule evaluation. */

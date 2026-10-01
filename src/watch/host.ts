@@ -19,11 +19,19 @@ export type HostHandle = {
 /** One role process. `argv` is passed to the host without a shell. */
 export type RoleSpec = { readonly title: "loop"; readonly argv: readonly string[]; readonly env: Readonly<Record<string, string>> };
 export type Host = {
-	open(root: string, launchId: string, role: RoleSpec): Promise<HostHandle>;
+	/**
+	 * Create the session and start the role. `signal` bounds startup; on any
+	 * failure or abort the adapter removes the session it created, which never
+	 * ran a loop, and rethrows.
+	 */
+	open(root: string, launchId: string, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle>;
 	/** True when the handle still names the same live session, pane, root and launch on the same server. */
-	verify(handle: HostHandle): Promise<boolean>;
-	paneDead(handle: HostHandle): Promise<boolean>;
-	/** Close the exact session. Callers prove the loop is idle first. */
+	verify(handle: HostHandle, signal?: AbortSignal): Promise<boolean>;
+	paneDead(handle: HostHandle, signal?: AbortSignal): Promise<boolean>;
+	/**
+	 * Close the exact session after it verifies. Callers authorize it: either
+	 * the role never dispatched a launch, or fresh state proves the loop idle.
+	 */
 	close(handle: HostHandle): Promise<void>;
 };
 

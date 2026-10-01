@@ -14,7 +14,7 @@ const roleFixture = fileURLToPath(new URL("./fixtures/driver-role.ts", import.me
 const available = spawnSync("tmux", ["-V"]).status === 0;
 const fact = (sequence: number, detail: Record<string, unknown>) => ({ op: "fact", envelope: { version: 1, id: String(sequence), sequence, fact: { run: { launchId: "$env", loopToken: "token", startedAt: "2026-09-30T00:00:00.000Z" }, iteration: 1, at: "2026-09-30T00:00:00.000Z", ...detail } } });
 
-test("scratch tmux launches fake-pi bundle and stop closes only exact idle session", { skip: available ? false : "tmux unavailable" }, async (t) => {
+for (const kind of ["plain", "bundle"] as const) test(`scratch tmux launches fake-pi ${kind} task and stop closes only exact idle session`, { skip: available ? false : "tmux unavailable" }, async (t) => {
 	// Isolated scratch server only; never the default server.
 	const server = `rw-t9-${process.pid}-${randomUUID().slice(0, 8)}`;
 	const tmux = (...args: string[]) => spawnSync("tmux", ["-L", server, ...args], { encoding: "utf8" });
@@ -36,7 +36,11 @@ test("scratch tmux launches fake-pi bundle and stop closes only exact idle sessi
 	execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], { cwd: root });
 	const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 	mkdirSync(join(root, ".ralph"));
-	writeFileSync(join(root, ".ralph/mission.json"), JSON.stringify({ version: 1, task: { kind: "plain", prompt: "Do it; echo $HOME 'quoted' && true" }, run: { model: "test-model", thinking: "high", maxIterations: 3, budgetAuthority: "Test" }, git: { baseCommit: sha }, rules: {}, host: { prefer: ["tmux"] } }));
+	if (kind === "bundle") {
+		for (const name of ["plan", "prompt", "progress"]) writeFileSync(join(root, `.ralph/${name}.md`), name);
+		writeFileSync(join(root, ".ralph/items.json"), JSON.stringify({ version: 1, items: [{ id: "first", title: "First", category: "feature", description: "Do first", steps: ["verify"], passes: false, regression_notes: "" }] }));
+	}
+	writeFileSync(join(root, ".ralph/mission.json"), JSON.stringify({ version: 1, task: kind === "bundle" ? { kind: "bundle" } : { kind: "plain", prompt: "Do it; echo $HOME 'quoted' && true" }, run: { model: "test-model", thinking: "high", maxIterations: 3, budgetAuthority: "Test" }, git: { baseCommit: sha }, rules: {}, host: { prefer: ["tmux"] } }));
 	const scenario = join(root, "scenario.json");
 	writeFileSync(scenario, JSON.stringify({
 		steps: [{ op: "state", running: true }, fact(1, { kind: "iteration-start", phase: "initialized" }), { op: "emit", record: { type: "agent_start" } }],
@@ -57,7 +61,7 @@ test("scratch tmux launches fake-pi bundle and stop closes only exact idle sessi
 	assert.deepEqual(records[0].env.herdr, [], "caller and server HERDR variables are cleared");
 	assert.equal(records[0].env.PI_SUBAGENT_MUX, "tmux");
 	assert.equal(records[0].env.RALPH_WATCH_LAUNCH_ID, handle.launchId);
-	assert.equal(records.find((r) => r.type === "prompt")?.message, "/ralph-loop Do it; echo $HOME 'quoted' && true --max-iterations=3");
+	assert.equal(records.find((r) => r.type === "prompt")?.message, kind === "bundle" ? '/ralph-loop "@.ralph/prompt.md" --max-iterations=3' : "/ralph-loop Do it; echo $HOME 'quoted' && true --max-iterations=3");
 	assert.equal(tmux("show-options", "-w", "-t", handle.windowId, "-v", "remain-on-exit").stdout.trim(), "on");
 	const document = readStateDocument(root);
 	assert.ok(document.status === "valid" && document.state.running);
@@ -125,4 +129,33 @@ test("same-basename roots receive independent names; close rejects wrong socket,
 		assert.equal(calls.some((call) => call.args.includes("kill-session")), closes);
 		if (closes) assert.deepEqual(calls.at(-1)!.args, ["-S", "/s", "kill-session", "-t", "$1"]);
 	}
+});
+
+test("tmux open rolls back its exact session when setup fails (R7)", async () => {
+	const calls: (readonly string[])[] = [];
+	const exec = async (args: readonly string[]) => {
+		calls.push(args);
+		if (args.includes("new-session")) return { code: 0, stdout: "$3\t@4\t%5\t/tmp/tmux-1/s\n", stderr: "" };
+		if (args.includes("remain-on-exit")) return { code: 1, stdout: "", stderr: "injected failure" };
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	await assert.rejects(tmuxHost({ exec, env: {} }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }), /injected failure/);
+	assert.deepEqual(calls.at(-1), ["-S", "/tmp/tmux-1/s", "kill-session", "-t", "$3"]);
+	assert.equal(calls.some((args) => args.includes("respawn-pane")), false, "the role never started");
+});
+
+test("tmux open stops at the startup deadline and removes only its marked session (R6)", async () => {
+	const calls: (readonly string[])[] = [];
+	// new-session hangs until aborted; the server already created the session with its markers.
+	const exec = async (args: readonly string[], _env: NodeJS.ProcessEnv, signal?: AbortSignal) => {
+		calls.push(args);
+		if (args.includes("new-session")) return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => signal?.addEventListener("abort", () => resolve({ code: 1, stdout: "", stderr: "killed" }), { once: true }));
+		if (args.includes("list-sessions")) return { code: 0, stdout: "$7\t/r\tlaunch-1\n$8\t/r\tother\n$9\t/elsewhere\tlaunch-1\n", stderr: "" };
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	const started = Date.now();
+	await assert.rejects(tmuxHost({ exec, env: {}, server: ["-L", "x"] }).open("/r", "launch-1", { title: "loop", argv: ["x"], env: {} }, AbortSignal.timeout(100)));
+	assert.ok(Date.now() - started < 1000);
+	assert.deepEqual(calls.filter((args) => args.includes("kill-session")), [["-L", "x", "kill-session", "-t", "$7"]]);
+	assert.ok(calls[0].includes("@ralph_launch") && calls[0].includes(";"), "markers are set in the creating command");
 });

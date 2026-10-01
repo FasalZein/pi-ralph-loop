@@ -435,3 +435,31 @@ test("driver: managed partial terminal sample never closes pi", async (t) => {
 	assert.ok(noEof(f.root), "partial state is not terminal proof");
 	assert.equal((await f.result).reason, "loop-finished");
 });
+
+test("driver: managed rejection while running requests graceful stop and keeps pi (R1)", async (t) => {
+	// Refusal notify before the answer, valid running state, no fact: the old route closed stdin without /ralph-stop.
+	const f = await start(t, { preSteps: [{ op: "state", running: true }, { op: "sleep", ms: 200 }, { op: "emit", record: notify("refused") }], responseDelay: 100, stopSteps: [{ op: "sleep", ms: 400 }, { op: "exit", code: 0 }] }, immediateGate, {}, managed);
+	await waitFor(() => log(f.root).some((r) => r.message === "/ralph-stop"));
+	assert.ok(noEof(f.root), "pi stdin must stay open while the loop may run");
+	// The subscriber attaches at ready; the 200 ms pre-answer pause keeps the frame after it.
+	await waitFor(() => f.frames.some((r) => r.type === "lifecycle" && r.state === "launch-failed" && r.detail === "refused"));
+	assert.equal((await f.result).reason, "pi-exited");
+	assert.ok(noEof(f.root));
+});
+
+test("driver: managed launch refuses an owner that appears at the gate without launch or stop (R5)", async (t) => {
+	let root = "";
+	const gate = async () => {
+		// A foreign loop with a live owner starts while the driver waits at its gate.
+		const { writeState } = await import("../src/state.ts");
+		writeState(root, { running: true, iteration: 1, max_iterations: 3, started_at: "2026-09-30T00:00:00.000Z", completed_at: null, stop_reason: null, session_id: "foreign", last_session_file: null, owner_pid: process.pid, owner_heartbeat_at: new Date().toISOString(), error_count: 0, transitioning: false, cancel_requested: false, stop_requested: false, bundle_mode: false, loop_token: "foreign-token", model_provider: null, model_id: null, thinking_level: null, bundle_snapshot_hash: null, items_snapshot_hash: null, progress_size: null, progress_hash: null, progress_snapshot: null, source_doc_hashes: null, bundle_items_snapshot: null, git_head: null, bundle_rejection_count: 0, provider_recovery_fresh_fallback_used: false, limit_reminders: null }, "Foreign.");
+	};
+	const rootDir = temp(t);
+	root = rootDir;
+	const m = await mission(rootDir);
+	t.after(() => rmSync(rootDir, { recursive: true, force: true }));
+	const exit = await runDriver({ mission: m, launchId: "launch", gate, lifecycle: "managed" }, { piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fixture] }, env: { ...process.env, FAKE_PI_STDIN_LOG: join(rootDir, "pi.log") }, tmpDir: rootDir, shutdownGraceMs: 100, log: () => {} });
+	assert.equal(exit.reason, "launch-rejected");
+	assert.match(exit.detail ?? "", /live owner/);
+	assert.equal(log(rootDir).some((r) => r.type === "prompt"), false, "neither /ralph-loop nor /ralph-stop reaches pi");
+});
