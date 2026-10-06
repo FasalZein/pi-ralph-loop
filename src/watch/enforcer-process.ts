@@ -91,7 +91,7 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 					}
 				}
 				const ended = notLaunched || !!loop && isTerminal(snapshot, loop);
-				if (ended) alerts.push(emit("loop-ended", "INFO", [`reason: ${notLaunched ? "not-launched" : snapshot.state?.stop_reason ?? "unknown"}`, `stop: ${JSON.stringify(stop)}`, `findings: ${JSON.stringify(records.filter(a => a.run.launchId === run.launchId).reduce((counts, a) => ({ ...counts, [a.level]: counts[a.level] + 1 }), { HARD: 0, WARN: 0, INFO: 0 }))}`]));
+				if (ended && !records.some(a => a.run.launchId === run.launchId && a.rule === "loop-ended")) alerts.push(emit("loop-ended", "INFO", [`reason: ${notLaunched ? "not-launched" : snapshot.state?.stop_reason ?? "unknown"}`, `stop: ${JSON.stringify(stop)}`, `findings: ${JSON.stringify(records.filter(a => a.run.launchId === run.launchId).reduce((counts, a) => ({ ...counts, [a.level]: counts[a.level] + 1 }), { HARD: 0, WARN: 0, INFO: 0 }))}`]));
 				const known = new Set(records.map(alertIdentity));
 				const added = alerts.filter(a => { const id = alertIdentity(a); if (known.has(id)) return false; known.add(id); return true; });
 				await append(spec.root, added); records = [...records, ...added];

@@ -187,3 +187,14 @@ test("a partially written alert batch prevents later stops instead of appending 
 		assert.equal(stops, 0);
 	} finally { f.close(); }
 });
+
+test("restarting after STOPPED does not append another final summary for the same launch", async () => {
+	const f = new Fixture([], { plain: true });
+	try {
+		f.state(false, T("09:00"), "terminal");
+		const spec = { root: f.root, mission: await loadMission(f.root), run: { launchId: "finished", loopToken: "terminal", startedAt: T("09:00") }, branch: f.git("symbolic-ref", "--short", "HEAD") };
+		for (let n = 0; n < 2; n++) assert.equal((await runEnforcer(spec, { observation: clock(), log: () => {}, async stop() { throw new Error("terminal loops never stop again"); } })).reason, "stopped");
+		const records = readFileSync(path.join(f.root, ".ralph/enforcer-alerts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+		assert.equal(records.filter(a => a.rule === "loop-ended").length, 1);
+	} finally { f.close(); }
+});
