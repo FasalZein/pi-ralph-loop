@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { deriveLiveness } from "../health.js";
 import type { Alert, ItemStatus, LoopSnapshot, ObservedAttempt, ObservedItem } from "../types.js";
 import { clean, fit, style } from "./layout.js";
@@ -24,6 +24,8 @@ const EIGHTHS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"] as const;
 const TRACK = "⣿";
 // Authority: design spec section 3 captures: the badge column keeps three spaces before the bar.
 const BADGE_GAP = 3;
+// Authority: design spec section 3 captures: two spaces between status facts and before the chip.
+const SEP = 2;
 // Authority: design spec section 6 card rows; the label column fits the longest label, "Not run", plus two spaces.
 const CARD_LABEL_COLS = 9;
 
@@ -40,12 +42,11 @@ export function formatDuration(ms: number): string {
 	return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
-/** `950`, `1.5k`, `215k`, `3.2M` (design spec section 3 capture ov-200x50). */
+/** `950`, `215k`, `3.2M`: integer kilo-tokens, one decimal for millions (approved prototype and capture ov-200x50). */
 export function formatTokens(n: number): string {
-	if (n < 1_000) return String(n);
-	if (n < 10_000) return `${(n / 1_000).toFixed(1)}k`;
-	if (n < 1_000_000) return `${Math.round(n / 1_000)}k`;
-	return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+	return String(n);
 }
 
 /** The one items-passed bar: `width` columns of fill, an eighth-block edge and a dim track. */
@@ -91,12 +92,17 @@ export function badge(snapshot: LoopSnapshot, now: number): string {
 /** Join a left and a right part, the right part flush with the end of `width`. */
 function spread(left: string, right: string, width: number): string {
 	const gap = width - visibleWidth(left) - visibleWidth(right);
+	if (!right) return fit(left, width);
 	return gap < 1 ? fit(`${left} ${right}`, width) : `${left}${" ".repeat(gap)}${right}`;
 }
 
+/** Cut clean identity text to `width` columns with an ellipsis. */
+const abbreviate = (text: string, width: number): string => (width <= 0 ? "" : visibleWidth(text) <= width ? text : truncateToWidth(text, width, "…"));
+
 /**
- * Header row. Worktree, elapsed time and cost always show; branch, model, heartbeat age and tokens
- * show in that order of priority while they fit, so a narrow frame drops them and never truncates.
+ * Header row. The right part (elapsed time, tokens from 150 columns, cost) is reserved first. The
+ * heartbeat age shows when the title and one worktree column still fit. Identity text on the left
+ * gives way: the model drops first, then the branch and then the worktree are abbreviated.
  */
 export function headerLine(snapshot: LoopSnapshot | null, worktree: string, width: number, cols: number): string {
 	const elapsed = snapshot?.timeline.elapsed;
@@ -105,27 +111,32 @@ export function headerLine(snapshot: LoopSnapshot | null, worktree: string, widt
 	const model = snapshot?.state?.model_id;
 	const hb = snapshot?.health.heartbeatAgeMs;
 	const live = snapshot?.health.state === "running" || snapshot?.health.state === "stale";
-	const text = {
-		branch: branch ? `⎇ ${clean(branch)}` : null,
-		model: model ? style.dim(clean(model)) : null,
-		hb: live && hb !== null && hb !== undefined ? `hb ${formatDuration(hb)}` : null,
-		tokens: usage && cols >= TOKENS_FROM_COLS ? `In ${formatTokens(usage.input)} · Cached ${formatTokens(usage.cacheRead)} · Out ${formatTokens(usage.output)}` : null,
+	const title = ` ${style.accent("◆")} ${style.bold("Ralph Watch")}`;
+	const rightPart = (withHb: boolean) => {
+		const parts = [
+			withHb && live && hb !== null && hb !== undefined ? `hb ${formatDuration(hb)}` : null,
+			elapsed ? `Time ${formatDuration(elapsed.wallMs)}` : null,
+			usage && cols >= TOKENS_FROM_COLS ? `In ${formatTokens(usage.input)} · Cached ${formatTokens(usage.cacheRead)} · Out ${formatTokens(usage.output)}` : null,
+			usage ? `$${usage.costUsd.toFixed(2)}` : null,
+		].filter((part): part is string => part !== null).join(" · ");
+		return parts ? `${parts} ` : "";
 	};
-	const shown = new Set<keyof typeof text>();
-	const draw = () => {
-		const left = [` ${style.accent("◆")} ${style.bold("Ralph Watch")}`, worktree, shown.has("branch") ? text.branch : null, shown.has("model") ? text.model : null];
-		const right = [shown.has("hb") ? text.hb : null, elapsed ? `Time ${formatDuration(elapsed.wallMs)}` : null, shown.has("tokens") ? text.tokens : null, usage ? `$${usage.costUsd.toFixed(2)}` : null];
-		const r = right.filter((part): part is string => part !== null).join(" · ");
-		return [left.filter((part): part is string => part !== null).join("  "), r ? `${r} ` : ""] as const;
-	};
-	for (const name of ["branch", "model", "hb", "tokens"] as const) {
-		if (text[name] === null) continue;
-		shown.add(name);
-		const [a, b] = draw();
-		if (visibleWidth(a) + 2 + visibleWidth(b) > width) shown.delete(name);
+	let right = rightPart(true);
+	// The title, a separator, one worktree column and the gap before the right part.
+	if (visibleWidth(title) + SEP + 1 + SEP + visibleWidth(right) > width) right = rightPart(false);
+	const room = width - visibleWidth(right) - SEP - visibleWidth(title) - SEP;
+	const branchText = branch ? `⎇ ${clean(branch)}` : null;
+	const modelText = model ? clean(model) : null;
+	const join = (parts: readonly (string | null)[]) => parts.filter((part): part is string => part !== null).join("  ");
+	let identity: string;
+	if (visibleWidth(join([worktree, branchText, modelText])) <= room) identity = join([worktree, branchText, modelText && style.dim(modelText)]);
+	else if (visibleWidth(join([worktree, branchText])) <= room) identity = join([worktree, branchText]);
+	else {
+		// Abbreviate the branch to what the full worktree leaves; drop it when not even "⎇ x…" fits.
+		const branchRoom = room - visibleWidth(worktree) - SEP;
+		identity = branchText && branchRoom >= visibleWidth("⎇ x…") ? join([worktree, abbreviate(branchText, branchRoom)]) : abbreviate(worktree, room);
 	}
-	const [a, b] = draw();
-	return spread(a, b, width);
+	return spread(identity ? `${title}  ${identity}` : title, right, width);
 }
 
 type StatusParts = { badge: string; bar: ((width: number) => string) | null; count: string | null; iteration: string | null; left: string | null; eta: string | null };
@@ -164,7 +175,6 @@ export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1
 	if (!snapshot) return [` ${failure ?? style.dim("reading loop state…")}`];
 	const p = statusParts(snapshot, now);
 	const lead = ` ${p.badge}${" ".repeat(BADGE_GAP)}`;
-	const indent = " ".repeat(visibleWidth(lead));
 	const tail = (parts: readonly (string | null)[]) => parts.filter((part): part is string => part !== null);
 	const withBar = (before: string, after: string) => {
 		if (!p.bar) return `${before.trimEnd()}${after ? `   ${after.trimStart()}` : ""}`;
@@ -174,9 +184,18 @@ export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1
 		const after = [`  ${p.count ?? ""}`, ...tail([p.eta]).map((x) => `  ${x}`), ...tail([p.iteration]).map((x) => `   ${x}`), ...tail([p.left]).map((x) => `  ${x}`), ...tail([failure, chip]).map((x) => `   ${x}`)].join("");
 		return [withBar(lead, p.bar ? `${after}  ` : after.trim())];
 	}
-	const first = withBar(lead, p.bar ? `  ${p.count}  ${failure ? `${failure}  ` : ""}` : failure ?? "");
+	// The fact row is laid out on its own: it aligns under the bar when it fits and moves left when a
+	// long badge (for example `■ STOPPED max_iterations`) leaves too little room. Facts are never cut.
 	const second = tail([p.iteration, p.left, p.eta]).join("  ");
-	return [first, spread(`${indent}${second}`, chip ? `${chip}  ` : "", width)];
+	const chipRight = chip ? `${chip}  ` : "";
+	const fits = (extra: string) => 1 + visibleWidth(second) + (extra ? SEP + visibleWidth(extra) : 0) <= width;
+	// The chip moves to the end of the bar row when the fact row cannot hold both.
+	const chipOnFirst = chip !== null && !fits(chipRight);
+	const firstAfter = [p.count && `  ${p.count}  `, failure && `${failure}  `, chipOnFirst && `${chip}  `].filter(Boolean).join("");
+	const first = withBar(lead, p.bar ? firstAfter : [failure, chipOnFirst ? chip : null].filter(Boolean).join("   "));
+	const rowRight = chipOnFirst ? "" : chipRight;
+	const pad = Math.max(1, Math.min(visibleWidth(lead), width - visibleWidth(second) - (rowRight ? SEP + visibleWidth(rowRight) : 0)));
+	return [first, spread(`${" ".repeat(pad)}${second}`, rowRight, width)];
 }
 
 /** Phone status block (design spec section 4): badge, bar with count, then iteration · items left · ETA. */
@@ -241,10 +260,13 @@ function wrap(text: string, width: number): string[] {
 	return rows;
 }
 
-/** A labelled card row: the label column, then text wrapped under itself. */
+/**
+ * A labelled card row: the label column, then text wrapped under itself. `text` must already be
+ * sanitized: callers clean untrusted parts and then add trusted styling.
+ */
 function cardRow(name: string, text: string, width: number): string[] {
 	const pad = " ".repeat(CARD_LABEL_COLS);
-	return wrap(clean(text), width - CARD_LABEL_COLS).map((line, index) => `${index === 0 ? style.dim(name.padEnd(CARD_LABEL_COLS)) : pad}${line}`);
+	return wrap(text, width - CARD_LABEL_COLS).map((line, index) => `${index === 0 ? style.dim(name.padEnd(CARD_LABEL_COLS)) : pad}${line}`);
 }
 
 const short = (sha: string) => sha.slice(0, 7);
@@ -258,30 +280,64 @@ export function attemptCard(card: ObservedAttempt, width: number): string[] {
 	if (card.outcome === "blocked" && card.resolvedBy !== null) {
 		// A resolved blocker collapses to Resolved and Asked.
 		rows.push(...cardRow("Resolved", card.resolvedCommitSha ? short(card.resolvedCommitSha) : `entry ${card.resolvedBy + 1}`, width));
-		if (f?.decide) rows.push(...cardRow("Asked", f.decide, width));
+		if (f?.decide) rows.push(...cardRow("Asked", clean(f.decide), width));
 		return rows;
 	}
 	if (!f) return rows;
 	if (f.failed) {
-		rows.push(...cardRow("Failed", `${f.failed.cmd}${f.failed.exit !== null ? `  exit ${f.failed.exit}` : ""}`, width));
-		if (f.failed.error) rows.push(...cardRow("", f.failed.error, width));
+		rows.push(...cardRow("Failed", clean(`${f.failed.cmd}${f.failed.exit !== null ? `  exit ${f.failed.exit}` : ""}`), width));
+		if (f.failed.error) rows.push(...cardRow("", clean(f.failed.error), width));
 	}
-	if (f.cause) rows.push(...cardRow("Cause", f.cause, width));
-	if (f.tried) rows.push(...cardRow("Tried", f.tried, width));
-	if (f.decide) rows.push(...cardRow("Decide", f.decide, width));
-	if (f.proof) rows.push(...cardRow("Proof", `${f.proof.identical}/${f.proof.total} identical`, width));
+	if (f.cause) rows.push(...cardRow("Cause", clean(f.cause), width));
+	if (f.tried) rows.push(...cardRow("Tried", clean(f.tried), width));
+	if (f.decide) rows.push(...cardRow("Decide", clean(f.decide), width));
+	if (f.proof) {
+		// Design spec sections 2 and 6: one ■ per proof line, green IDENTICAL, red different.
+		const { identical, total } = f.proof;
+		const squares = style.green("■".repeat(identical)) + (total > identical ? style.red("■".repeat(total - identical)) : "");
+		rows.push(...cardRow("Proof", `${squares} ${identical === total ? `${identical}/${total} identical` : style.red(`${total - identical} differ`)}`, width));
+	}
 	if (f.checks.length) {
-		// Collapsed checks: a count when all ended green; otherwise only the red finals.
+		// Collapsed checks: a green count of checks that ended green; the red finals by name.
 		const red = f.checks.filter((check) => check.exits.at(-1) !== 0);
-		rows.push(...cardRow("Checks", red.length ? red.map((check) => `✕ ${check.cmd}`).join("  ") : `✓ ${f.checks.length}`, width));
+		const green = f.checks.length - red.length;
+		const parts = [green > 0 ? `${style.green("✓")} ${green}` : null, ...red.map((check) => `${style.red("✕")} ${clean(check.cmd)}`)];
+		rows.push(...cardRow("Checks", parts.filter((part): part is string => part !== null).join("  "), width));
 	}
 	const changed = f.counts.filter((count) => count.from !== count.to);
-	if (changed.length) rows.push(...cardRow("Counts", changed.map((count) => `${count.label} ${count.from}→${count.to}`).join("  "), width));
-	if (f.diff) rows.push(...cardRow("Diff", f.diff, width));
-	if (f.assumed.length) rows.push(...cardRow("Assumed", f.assumed.join("; "), width));
-	if (f.notRun.length) rows.push(...cardRow("Not run", f.notRun.join(" · "), width));
-	if (f.evidence.length) rows.push(...cardRow("Evidence", f.evidence.join("; "), width));
+	if (changed.length) rows.push(...cardRow("Counts", clean(changed.map((count) => `${count.label} ${count.from}→${count.to}`).join("  ")), width));
+	if (f.diff) rows.push(...cardRow("Diff", clean(f.diff), width));
+	if (f.assumed.length) rows.push(...cardRow("Assumed", clean(f.assumed.join("; ")), width));
+	if (f.notRun.length) rows.push(...cardRow("Not run", clean(f.notRun.join(" · ")), width));
+	if (f.evidence.length) rows.push(...cardRow("Evidence", clean(f.evidence.join("; ")), width));
 	return rows;
+}
+
+/**
+ * Runs on the current item: the run in which it became current, plus every later run start. The item
+ * became current at the last pass of an item before it in list order (spec #1 story 26), so a pass of a
+ * later item does not count. Null when the evidence is incomplete: then the count is omitted.
+ */
+function runsOnItem(snapshot: LoopSnapshot, key: string): number | null {
+	const commits = snapshot.git?.commits;
+	const index = snapshot.items.findIndex((item) => item.key === key);
+	if (!snapshot.historyComplete || !commits || index < 0) return null;
+	const earlier = new Set(snapshot.items.slice(0, index).map((item) => item.key));
+	let since: number | null = null;
+	// A commit with unknown passes may hide a flip; it matters only after the last known flip.
+	let unknownAfter = false;
+	for (const commit of commits) {
+		if (!commit.passesKnown) { unknownAfter = earlier.size > 0; continue; }
+		if (!commit.passedItems.some((item) => earlier.has(item))) continue;
+		if (commit.committedAt === null) return null;
+		since = Math.max(since ?? -Infinity, Date.parse(commit.committedAt));
+		unknownAfter = false;
+	}
+	if (unknownAfter) return null;
+	const starts = snapshot.runStarts.map((r) => Date.parse(r.startedAt));
+	if (since === null) return starts.length;
+	const at = since;
+	return starts.filter((start) => start > at).length + (starts.some((start) => start <= at) ? 1 : 0);
 }
 
 /**
@@ -299,11 +355,8 @@ export function currentBody(snapshot: LoopSnapshot | null, width: number): strin
 
 	const facts: string[] = [];
 	if (meta?.category) facts.push(clean(meta.category));
-	// Runs on this item: the run in which it became current, plus every later run start.
-	const since = [...snapshot.timeline.boundaries].filter((b) => b.kind === "item-pass").map((b) => Date.parse(b.at)).sort((a, b) => a - b).at(-1);
-	const starts = snapshot.runStarts.map((r) => Date.parse(r.startedAt));
-	const runs = since === undefined ? starts.length : 1 + starts.filter((at) => at > since).length;
-	if (runs > 0) facts.push(plural(runs, "run"));
+	const runs = runsOnItem(snapshot, key);
+	if (runs !== null && runs > 0) facts.push(plural(runs, "run"));
 	const blockers = (snapshot.git?.commits ?? []).filter((c) => c.kind === "blocker" && c.blockerItem === key).length;
 	if (blockers > 0) facts.push(plural(blockers, "blocker"));
 	const current = snapshot.timeline.currentItem;

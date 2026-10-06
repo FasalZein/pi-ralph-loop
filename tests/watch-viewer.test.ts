@@ -119,8 +119,8 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	assert.match(s[22], /^│ ⇧Q Quit +│$/);
 	assert.match(s[23], /^╰─+╯$/);
 	assert.match(s[6], /^│ ● Current item B {2}Evil +title +│ Items +1\/2 │$/);
-	// Category "c" and the run in which B became current; time on item needs journal coverage, so it is omitted.
-	assert.match(s[7], /^│ c · 1 run +│ ✓ A Parse config +│$/);
+	// Category "c". Run count and time on item need complete history (journal coverage), so both are omitted.
+	assert.match(s[7], /^│ c +│ ✓ A Parse config +│$/);
 	assert.match(s[8], /^│ +│ ● B Evil +title +│$/);
 	assert.match(s[9], /^│ Steps +│ +│$/);
 	assert.match(s[10], /^│ 1 s +│ +│$/);
@@ -143,9 +143,26 @@ test("desktop frame at 200x50: status in one row and three columns Items 46, mid
 	assert.equal(s[47].indexOf("┴"), 47);
 	assert.equal(s[47].lastIndexOf("┴"), 134);
 	assert.match(s[5], /^│ Items +1\/2 │ ● Current item B {2}Evil +title +│ Iterations +run 1 │$/);
-	assert.match(s[6], /^│ ✓ A Parse config +│ c · 1 run +│ iteration 1\/9 +│$/);
+	assert.match(s[6], /^│ ✓ A Parse config +│ c +│ iteration 1\/9 +│$/);
 	assert.match(s[48], /^│ ⇧Q Quit +│$/);
 	assert.match(s[49], /^╰─+╯$/);
+	await quitByKeys(h);
+});
+
+test("at 150 columns the header keeps the token group with a long branch and model (review r1 P2)", async (t) => {
+	const f = runningLoop(t);
+	f.git("checkout", "-qb", "rw/typed-session-validation");
+	f.journal([
+		{ v: 1, k: "loop", r: "L1", t: T("10:00"), tok: "run-a", sa: T("10:00"), i: 1, ph: "initialized" },
+		{ v: 1, k: "u", r: "L1", t: T("11:00"), tok: "run-a", i: 1, in: 3_200_000, out: 215_000, cr: 41_600_000, cw: 0, c: 18.61, n: 1, dc: 0, pr: 0 },
+	]);
+	f.state(true, T("10:00"), "run-a", { owner_heartbeat_at: NOW, model_id: "claude-opus-4-5-20251101" });
+	const h = start(f.root, new ReplayTerminal(150, 30));
+	await until(() => h.term.text().includes("Cached"), "header with tokens");
+	const s = h.term.screen();
+	// Left: title 14 + 2 + worktree (ralph-loop-state-XXXXXX, 23) + 2 + branch 29 = 70; the model (+26) would pass 148 - 2 - 65.
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S{6} {2}⎇ rw\/typed-session-validation +hb 0s · Time 2h 00m · In 3\.2M · Cached 41\.6M · Out 215k · \$18\.61 │$/);
+	assert.equal([...s[1]].length, 150);
 	await quitByKeys(h);
 });
 
