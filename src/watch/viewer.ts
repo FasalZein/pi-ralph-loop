@@ -6,7 +6,7 @@ import { applyFrame, disconnect, emptyFeed, FILTERS, type FeedFilter, type LiveF
 import { openLoop } from "./loop-state.js";
 import type { LoopReader, LoopSnapshot } from "./types.js";
 import { allocate, clean, fit, Lines, message, Panel, type Region, Stack, style } from "./viewer/layout.js";
-import { currentBody, currentTitle, headerLine, itemRows, itemsTitle, iterationsBody, iterationsTitle, phoneStatusRows, statusRows } from "./viewer/overview.js";
+import { enforcerChip, currentBody, currentTitle, headerLine, itemRows, itemsTitle, iterationsBody, iterationsTitle, phoneStatusRows, statusRows } from "./viewer/overview.js";
 
 // Authority: spec #1 story 46 and the thresholds table ("Viewer refresh about 2 s"); design spec Behaviour.
 export const REFRESH_MS = 2_000;
@@ -111,8 +111,15 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const now = () => runtime.now();
 	const header = new Lines((width) => [headerLine(state.snapshot, worktree, width, terminal.columns, state.live, now())], "header");
 	const phoneHeader = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}`, ` ${worktree}${branch() ? ` · ${branch()}` : ""}`], "header");
-	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error, null, state.live), "status");
-	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error, state.live), "status");
+	const chip = () => {
+		const enforcer = state.snapshot?.enforcer;
+		if (!enforcer) return null;
+		return ["down", "unavailable"].includes(enforcer.status.state)
+			? style.yellow(`⚠ enforcer ${enforcer.status.state}`)
+			: enforcerChip(enforcer.alerts, enforcer.commitsChecked);
+	};
+	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error, chip(), state.live), "status");
+	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error, chip(), state.live), "status");
 	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS], "footer");
 	const current = new Panel(() => currentTitle(state.snapshot), (width) => currentBody(state.snapshot, width), "Current item");
 	const items = new Panel((width) => itemsTitle(state.snapshot, width), (width) => itemRows(state.snapshot, width), "Items");

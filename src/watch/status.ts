@@ -28,6 +28,7 @@ export async function readStatus(root: string, runtime: StatusRuntime = {}): Pro
 		for (const [source, report] of Object.entries(snapshot.sources)) {
 			if (report.status !== "fresh" && report.status !== "not-applicable") warnings.push(`${source} ${report.status}${report.error ? `: ${report.error}` : ""}`);
 		}
+		if (snapshot.enforcer && ["down", "unavailable"].includes(snapshot.enforcer.status.state)) warnings.push(`enforcer: ${snapshot.enforcer.status.state}`);
 		if (!snapshot.timeline.coverage.complete) warnings.push(`timing: ${snapshot.timeline.coverage.reason ?? "unavailable"}`);
 		let liveness = deriveLiveness(snapshot, null, snapshot.observedAt ? Date.parse(snapshot.observedAt) : Date.now());
 		const abort = new AbortController();
@@ -60,6 +61,7 @@ export async function readStatus(root: string, runtime: StatusRuntime = {}): Pro
 			`current item: ${item(snapshot, snapshot.currentItem)}`,
 			`stopped item: ${item(snapshot, snapshot.stoppedItem)}`,
 			`health: ${liveness.badge.toUpperCase()}`,
+			`enforcer: ${snapshot.enforcer?.status.state ?? "unavailable"}`,
 			`stale: ${flag(snapshot.health.stale)}`,
 			`stalled: ${flag(liveness.stalled)}`,
 			`heartbeat age: ${milliseconds(snapshot.health.heartbeatAgeMs)}`,

@@ -1,3 +1,5 @@
+import { readEnforcerStatus } from "./alert-log.js";
+import { runEnforcer, type EnforcementRuntime, type EnforcerExit } from "./enforcer-process.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -54,6 +56,14 @@ export async function runDriverRole(path: string, runtime: DriverRuntime = {}): 
 	return runDriver({ mission, launchId: manifest.launchId, gate: fifoGate(mission.root, manifest.launchId), mode: manifest.mode, lifecycle: "managed" }, { readyTimeoutMs: LAUNCH_READY_TIMEOUT_MS, ...runtime });
 }
 
+/** Hidden own-process enforcer role. Never reload the effective policy inside its reader. */
+export async function runEnforcerRole(path: string, runtime: EnforcementRuntime = {}): Promise<EnforcerExit> {
+	const manifest = readManifest(path);
+	const mission = await loadMission(manifest.root);
+	if (mission.root !== manifest.root || mission.configHash !== manifest.configHash) throw new Error("Mission changed after launch preflight; launch again");
+	return runEnforcer({ root: manifest.root, mission, branch: manifest.branch, run: { launchId: manifest.launchId, loopToken: null, startedAt: null } }, runtime);
+}
+
 /** Branch checked out at launch; null for a detached HEAD. Any other git failure refuses the launch. */
 function launchBranch(root: string): string | null {
 	try {
@@ -65,6 +75,7 @@ function launchBranch(root: string): string | null {
 	}
 }
 
+const defaultEnforcerArgv = (manifest: string) => [process.execPath, fileURLToPath(new URL("./ralph.mjs", import.meta.url)), "_enforcer", manifest];
 const defaultDriverArgv = (manifest: string) => [process.execPath, fileURLToPath(new URL("./ralph.mjs", import.meta.url)), "_driver", manifest];
 
 /** Refuse a launch while any live driver or live loop owner may exist. */
@@ -99,6 +110,23 @@ async function waitReady(root: string, launchId: string, host: Host, handle: Hos
 	}
 }
 
+async function waitEnforcer(root: string, launchId: string, configHash: string, host: Host, handle: HostHandle, signal: AbortSignal): Promise<void> {
+	while (true) {
+		signal.throwIfAborted();
+		const status = await readEnforcerStatus(root);
+		if (status?.run.launchId === launchId && status.configHash === configHash && status.pid > 0 && isAlive(status.pid)) {
+			if (status.state === "ready") return;
+			if (status.state === "stopping" || status.state === "stopped") throw new Error("Enforcer found HARD evidence before launch; inspect .ralph/enforcer-alerts.jsonl");
+		}
+		if (await host.paneDead(handle, signal)) throw new Error("Enforcer role exited before it was ready");
+		await sleep(READY_POLL_MS, signal);
+	}
+}
+const enforcerHandle = (handle: HostHandle): HostHandle | null => handle.enforcer ? { ...handle, ...handle.enforcer } : null;
+async function allRolesDead(host: Host, handle: HostHandle, signal?: AbortSignal): Promise<boolean> {
+	return await host.paneDead(handle, signal) && (!handle.enforcer || await host.paneDead(enforcerHandle(handle)!, signal));
+}
+
 /** Resolves on the first launch confirmation; rejects on failure, driver loss or the deadline. */
 async function waitConfirmed(frames: AsyncIterator<EventFrame>, signal: AbortSignal): Promise<void> {
 	while (true) {
@@ -128,7 +156,7 @@ async function recoverInactiveHost(root: string, host: Host, signal: AbortSignal
 	// A query cut off by the deadline answers false; keep the record for a later recovery.
 	if (signal.aborted) throw signal.reason;
 	if (same) {
-		if (!await host.paneDead(previous, signal)) throw new Error(`tmux session ${previous.name} (${previous.sessionId}) of launch ${previous.launchId} still runs a process; inspect or close it first`);
+		if (!await allRolesDead(host, previous, signal)) throw new Error(`tmux session ${previous.name} (${previous.sessionId}) of launch ${previous.launchId} still runs a process; inspect or close it first`);
 		if (signal.aborted) throw signal.reason;
 		await host.close(previous, signal);
 	}
@@ -153,9 +181,9 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 		const env = runtime.env ?? process.env;
 		const blocked = [...new Set(["ask_user", ...[env.RALPH_BLOCKED_TOOLS, env.RALPH_EXTRA_BLOCKED_TOOLS].flatMap((list) => (list ?? "").split(",")).map((tool) => tool.trim()).filter(Boolean)])].join(",");
 		const readyMs = runtime.readyTimeoutMs ?? LAUNCH_READY_TIMEOUT_MS;
-		// One absolute readiness deadline covers host startup and the driver's ready metadata.
+		// One absolute readiness deadline covers host startup, driver metadata and enforcer readiness.
 		const ready = deadline(readyMs, runtime.signal);
-		const notReady = () => runtime.signal?.aborted ? new Error("Launch aborted before dispatch") : new Error(`Driver not ready within ${readyMs / 1000} s`);
+		const notReady = () => runtime.signal?.aborted ? new Error("Launch aborted before dispatch") : new Error(`Driver and enforcer not ready within ${readyMs / 1000} s`);
 		try {
 			await recoverInactiveHost(root, host, ready);
 			handle = await host.open(root, launchId, { title: "loop", argv: (runtime.driverArgv ?? defaultDriverArgv)(manifest), env: { PATH: env.PATH ?? "", PI_SUBAGENT_MUX: "tmux", RALPH_BLOCKED_TOOLS: blocked } }, ready);
@@ -170,6 +198,10 @@ async function launch(request: Extract<Request, { kind: "launch" }>, runtime: Co
 			writeHostRecord(handle);
 			err(`ralph: waiting for driver in tmux session ${handle.name} (${handle.sessionId})`);
 			await waitReady(root, launchId, host, handle, ready);
+			const enforcer = await host.addRole(handle, { title: "enforcer", argv: (runtime.enforcerArgv ?? defaultEnforcerArgv)(manifest), env: { PATH: env.PATH ?? "" } }, ready);
+			handle = { ...handle, enforcer: { windowId: enforcer.windowId, paneId: enforcer.paneId } };
+			writeHostRecord(handle);
+			await waitEnforcer(root, launchId, mission.configHash, host, enforcer, ready);
 		} catch (error) {
 			// Nothing was dispatched: the unused session holds no loop.
 			const failure = ready.aborted ? notReady() : error;
@@ -243,15 +275,15 @@ async function stop(request: Extract<Request, { kind: "stop" }>, runtime: Comman
 	const stillStopping = () => new Error(`Loop still stopping after ${waited()}; the host was left open`);
 	const host = runtime.host ?? tmuxHost({ env: runtime.env });
 	const poll = () => sleep(runtime.pollMs ?? TERMINAL_POLL_MS, wait).catch(() => {});
-	/** Wait for the driver role to exit so the session holds no process when it closes. */
+	/** Wait for both roles to exit before closing the idle session. */
 	async function roleExited(handle: HostHandle): Promise<void> {
 		const dead = async () => {
-			try { return await host.paneDead(handle, wait); }
+			try { return await allRolesDead(host, handle, wait); }
 			catch (error) { if (wait?.aborted) throw stillStopping(); throw new Error(`${message(error)}; the host was left open`); }
 		};
 		while (!await dead()) {
 			if (wait?.aborted) throw stillStopping();
-			err(`ralph: loop stopped; waiting for the driver to exit; waited ${waited()}`);
+			err(`ralph: loop stopped; waiting for the driver and enforcer to exit; waited ${waited()}`);
 			await poll();
 		}
 		if (wait?.aborted) throw stillStopping();

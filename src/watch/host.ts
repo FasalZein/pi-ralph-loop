@@ -15,9 +15,11 @@ export type HostHandle = {
 	readonly windowId: string;
 	readonly paneId: string;
 	readonly createdAt: string;
+	/** Exact second role identity, when this launch has an enforcer. */
+	readonly enforcer?: { readonly windowId: string; readonly paneId: string };
 };
 /** One role process. `argv` is passed to the host without a shell. */
-export type RoleSpec = { readonly title: "loop"; readonly argv: readonly string[]; readonly env: Readonly<Record<string, string>> };
+export type RoleSpec = { readonly title: "loop" | "enforcer"; readonly argv: readonly string[]; readonly env: Readonly<Record<string, string>> };
 export type Host = {
 	/**
 	 * Create the session and start the role. `signal` is the absolute startup
@@ -26,6 +28,7 @@ export type Host = {
 	 * leaves no time for that, it throws HostOpenError instead.
 	 */
 	open(root: string, launchId: string, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle>;
+	addRole(handle: HostHandle, role: RoleSpec, signal?: AbortSignal): Promise<HostHandle>;
 	/** True when the handle still names the same live session, pane, root and launch on the same server. */
 	verify(handle: HostHandle, signal?: AbortSignal): Promise<boolean>;
 	/**
@@ -51,7 +54,7 @@ export class HostOpenError extends Error {
 
 const RECORD = ".ralph/watch-host.json";
 function valid(value: unknown): value is HostHandle {
-	return object(value) && value.v === 1 && value.kind === "tmux" && ["root", "launchId", "name", "socket", "sessionId", "windowId", "paneId", "createdAt"].every((key) => typeof value[key] === "string");
+	return object(value) && value.v === 1 && value.kind === "tmux" && ["root", "launchId", "name", "socket", "sessionId", "windowId", "paneId", "createdAt"].every((key) => typeof value[key] === "string") && (value.enforcer === undefined || object(value.enforcer) && typeof value.enforcer.windowId === "string" && typeof value.enforcer.paneId === "string");
 }
 /** Atomic write; never replaces the record of another launch. */
 export function writeHostRecord(handle: HostHandle): void {

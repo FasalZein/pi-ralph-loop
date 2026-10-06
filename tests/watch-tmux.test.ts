@@ -11,6 +11,7 @@ import { tmuxHost } from "../src/watch/hosts/tmux.ts";
 import { HostOpenError } from "../src/watch/host.ts";
 import { readStateDocument } from "../src/state.ts";
 
+const enforcerFixture = fileURLToPath(new URL("./fixtures/enforcer-role.ts", import.meta.url));
 const roleFixture = fileURLToPath(new URL("./fixtures/driver-role.ts", import.meta.url));
 const available = spawnSync("tmux", ["-V"]).status === 0;
 const fact = (sequence: number, detail: Record<string, unknown>) => ({ op: "fact", envelope: { version: 1, id: String(sequence), sequence, fact: { run: { launchId: "$env", loopToken: "token", startedAt: "2026-09-30T00:00:00.000Z" }, iteration: 1, at: "2026-09-30T00:00:00.000Z", ...detail } } });
@@ -50,9 +51,20 @@ for (const kind of ["plain", "bundle"] as const) test(`scratch tmux launches fak
 	const env = { ...process.env, HERDR_CALLER: "caller" };
 	const host = tmuxHost({ server: ["-L", server], env });
 	const lines: string[] = [];
-	const runtime = { host, env, err: (line: string) => lines.push(line), pollMs: 100, driverArgv: (manifest: string) => [process.execPath, "--import", import.meta.resolve("tsx"), roleFixture, manifest, scenario, piLog] };
+	const runtime = { host, env, err: (line: string) => lines.push(line), pollMs: 100, enforcerArgv: (manifest: string) => [process.execPath, "--import", import.meta.resolve("tsx"), enforcerFixture, manifest, ...(kind === "plain" ? [join(root, ".ralph/launch-enforcer-test-gate.json")] : [])], driverArgv: (manifest: string) => [process.execPath, "--import", import.meta.resolve("tsx"), roleFixture, manifest, scenario, piLog] };
 
-	const launched = await execute({ kind: "launch", root, mode: "fresh" }, runtime);
+	const launching = execute({ kind: "launch", root, mode: "fresh" }, runtime);
+	if (kind === "plain") {
+		for (const end = Date.now() + 5000; !existsSync(join(root, ".ralph/driver.json"));) {
+			assert.ok(Date.now() < end, "driver ready before test deadline");
+			await new Promise(resolve => setTimeout(resolve, 20));
+		}
+		// Driver readiness alone must never release the loop prompt.
+		await new Promise(resolve => setTimeout(resolve, 100));
+		assert.equal(readFileSync(piLog, "utf8").includes('"type":"prompt"'), false);
+		writeFileSync(join(root, ".ralph/launch-enforcer-test-gate.json"), "{}");
+	}
+	const launched = await launching;
 	assert.ok(launched.ok, launched.ok ? "" : launched.error);
 	const handle = launched.handle!;
 	assert.equal(handle.socket, tmux("display-message", "-p", "#{socket_path}").stdout.trim());
@@ -64,6 +76,21 @@ for (const kind of ["plain", "bundle"] as const) test(`scratch tmux launches fak
 	assert.equal(records[0].env.RALPH_WATCH_LAUNCH_ID, handle.launchId);
 	assert.equal(records.find((r) => r.type === "prompt")?.message, kind === "bundle" ? '/ralph-loop "@.ralph/prompt.md" --max-iterations=3' : "/ralph-loop Do it; echo $HOME 'quoted' && true --max-iterations=3");
 	assert.equal(tmux("show-options", "-w", "-t", handle.windowId, "-v", "remain-on-exit").stdout.trim(), "on");
+	assert.ok(handle.enforcer, "enforcer has an independent window and pane");
+	assert.notEqual(handle.enforcer.windowId, handle.windowId);
+	if (kind === "plain") {
+		const viewer = tmux("new-window", "-d", "-P", "-F", "#{window_id}", "-t", handle.sessionId, "-n", "viewer", process.execPath, "-e", "setInterval(()=>{},1000)").stdout.trim();
+		const before = JSON.parse(readFileSync(join(root, ".ralph/enforcer.json"), "utf8"));
+		assert.equal(tmux("kill-window", "-t", viewer).status, 0);
+		let after = before;
+		for (const end = Date.now() + 5000; after.polledAt === before.polledAt && Date.now() < end;) {
+			await new Promise(resolve => setTimeout(resolve, 20));
+			after = JSON.parse(readFileSync(join(root, ".ralph/enforcer.json"), "utf8"));
+		}
+		assert.notEqual(after.polledAt, before.polledAt, "killing the viewer host leaves the enforcer polling");
+		assert.equal(after.pid, before.pid);
+		process.kill(after.pid, 0);
+	}
 	const document = readStateDocument(root);
 	assert.ok(document.status === "valid" && document.state.running);
 
@@ -89,6 +116,9 @@ for (const kind of ["plain", "bundle"] as const) test(`scratch tmux launches fak
 	assert.equal(tmux("has-session", "-t", "sentinel").status, 0, "unrelated session survives");
 	assert.equal(existsSync(join(root, ".ralph/watch-host.json")), false);
 	assert.equal(existsSync(join(root, ".ralph/driver.json")), false);
+	const final = JSON.parse(readFileSync(join(root, ".ralph/enforcer.json"), "utf8"));
+	assert.equal(final.state, "stopped");
+	assert.equal(readFileSync(join(root, ".ralph/enforcer-alerts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(a => a.rule === "loop-ended").length, 1);
 });
 
 /** Recording tmux: scripted answers, no server. */

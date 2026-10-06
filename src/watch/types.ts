@@ -317,6 +317,9 @@ export type LoopSnapshot = {
 	readonly git: GitObservation | null;
 	/** Content evidence from the same consistent window as `git`; null whenever `git` is null. */
 	readonly evidence: ContentEvidence | null;
+	/** Validated git content stamp for live probe evidence. */
+	readonly gitVersion: string | null;
+	readonly enforcer: import("./alert-log.js").EnforcerView | null;
 	readonly sources: Readonly<Record<SourceName, SourceReport>>;
 	readonly retained: RetainedValues;
 	readonly issues: readonly Issue[];

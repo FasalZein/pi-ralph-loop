@@ -14,6 +14,8 @@ import { collectPolicyEvidence, keyItems, type KeyedItem } from "./policy-eviden
 import { GIT_BINARY_SNIFF_BYTES, parseDiff, textContent } from "./file-content.js";
 import { linearRegex } from "./regex.js";
 import { isJsTs, isTestPath } from "./content.js";
+import { enforcerRuntimePath, readAlerts, readEnforcerStatus } from "./alert-log.js";
+import { isAlive } from "./transport.js";
 import { parseJournal } from "./journal.js";
 import { deriveIterations, deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
@@ -129,6 +131,8 @@ export type LoopObservation = {
 	readonly history: Result<readonly CommitEvent[]>;
 	/** Content evidence from the git window; ignored unless git is fresh. */
 	readonly evidence: ContentEvidence | null;
+	readonly gitVersion?: string | null;
+	readonly enforcer?: LoopSnapshot["enforcer"];
 	readonly journal: Result<JournalView>;
 	readonly counterBaseline: CounterBaseline | null;
 	/** State run starts observed by this reader; fresh journal starts are merged during derivation. */
@@ -291,8 +295,10 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		retained,
 		issues,
 		usage: runUsage(journal, state?.loop_token ?? null),
-		// T12 supplies persisted alerts at this seam; no in-memory enforcer state is authoritative.
-		iterations: deriveIterations({ journal, commits, items, alerts: [] }),
+		// Persisted enforcer alerts mark timeline gates; deriveIterations matches each alert to its own run.
+		iterations: deriveIterations({ journal, commits, items, alerts: o.enforcer?.alerts ?? [] }),
+		gitVersion: o.git.status === "fresh" ? o.gitVersion ?? null : null,
+		enforcer: o.enforcer && (!launchId || o.enforcer.status.run.launchId === launchId) ? o.enforcer : null,
 	} satisfies LoopSnapshot);
 }
 
@@ -355,6 +361,41 @@ const sha256 = (data: string | Buffer) => createHash("sha256").update(data).dige
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 type Sourced<T> = { readonly result: Result<T>; readonly stamp: FileStamp | null };
+
+async function collectGitStamp(root: string, rt: ObservationRuntime, signal: AbortSignal, hashContent: (full: string) => Promise<string>): Promise<{ head: string; branch: string | null; digest: string }> {
+	const head = (await rt.git(root, ["rev-parse", "--verify", "HEAD"], signal)).trim();
+	let branch: string | null;
+	try {
+		branch = (await rt.git(root, ["symbolic-ref", "-q", "--short", "HEAD"], signal)).trim();
+	} catch (error) {
+		// `symbolic-ref -q` exits 1 only when HEAD is detached.
+		if (!(error instanceof GitCommandError && error.exitCode === 1)) throw error;
+		branch = null;
+	}
+	const indexPath = path.resolve(root, (await rt.git(root, ["rev-parse", "--git-path", "index"], signal)).trim());
+	const indexStamp = await rt.stat(indexPath);
+	// The index version is part of the stamp: a staged A-to-B-to-A edit in the window is a change.
+	const index = indexStamp ? [sha256(await rt.readRange(indexPath, 0)), indexStamp.ino, indexStamp.size, String(indexStamp.mtimeNs)] : "absent";
+	const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl" && !enforcerRuntimePath(p)))].sort();
+	const content: string[] = [];
+	for (const rel of dirty) {
+		const full = path.join(root, rel);
+		const info = await lstat(full).catch((error: unknown) => {
+			if (isMissing(error)) return null;
+			throw error;
+		});
+		if (!info) content.push(`${rel}\0deleted`);
+		else if (info.isSymbolicLink()) content.push(`${rel}\0link\0${await readlink(full)}`);
+		else if (info.isFile()) content.push(`${rel}\0${info.mode}\0${await hashContent(full)}`);
+		else content.push(`${rel}\0${info.mode}`);
+	}
+	return { head, branch, digest: sha256(JSON.stringify([head, branch, index, content])) };
+}
+
+/** A probe's completion stamp uses the same read-only git boundary as observation. */
+export async function readGitVersion(root: string, runtime: ObservationRuntime = defaultRuntime, signal: AbortSignal = new AbortController().signal): Promise<string> {
+	return (await collectGitStamp(root, runtime, signal, async full => sha256(await runtime.readRange(full, 0)))).digest;
+}
 
 /**
  * Open a serialized reader for one loop root. Invalid root or mismatched mission
@@ -557,33 +598,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	 * exit and a missing path throws.
 	 */
 	async function gitStamp(signal: AbortSignal): Promise<{ head: string; branch: string | null; digest: string }> {
-		const head = (await rt.git(root, ["rev-parse", "--verify", "HEAD"], signal)).trim();
-		let branch: string | null;
-		try {
-			branch = (await rt.git(root, ["symbolic-ref", "-q", "--short", "HEAD"], signal)).trim();
-		} catch (error) {
-			// `symbolic-ref -q` exits 1 only when HEAD is detached.
-			if (!(error instanceof GitCommandError && error.exitCode === 1)) throw error;
-			branch = null;
-		}
-		const indexPath = path.resolve(root, (await rt.git(root, ["rev-parse", "--git-path", "index"], signal)).trim());
-		const indexStamp = await rt.stat(indexPath);
-		// The index version is part of the stamp: a staged A-to-B-to-A edit in the window is a change.
-		const index = indexStamp ? [sha256(await rt.readRange(indexPath, 0)), indexStamp.ino, indexStamp.size, String(indexStamp.mtimeNs)] : "absent";
-		const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl"))].sort();
-		const content: string[] = [];
-		for (const rel of dirty) {
-			const full = path.join(root, rel);
-			const info = await lstat(full).catch((error: unknown) => {
-				if (isMissing(error)) return null;
-				throw error;
-			});
-			if (!info) content.push(`${rel}\0deleted`);
-			else if (info.isSymbolicLink()) content.push(`${rel}\0link\0${await readlink(full)}`);
-			else if (info.isFile()) content.push(`${rel}\0${info.mode}\0${await contentHash(full)}`);
-			else content.push(`${rel}\0${info.mode}`);
-		}
-		return { head, branch, digest: sha256(JSON.stringify([head, branch, index, content])) };
+		return collectGitStamp(root, rt, signal, contentHash);
 	}
 
 	/** Content hash, reused while the file stamp is unchanged so unchanged dirty files are not reread. */
@@ -715,7 +730,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	/** Untracked, nonignored files are additions in the worktree seam. */
 	async function untracked(signal: AbortSignal): Promise<FileChange[]> {
 		const paths = (await rt.git(root, ["ls-files", "-z", "--others", "--exclude-standard"], signal)).split("\0")
-			.filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl");
+			.filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl" && !enforcerRuntimePath(p));
 		const changes: FileChange[] = [];
 		for (const rel of paths) {
 			if (!scanned(rel)) { changes.push({ path: rel, status: "A", content: { kind: "skipped" } }); continue; }
@@ -766,7 +781,8 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	}
 
 	const commitEvidence = new Map<string, SeamEvidence>();
-	async function readEvidence(history: Result<readonly CommitEvent[]>, baseAncestor: boolean | null, signal: AbortSignal): Promise<ContentEvidence> {
+	let liveEvidence: { digest: string; index: SeamEvidence; worktree: SeamEvidence } | null = null;
+	async function readEvidence(history: Result<readonly CommitEvent[]>, baseAncestor: boolean | null, digest: string, signal: AbortSignal): Promise<ContentEvidence> {
 		liveReads = new Map();
 		liveRaced = false;
 		const readSeam = async (range: readonly string[], read: () => Promise<FileChange[]>): Promise<SeamEvidence> => {
@@ -794,6 +810,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			}
 			commits[c.sha] = found;
 		}
+		if (liveEvidence?.digest === digest) return { baseAncestor, commits, index: liveEvidence.index, worktree: liveEvidence.worktree };
 		const index = await attempt(() => readSeam(["--cached", "HEAD"], () => seam(["--cached", "HEAD"], signal)));
 		const worktree = await attempt(() => readSeam([], async () => [...await seam([], signal), ...await untracked(signal)]));
 		return { baseAncestor, commits, index, worktree };
@@ -833,7 +850,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				const ancestry = { baseAncestor: null as boolean | null };
 				history = await readHistory(issues, signal, progressAtPass, before.head, ancestry);
 				// Content is read inside the window, so a change during the read is a retry, never a finding.
-				evidence = await readEvidence(history, ancestry.baseAncestor, signal);
+				evidence = await readEvidence(history, ancestry.baseAncestor, before.digest, signal);
 				let after: typeof before | null = null;
 				try {
 					after = await gitStamp(signal);
@@ -855,6 +872,8 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 						git = unavailable(detail);
 					}
 				}
+				if (!changed && after && git.status === "fresh" && evidence.index.status === "fresh" && evidence.worktree.status === "fresh") liveEvidence = { digest: before.digest, index: evidence.index, worktree: evidence.worktree };
+				else liveEvidence = null;
 				if (changed) {
 					// No tight retry loop: the next read retries and publishes one coherent result.
 					const detail = "HEAD, index or worktree changed during read; retry next poll";
@@ -897,9 +916,22 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 					runStarts.push({ source: "state", loopToken: s.loop_token, startedAt: s.started_at });
 				}
 			}
+			let enforcer: LoopSnapshot["enforcer"] = null;
+			try {
+				const status = await readEnforcerStatus(root);
+				if (status) {
+					try {
+						const alerts = (await readAlerts(root)).filter(a => a.run.launchId === status.run.launchId);
+						enforcer = { alerts, status: !isAlive(status.pid) && status.state !== "stopped" ? { ...status, state: "down" } : status, commitsChecked: status.commitsChecked };
+					} catch (error) {
+						enforcer = { alerts: [], status: { ...status, state: "unavailable" }, commitsChecked: status.commitsChecked };
+						issues.push({ source: "enforcer", kind: "unavailable", detail: message(error) });
+					}
+				}
+			} catch (error) { issues.push({ source: "enforcer", kind: "unavailable", detail: message(error) }); }
 			const snapshot = deriveLoopSnapshot({
 				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
-				git, history, evidence, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
+				git, history, evidence, gitVersion: before?.digest ?? null, enforcer, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
 			if (journalResult.status === "fresh") lastGood.journal = { value: journalResult.value, observedAt };
 			if (stateResult.status === "fresh") {

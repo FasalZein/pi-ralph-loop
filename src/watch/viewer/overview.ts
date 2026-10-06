@@ -202,7 +202,7 @@ export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1
 }
 
 /** Phone status block (design spec section 4): badge, bar with count, then iteration · items left · ETA. */
-export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, now: number, error: string | null, live: LiveFeed | null = null): string[] {
+export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, now: number, error: string | null, chip: string | null = null, live: LiveFeed | null = null): string[] {
 	const failure = error === null ? null : style.red(`✕ refresh failed: ${clean(error)}`);
 	if (!snapshot) return [` ${failure ?? style.dim("reading loop state…")}`];
 	const p = statusParts(snapshot, now, live);
@@ -214,6 +214,7 @@ export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, no
 		const age = deriveLiveness(snapshot, live, now).lastEventAgeMs;
 		rows.push(` hb ${snapshot.health.heartbeatAgeMs === null ? "unavailable" : formatDuration(snapshot.health.heartbeatAgeMs)} · ${age === null ? "event" : `event ${formatDuration(age)}`}`);
 	}
+	if (chip) rows.push(` ${chip}`);
 	return rows;
 }
 

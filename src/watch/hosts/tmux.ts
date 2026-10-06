@@ -107,6 +107,20 @@ export function tmuxHost(runtime: TmuxRuntime = {}): Host {
 				throw error;
 			}
 		},
+		async addRole(handle, role, signal) {
+			if (!await verify(handle, signal)) throw new Error("Host changed before adding enforcer role");
+			const target = at(handle);
+			const created = (await run([...target, "new-window", "-d", "-P", "-F", "#{window_id}\t#{pane_id}", "-t", handle.sessionId, "-n", role.title, "-c", handle.root, ...BOOTSTRAP], signal)).trim().split("\t");
+			if (created.length !== 2 || !created.every(Boolean)) throw new Error("tmux new-window returned no identity");
+			const [windowId, paneId] = created;
+			const added = { ...handle, windowId, paneId };
+			await run([...target, "set-option", "-w", "-t", windowId, "remain-on-exit", "on"], signal);
+			const global = await run([...target, "show-environment", "-g"], signal);
+			const names = new Set([...Object.keys(runtime.env ?? process.env), ...global.split("\n").map(line => line.replace(/^-/, "").split("=")[0])].filter(variable => HERDR.test(variable)));
+			const argv = ["env", ...[...names].sort().flatMap(variable => ["-u", variable]), ...Object.entries(role.env).map(([key, value]) => `${key}=${value}`), ...role.argv];
+			await run([...target, "respawn-pane", "-k", "-t", paneId, "-c", handle.root, ...argv], signal);
+			return added;
+		},
 		verify,
 		async paneDead(handle: HostHandle, signal?: AbortSignal): Promise<boolean> {
 			const uncertain = (detail: string) => new Error(`tmux pane ${handle.paneId} of launch ${handle.launchId}: state uncertain (${detail})`);

@@ -17,6 +17,7 @@ export type CommandRuntime = StatusRuntime & {
 	readonly signal?: AbortSignal;
 	readonly env?: NodeJS.ProcessEnv;
 	/** Role command for the hidden driver; the default runs this package's `ralph _driver`. */
+	readonly enforcerArgv?: (manifest: string) => readonly string[];
 	readonly driverArgv?: (manifest: string) => readonly string[];
 	readonly readyTimeoutMs?: number;
 	readonly factTimeoutMs?: number;
@@ -38,4 +39,8 @@ export async function execute(request: Request, runtime: CommandRuntime = {}): P
 
 export async function runDriverRole(path: string, runtime: DriverRuntime = {}): Promise<DriverExit> {
 	return (await import("./command-lifecycle.js")).runDriverRole(path, runtime);
+}
+
+export async function runEnforcerRole(path: string, runtime: import("./enforcer-process.js").EnforcementRuntime = {}): Promise<import("./enforcer-process.js").EnforcerExit> {
+	return (await import("./command-lifecycle.js")).runEnforcerRole(path, runtime);
 }

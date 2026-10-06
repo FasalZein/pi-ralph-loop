@@ -525,3 +525,17 @@ test("80-column unavailable header keeps the branch and leaves the full unavaila
 	assert.equal(h.term.text().split("activity unavailable").length - 1, 1);
 	await quitByKeys(h);
 });
+
+test("persisted enforcer alerts drive the production chip; unavailable enforcer status stays visible", async t => {
+	const f = runningLoop(t);
+	const { appendAlerts, writeEnforcerStatus } = await import("../src/watch/alert-log.ts");
+	const run = { launchId: "viewer", loopToken: "run-a", startedAt: T("10:00") };
+	await appendAlerts(f.root, [{ timestamp: NOW, level: "WARN", rule: "test-edit", item: "B", commit: null, evidence: ["edited test"], run }]);
+	await writeEnforcerStatus(f.root, { v: 1, pid: process.pid, run, configHash: "pinned", state: "ready", polledAt: NOW, commitsChecked: 3, counts: { HARD: 0, WARN: 1, INFO: 0 }, stop: null });
+	const h = start(f.root, new ReplayTerminal(200, 50));
+	try {
+		await until(() => h.term.text().includes("enforcer 1 warn"), "persisted WARN chip");
+		await writeEnforcerStatus(f.root, { v: 1, pid: process.pid, run, configHash: "pinned", state: "down", polledAt: NOW, commitsChecked: 3, counts: { HARD: 0, WARN: 1, INFO: 0 }, stop: null });
+		h.tick(); await until(() => h.term.text().includes("enforcer down"), "down chip");
+	} finally { await quitByKeys(h); }
+});

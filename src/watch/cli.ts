@@ -1,12 +1,13 @@
-import { execute, runDriverRole, type Request } from "./commands.js";
+import { execute, runDriverRole, runEnforcerRole, type Request } from "./commands.js";
 
 const USAGE = "Usage: ralph launch <root> [--fresh|--relaunch|--resume]\n       ralph stop <root> [--timeout <seconds>]\n       ralph status <root>\n       ralph watch <root>";
-type Parsed = { readonly kind: "help" } | { readonly kind: "driver"; readonly manifest: string } | { readonly kind: "watch"; readonly root: string } | { readonly kind: "request"; readonly request: Request };
+type Parsed = { readonly kind: "help" } | { readonly kind: "driver"; readonly manifest: string } | { readonly kind: "enforcer"; readonly manifest: string } | { readonly kind: "watch"; readonly root: string } | { readonly kind: "request"; readonly request: Request };
 
 /** Parse argv; null means a usage error. */
 export function parse(argv: readonly string[]): Parsed | null {
 	if (argv.length === 0 || (argv.length === 1 && (argv[0] === "-h" || argv[0] === "--help"))) return { kind: "help" };
 	const [command, root, ...rest] = argv;
+	if (command === "_enforcer") return root && rest.length === 0 && root.startsWith("/") ? { kind: "enforcer", manifest: root } : null;
 	if (command === "_driver") return root && rest.length === 0 && root.startsWith("/") ? { kind: "driver", manifest: root } : null;
 	if (!root || root.startsWith("-")) return null;
 	if (command === "status") return rest.length === 0 ? { kind: "request", request: { kind: "status", root } } : null;
@@ -30,6 +31,13 @@ export async function main(argv: readonly string[]): Promise<number> {
 	const parsed = parse(argv);
 	if (!parsed) { console.error(USAGE); return 2; }
 	if (parsed.kind === "help") { console.log(USAGE); return 0; }
+	if (parsed.kind === "enforcer") {
+		const abort = new AbortController();
+		const stop = () => abort.abort();
+		for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.once(signal, stop);
+		try { const exit = await runEnforcerRole(parsed.manifest, { signal: abort.signal }); return exit.reason === "stopped" ? 0 : 1; }
+		finally { for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.removeListener(signal, stop); }
+	}
 	if (parsed.kind === "driver") {
 		const abort = new AbortController();
 		for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.once(signal, () => abort.abort());

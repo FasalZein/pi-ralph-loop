@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { execute, LAUNCH_READY_TIMEOUT_MS, STOP_ACK_TIMEOUT_MS } from "../src/watch/commands.ts";
-import { readManifest } from "../src/watch/command-lifecycle.ts";
-import { connectEvents, immediateGate, runDriver } from "../src/watch/driver.ts";
+import { readManifest, runEnforcerRole } from "../src/watch/command-lifecycle.ts";
+import { connectEvents, fifoGate, immediateGate, runDriver } from "../src/watch/driver.ts";
 import { loadMission } from "../src/watch/config.ts";
 import { readHostRecord, writeHostRecord, type Host, type HostHandle } from "../src/watch/host.ts";
 import { writeState } from "../src/state.ts";
@@ -36,6 +36,7 @@ function recordingHost(dead: boolean | ((handle: HostHandle) => boolean) = false
 			if (openDelayMs) await new Promise<void>((resolve, reject) => { const timer = setTimeout(resolve, openDelayMs); signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true }); });
 			return { v: 1, kind: "tmux", root, launchId, name: "n", socket: "/tmp/none", sessionId: "$9", windowId: "@9", paneId: "%9", createdAt: "x" } satisfies HostHandle;
 		},
+		async addRole(handle) { calls.push("addRole"); return { ...handle, windowId: "@10", paneId: "%10" }; },
 		async verify() { calls.push("verify"); return true; },
 		async paneDead(handle) { return typeof dead === "function" ? dead(handle) : dead; },
 		async close(handle) { calls.push("close"); closed.push(handle.launchId); },
@@ -346,4 +347,41 @@ test("recovery cut off by the deadline keeps the previous record (J1)", { timeou
 	assert.ok(!outcome.ok && /not ready within 0.3 s/.test(outcome.error), JSON.stringify(outcome));
 	assert.equal(calls.some((args) => args.includes("new-session") || args.includes("kill-session")), false);
 	assert.equal(readHostRecord(root)?.launchId, "old-launch");
+});
+
+// No role may start after preflight's validated mission hash changes.
+test("enforcer role refuses a launch manifest with a different config pin", async t => {
+	const root = scratch(t);
+	const manifest = join(root, ".ralph/launch-test.json");
+	writeFileSync(manifest, JSON.stringify({ v: 1, launchId: "test", root, mode: "fresh", configHash: "different", branch: null }));
+	await assert.rejects(runEnforcerRole(manifest), /Mission changed after launch preflight/);
+	assert.equal(existsSync(join(root, ".ralph/enforcer.json")), false);
+});
+
+for (const role of ["dead", "silent"] as const) test(`launch never dispatches while the enforcer is ${role}`, async t => {
+	const root = scratch(t, true, false);
+	const abort = new AbortController();
+	let driver: Promise<unknown> | null = null;
+	t.after(async () => { abort.abort(); await driver; rmSync(root, { recursive: true, force: true }); });
+	const base = recordingHost(false);
+	const host: Host = {
+		...base.host,
+		async open(r, launchId, spec, signal) {
+			driver = runDriver({ mission: await loadMission(root), launchId, gate: fifoGate(root, launchId), lifecycle: "managed" }, {
+				piCommand: { file: process.execPath, args: ["--import", import.meta.resolve("tsx"), fakePi] },
+				env: { ...process.env, FAKE_PI_STDIN_LOG: piLog(root), FAKE_PI_SCENARIO: "{}" },
+				signal: abort.signal, shutdownGraceMs: 100, log: () => {},
+			});
+			return base.host.open(r, launchId, spec, signal);
+		},
+		async paneDead(handle) { return role === "dead" && handle.paneId === "%10"; },
+		async close(handle) { abort.abort(); await driver; await base.host.close(handle); },
+	};
+	const outcome = await execute({ kind: "launch", root, mode: "fresh" }, { host, ...quiet, readyTimeoutMs: 5000 });
+	assert.ok(!outcome.ok);
+	assert.match(outcome.error, role === "dead" ? /Enforcer role exited/ : /Driver and enforcer not ready/);
+	assert.ok(base.calls.includes("addRole"), "driver was ready and enforcer startup was attempted");
+	assert.equal(readFileSync(piLog(root), "utf8").includes('"type":"prompt"'), false);
+	if (role === "dead") assert.ok(base.calls.includes("close"));
+	else assert.equal(readHostRecord(root)?.launchId !== undefined, true);
 });

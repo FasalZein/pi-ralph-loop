@@ -543,8 +543,13 @@ for (const kind of ["dirty tracked", "untracked"] as const) {
 		};
 		const reader = openLoop(x.f.root, { runtime });
 		try {
-			// Warm the untracked file's stamp read so the flip lands in the evidence read, not the git stamp.
-			if (kind === "untracked") { armed = false; await reader.read(); armed = true; }
+			// Warm the untracked file's content hash, then invalidate live evidence
+			// through another path. The flip must still land in the evidence read,
+			// not the stamp read; unchanged polls now correctly skip evidence reads.
+			if (kind === "untracked") {
+				armed = false; await reader.read(); armed = true;
+				write(x.f, "src/a.ts", CLEAN);
+			}
 			let s = await reader.read();
 			assert.equal(armed, false, "the flip ran");
 			let alerts = evaluate(s, s.mission!, x.launch);
