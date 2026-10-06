@@ -23,13 +23,16 @@ test("RPC: correlates responses, preserves LF framing and cancels dialogs", asyn
 	} finally { await rpc.close(100); }
 });
 
-test("RPC: final assistant usage counts once; no assistant text retained", () => {
+test("RPC: final assistant usage counts once; capped assistant text is live only", () => {
 	const events: DriverEvent[] = [];
 	const monitor = new RpcMonitor((e) => events.push(e));
 	const message = { role: "assistant", content: [{ type: "text", text: "SECRET" }], usage: { input: 12, output: 4, cacheRead: 7, cacheWrite: 3, cost: { total: 0.125 } } };
 	for (const type of ["message_update", "message_end", "turn_end", "agent_end"]) monitor.record({ type, message, messages: [message] }, () => {});
 	assert.deepEqual(monitor.totals, { input: 12, output: 4, cacheRead: 7, cacheWrite: 3, costUsd: 0.125, messages: 1, dialogsCancelled: 0, refusals: 0 });
-	assert.equal(JSON.stringify(events).includes("SECRET"), false);
+	assert.deepEqual(events.filter((e) => e.kind === "message"), [{ kind: "message", text: "SECRET" }]);
+	monitor.record({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "a".repeat(600) }, { type: "thinking", thinking: "private" }] } }, () => {});
+	assert.equal(events.filter((e) => e.kind === "message").at(-1)?.text.length, 500);
+	assert.equal(JSON.stringify(monitor.tools).includes("SECRET"), false);
 });
 
 test("RPC: tool buffer keeps 200 calls, pairs durations and retains unmatched ends", () => {

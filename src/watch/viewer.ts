@@ -1,5 +1,8 @@
 import path from "node:path";
 import { type Component, isKeyRelease, type KeyId, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
+import { connectEvents, matchingHello } from "./events.js";
+import { activityRows, activityTitle } from "./viewer/activity.js";
+import { applyFrame, disconnect, emptyFeed, FILTERS, type FeedFilter, type LiveFeed } from "./viewer/live.js";
 import { openLoop } from "./loop-state.js";
 import type { LoopReader, LoopSnapshot } from "./types.js";
 import { allocate, clean, fit, Lines, message, Panel, type Region, Stack, style } from "./viewer/layout.js";
@@ -34,6 +37,7 @@ export type ViewerRuntime = {
 	readonly setInterval: (fn: () => void, ms: number) => unknown;
 	readonly clearInterval: (handle: unknown) => void;
 	readonly openLoop: (root: string) => LoopReader;
+	readonly connectEvents?: typeof connectEvents;
 };
 
 const defaultRuntime = (): ViewerRuntime => ({
@@ -51,6 +55,9 @@ type ViewerState = {
 	error: string | null;
 	confirmQuit: boolean;
 	lastCtrlCAt: number | null;
+	screen: "overview" | "activity";
+	filter: FeedFilter;
+	live: LiveFeed;
 };
 
 /**
@@ -76,7 +83,7 @@ class GuardedAltScreen extends TuiAltScreen {
 }
 
 const QUIT_PROMPT = `Quit Ralph Watch? The loop keeps running.   ${style.bold("y")} quit   ${style.bold("n")} stay`;
-const QUIT_KEYS = ` ${style.bold("⇧Q")} Quit`;
+const QUIT_KEYS = ` a Activity  Esc Back  F Filter  · ${style.bold("⇧Q")} Quit`;
 
 /** The standalone Ralph Watch viewer. Resolves after a deliberate quit; never exits the process. */
 export async function runViewer(spec: { readonly roots: readonly string[]; readonly initialRoot?: string }, runtime: ViewerRuntime = defaultRuntime()): Promise<void> {
@@ -85,7 +92,7 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	// Fails before the alternate screen opens, so a bad root prints a plain error.
 	const reader = runtime.openLoop(root);
 	const { terminal } = runtime;
-	const state: ViewerState = { snapshot: null, error: null, confirmQuit: false, lastCtrlCAt: null };
+	const state: ViewerState = { snapshot: null, error: null, confirmQuit: false, lastCtrlCAt: null, screen: "overview", filter: "all", live: emptyFeed() };
 	// Drawn without pi-tui layout, so it works when the layout itself fails.
 	const drawRenderError = (error: unknown) => {
 		try {
@@ -102,14 +109,19 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const worktree = clean(path.basename(root));
 	const branch = () => state.snapshot?.git?.branch ? clean(state.snapshot.git.branch) : null;
 	const now = () => runtime.now();
-	const header = new Lines((width) => [headerLine(state.snapshot, worktree, width, terminal.columns)], "header");
+	const header = new Lines((width) => [headerLine(state.snapshot, worktree, width, terminal.columns, state.live, now())], "header");
 	const phoneHeader = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}`, ` ${worktree}${branch() ? ` · ${branch()}` : ""}`], "header");
-	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error), "status");
-	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error), "status");
+	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error, null, state.live), "status");
+	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error, state.live), "status");
 	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS], "footer");
 	const current = new Panel(() => currentTitle(state.snapshot), (width) => currentBody(state.snapshot, width), "Current item");
 	const items = new Panel((width) => itemsTitle(state.snapshot, width), (width) => itemRows(state.snapshot, width), "Items");
 	const iterations = new Panel((width) => iterationsTitle(state.snapshot, width), () => iterationsBody(state.snapshot), "Iterations");
+
+	let activityHeight = 0;
+	const activityHeader = new Lines(() => [` ${activityTitle(state.filter)}`], "Activity");
+	const activity = new Lines((width) => activityRows(state.live, state.filter, width, activityHeight), "Activity");
+	const liveStrip = new Lines((width) => activityRows(state.live, "all", width, 1), "Activity");
 
 	// ---- Frame (Look A on desktop, rules only on phones) ----
 	// Inner column widths of the main row, left to right; junctions sit between them.
@@ -128,7 +140,7 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	// The stack clips this leaf to the height of its row.
 	const vrule = new Lines(() => Array.from({ length: terminal.rows }, () => style.dim("│")), "frame");
 	const framed = (component: Component) => new Stack("hstack", () => [{ component: vrule, size: 1 }, { component, size: Math.max(0, terminal.columns - 2) }, { component: vrule, size: 1 }]);
-	const [fHeader, fStatus, fFooter] = [header, status, footer].map(framed);
+	const [fHeader, fStatus, fFooter, fLive] = [header, status, footer, liveStrip].map(framed);
 	const mainRow = new Stack("hstack", () => {
 		const panels = columns.length === 3 ? [items, current, iterations] : [current, items];
 		return [...panels.flatMap((component, index) => [{ component: vrule, size: 1 }, { component, size: columns[index] ?? 0 }]), { component: vrule, size: 1 }];
@@ -137,9 +149,15 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const regions = (): Region[] => {
 		const cols = terminal.columns;
 		const rows = terminal.rows;
+		if (state.screen === "activity") {
+			activityHeight = Math.max(0, rows - 3);
+			const layout = [activityHeader, phoneRule, activity, footer];
+			const sizes = allocate(rows, [1, 1, "rest", 1]);
+			return layout.map((component, index) => ({ component, size: sizes[index] }));
+		}
 		if (cols < PHONE_BELOW_COLS) {
-			const layout = [phoneHeader, phoneRule, phoneStatus, phoneRule, current, phoneRule, footer];
-			const sizes = allocate(rows, [2, 1, PHONE_STATUS_ROWS, 1, "rest", 1, 1]);
+			const layout = [phoneHeader, phoneRule, phoneStatus, phoneRule, current, phoneRule, liveStrip, footer];
+			const sizes = allocate(rows, [2, 1, PHONE_STATUS_ROWS + 1, 1, "rest", 1, 1, 1]);
 			return layout.map((component, index) => ({ component, size: sizes[index] }));
 		}
 		if (cols >= THREE_COLUMNS_COLS) columns = [ITEMS_COL, Math.max(0, cols - 4 - ITEMS_COL - SIDE_COL), SIDE_COL];
@@ -148,8 +166,8 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 			columns = [Math.max(0, cols - 3 - list), list];
 		}
 		const statusRows = cols >= ONE_ROW_STATUS_COLS ? 1 : 2;
-		const layout = [top, fHeader, divider, fStatus, open, mainRow, close, fFooter, bottom];
-		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1]);
+		const layout = [top, fHeader, divider, fStatus, open, mainRow, fLive, close, fFooter, bottom];
+		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1, 1]);
 		return layout.map((component, index) => ({ component, size: sizes[index] }));
 	};
 	tui.setLayoutRoot(new Stack("vstack", regions));
@@ -158,16 +176,59 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const abort = new AbortController();
 	let inflight: Promise<void> | null = null;
 	let stopped = false;
+	let connection: { identity: string; abort: AbortController; task: Promise<void> } | null = null;
+	const attach = async () => {
+		const snapshot = state.snapshot;
+		if (!snapshot || stopped) return;
+		if (snapshot.sources.state.status !== "fresh") {
+			connection?.abort.abort();
+			state.live = disconnect(state.live, "fresh loop identity unavailable");
+			return;
+		}
+		const identity = JSON.stringify(snapshot.run);
+		if (connection && connection.identity !== identity) {
+			state.live = disconnect(state.live, "loop identity changed");
+			connection.abort.abort();
+			await connection.task;
+		}
+		if (connection || stopped) return;
+		const controller = new AbortController();
+		const session = { identity, abort: controller, task: Promise.resolve() };
+		connection = session;
+		session.task = (async () => {
+			try {
+				for await (const frame of (runtime.connectEvents ?? connectEvents)({ root, run: snapshot.run }, controller.signal)) {
+					if (controller.signal.aborted || stopped) break;
+					if (frame.type === "hello") matchingHello(snapshot, frame);
+					if (frame.type === "event" && frame.event.kind === "fact" && (frame.event.fact.run.loopToken !== snapshot.run.loopToken || frame.event.fact.run.startedAt !== snapshot.run.startedAt)) throw new Error("Driver loop identity changed");
+					state.live = applyFrame(state.live, frame);
+					tui.requestRender();
+				}
+				if (!stopped) state.live = disconnect(state.live, "stream closed");
+			} catch (error) {
+				if (!stopped) state.live = disconnect(state.live, message(error));
+			} finally {
+				if (connection === session) connection = null;
+				if (!stopped) tui.requestRender();
+			}
+		})();
+	};
 	const refresh = () => {
 		// A slow read never overlaps the next one.
 		if (stopped || inflight) return;
 		inflight = reader.read(abort.signal).then(
-			(snapshot) => { state.snapshot = snapshot; state.error = null; },
-			(error: unknown) => { state.error = message(error); },
+			(snapshot) => { state.snapshot = snapshot; state.error = null; void attach(); },
+			(error: unknown) => { state.error = message(error); connection?.abort.abort(); state.live = disconnect(state.live, "snapshot unavailable"); },
 		).finally(() => { inflight = null; if (!stopped) tui.requestRender(); });
 	};
 
 	// ---- Keys ----
+	// Minimal navigation seam; T15 extends the screen field and key table.
+	const keymap: readonly { key: KeyId; act: () => void }[] = [
+		{ key: "a", act: () => { state.screen = "activity"; } },
+		{ key: "escape", act: () => { state.screen = "overview"; } },
+		{ key: "shift+f", act: () => { state.filter = FILTERS[(FILTERS.indexOf(state.filter) + 1) % FILTERS.length]; } },
+	];
 	let finish!: () => void;
 	const done = new Promise<void>((resolve) => { finish = resolve; });
 	const quit = async () => {
@@ -175,6 +236,9 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 		stopped = true;
 		runtime.clearInterval(timer);
 		abort.abort();
+		connection?.abort.abort();
+		await connection?.task;
+		await inflight;
 		try {
 			await terminal.drainInput(DRAIN_INPUT_MS);
 		} finally {
@@ -205,7 +269,11 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 			else return { consume: true };
 		} else if (key("shift+q")) state.confirmQuit = true;
 		else if (key("q")) tui.flash("Shift+Q to quit", HINT_MS);
-		else return undefined;
+		else {
+			const entry = keymap.find((entry) => key(entry.key));
+			if (!entry) return undefined;
+			entry.act();
+		}
 		tui.requestRender();
 		return { consume: true };
 	});

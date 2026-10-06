@@ -5,7 +5,7 @@ import test from "node:test";
 
 import { parseProgress } from "../src/watch/progress.ts";
 import type { Alert, LoopSnapshot, ObservedAttempt } from "../src/watch/types.ts";
-import { attemptCard, badge, currentBody, enforcerChip, formatTokens, headerLine, progressBar, statusRows } from "../src/watch/viewer/overview.ts";
+import { attemptCard, badge, currentBody, enforcerChip, formatTokens, headerLine, iterationsBody, progressBar, statusRows } from "../src/watch/viewer/overview.ts";
 import { clock, Fixture, readOnce, T } from "./fixtures/loop-state.ts";
 
 const NOW = Date.parse(T("12:00"));
@@ -219,4 +219,17 @@ test("token counts: integer kilo-tokens and one decimal for millions (approved p
 	assert.equal(formatTokens(215_000), "215k");
 	assert.equal(formatTokens(3_200_000), "3.2M");
 	assert.equal(formatTokens(41_600_000), "41.6M");
+});
+
+
+test("iterations panel shows durable run starts, interventions and gates; marks only exceptions", async (t) => {
+	const snapshot = await readOnce(designLoop(t));
+	const rows = iterationsBody({ ...snapshot, iterations: [
+		{ kind: "run", at: T("10:00"), token: "run-a", phase: "initialized" },
+		{ kind: "gate", at: T("10:31"), iteration: 1, item: "01", promise: "NEXT", commit: "abcdef0123456789", accepted: true, reason: null, marks: [] },
+		{ kind: "intervention", at: T("10:32"), op: "steer", accepted: true, reason: null },
+		{ kind: "gate", at: T("10:33"), iteration: 2, item: "02", promise: "WAIT", commit: null, accepted: false, reason: "missing\x1b[2J proof", marks: ["rejection"] },
+		{ kind: "gate", at: T("10:34"), iteration: 2, item: "02", promise: "STOP", commit: "123456789abcdef", accepted: true, reason: null, marks: ["enforcer"] },
+	] }).map(plain);
+	assert.deepEqual(rows, ["iteration 4/8", "⚠ it2 02 STOP 1234567", "✕ it2 02 WAIT missing proof", "✎ steer", "it1 01 NEXT abcdef0", `run initialized ${T("10:00")}`]);
 });

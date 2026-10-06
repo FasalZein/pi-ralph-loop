@@ -1,3 +1,6 @@
+// Authority: owner decision Q1 on #17, 2026-10-06. Text is live-only, never journaled.
+export const MESSAGE_CHARS = 500;
+
 /** Identity evidence for a launch and its loop. */
 export type RunKey = {
 	readonly launchId: string | null;
@@ -319,6 +322,8 @@ export type LoopSnapshot = {
 	readonly issues: readonly Issue[];
 	/** Journal usage summed for the current loop token (owner Q4 on #15); null without fresh state and journal. */
 	readonly usage: RunUsage | null;
+	/** Fresh journal history only. Null means unavailable, not empty history. */
+	readonly iterations: readonly IterationEntry[] | null;
 };
 
 export type LoopReader = {
@@ -343,6 +348,7 @@ export type DriverCounters = { readonly dialogsCancelled: number; readonly refus
 export type DriverEvent =
 	| { readonly kind: "tool-start" | "tool-end"; readonly tool: ToolEntry }
 	| { readonly kind: "assistant-end"; readonly usage: Usage; readonly costUsd: number; readonly stopReason: string | null; readonly model: string | null }
+	| { readonly kind: "message"; readonly text: string }
 	| { readonly kind: "activity" }
 	| { readonly kind: "dialog-cancelled"; readonly method: string; readonly title: string | null }
 	| { readonly kind: "refusal"; readonly tool: string; readonly text: string }
@@ -402,3 +408,11 @@ export type Health = {
 	/** Null when state is not fresh; retained counters never feed comparisons. */
 	readonly counters: { readonly errors: Counter; readonly bundleRejections: Counter } | null;
 };
+
+/** Operator timeline: marks denote exceptions, never successful gates. */
+export type IterationEntry =
+	| { readonly kind: "run"; readonly at: string; readonly token: string; readonly phase: "initialized" | "resumed" }
+	| { readonly kind: "intervention"; readonly at: string; readonly op: "stop" | "steer"; readonly accepted: boolean; readonly reason: string | null }
+	| { readonly kind: "gate"; readonly at: string; readonly iteration: number; readonly promise: import("../loop/control-promise.js").ControlPromise; readonly item: string | null; readonly commit: string | null; readonly accepted: boolean; readonly reason: string | null; readonly marks: readonly ("rejection" | "enforcer")[] }
+	| { readonly kind: "parent"; readonly at: string; readonly commit: string; readonly reason: string | null }
+	| { readonly kind: "incomplete"; readonly at: string; readonly reason: string };

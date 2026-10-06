@@ -347,3 +347,49 @@ for (const [patch, expected] of [[{ committedAt: null }, /commit time unavailabl
 	});
 	assert.equal(timeline.durations.A.ms, null); assert.equal(timeline.eta.n, 0); assert.ok(issues.some((i) => expected.test(i.detail)));
 });
+
+test("iteration history shows gates and interventions, correlates only unambiguous commits", async () => {
+	const { f, records } = buildTimeline();
+	try {
+		f.journal([...records, { v: 1, k: "x", r: "L3", t: iso("13:27"), op: "stop", id: "stop", ok: 1 },
+			{ v: 1, k: "g", r: "L3", t: iso("13:28"), tok: "run-c", i: 2, p: "WAIT", ok: 0, why: "proof missing" }]);
+		const s = await readOnce(f, clock(T("13:40")));
+		const gates = s.iterations?.filter((e) => e.kind === "gate");
+		assert.equal(gates?.[0].commit, s.git?.commits?.find((c) => c.passedItems.includes("A"))?.sha);
+		assert.equal(gates?.[0].item, "A");
+		assert.equal(gates?.at(-1)?.commit, null);
+		assert.deepEqual(gates?.at(-1)?.marks, ["rejection"]);
+		assert.ok(s.iterations?.some((e) => e.kind === "intervention" && e.op === "stop"));
+		assert.ok(s.iterations?.some((e) => e.kind === "parent" && e.reason === "owner fix"));
+	} finally { f.close(); }
+});
+
+test("iteration gates retain NEXT, STOP, COMPLETE and WAIT; only rejections and enforcer findings have marks", async () => {
+	const { deriveIterations } = await import("../src/watch/timeline.ts");
+	const { readJournal } = await import("../src/watch/journal.ts");
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	try {
+		const pass = f.pass("A", T("10:30"));
+		const decision = (time: string, p: "NEXT" | "STOP" | "COMPLETE" | "WAIT", ok: 0 | 1 = 1): JournalRecord => ({ v: 1, k: "g", r: "L1", t: iso(time), tok: "run-a", i: 1, p, ok });
+		const records: JournalRecord[] = [run("L1", "10:00"), loop("L1", "10:00", "run-a"),
+			gate("L1", "10:31", "run-a"),
+			decision("10:32", "WAIT", 0),
+			decision("10:33", "STOP"),
+			decision("10:34", "COMPLETE")];
+		f.journal(records); f.state(true, T("10:00"));
+		const snapshot = await readOnce(f);
+		const journal = { ...readJournal(f.root), launches: [{ launchId: "L1", at: T("10:00") }], runs: snapshot.runStarts, stops: [], coverageStart: T("10:00") };
+		const entries = deriveIterations({ journal, commits: snapshot.git!.commits, items: snapshot.items, alerts: [
+			{ timestamp: T("10:30"), level: "WARN", rule: "scope", commit: pass, item: "A", evidence: ["file"], run: snapshot.run },
+		] });
+		const gates = entries?.filter((e) => e.kind === "gate");
+		assert.deepEqual(gates?.map((e) => e.promise), ["NEXT", "WAIT", "STOP", "COMPLETE"]);
+		assert.deepEqual(gates?.map((e) => e.marks), [["enforcer"], ["rejection"], [], []]);
+		assert.deepEqual(gates?.map((e) => e.item), ["A", "B", "B", "B"]);
+		const incomplete = deriveIterations({ journal: { ...journal, rotated: true }, commits: snapshot.git!.commits, alerts: [] });
+		assert.equal(incomplete?.[0].kind, "incomplete");
+		assert.ok(incomplete?.filter((e) => e.kind === "gate").every((e) => e.commit === null));
+		const ambiguous = deriveIterations({ journal, commits: [...snapshot.git!.commits!, { ...snapshot.git!.commits!.at(-1)!, sha: "another" }], alerts: [] });
+		assert.equal(ambiguous?.find((e) => e.kind === "gate")?.commit, null);
+	} finally { f.close(); }
+});

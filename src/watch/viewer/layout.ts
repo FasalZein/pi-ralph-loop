@@ -65,6 +65,7 @@ export const style = {
 	red: sgr("31"),
 	green: sgr("32"),
 	yellow: sgr("33"),
+	blue: sgr("34"),
 } as const;
 
 /**

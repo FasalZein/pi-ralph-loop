@@ -15,7 +15,7 @@ import { GIT_BINARY_SNIFF_BYTES, parseDiff, textContent } from "./file-content.j
 import { linearRegex } from "./regex.js";
 import { isJsTs, isTestPath } from "./content.js";
 import { parseJournal } from "./journal.js";
-import { deriveTimeline } from "./timeline.js";
+import { deriveIterations, deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
@@ -291,6 +291,8 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		retained,
 		issues,
 		usage: runUsage(journal, state?.loop_token ?? null),
+		// T12 supplies persisted alerts at this seam; no in-memory enforcer state is authoritative.
+		iterations: deriveIterations({ journal, commits, items, alerts: [] }),
 	} satisfies LoopSnapshot);
 }
 

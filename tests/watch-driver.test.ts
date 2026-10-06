@@ -98,7 +98,7 @@ function currentHello(frames: EventFrame[]) { const hello = frames.find((f) => f
 const run = { launchId: "launch", loopToken: "token", startedAt: "2026-09-30T00:00:00.000Z" };
 
 test("driver: counts final usage once, records gate decisions and never persists raw pi output", async (t) => {
-	const message = { role: "assistant", content: [{ text: "SECRET-ASSISTANT" }], usage: { input: 12, output: 5, cacheRead: 3, cacheWrite: 2, cost: { total: 0.0123 } } };
+	const message = { role: "assistant", content: [{ type: "text", text: "SECRET-ASSISTANT" }], usage: { input: 12, output: 5, cacheRead: 3, cacheWrite: 2, cost: { total: 0.0123 } } };
 	const f = await start(t, { steps: [
 		{ op: "sleep", ms: 100 },
 		fact(1, { kind: "iteration-start", phase: "initialized" }),
@@ -114,6 +114,7 @@ test("driver: counts final usage once, records gate decisions and never persists
 	] });
 	assert.equal((await f.result).reason, "loop-finished");
 	await f.consume;
+	assert.ok(f.frames.some((r) => r.type === "event" && r.event.kind === "message" && r.event.text === "SECRET-ASSISTANT"));
 	const { readJournal } = await import("../src/watch/journal.ts");
 	const journal = readJournal(f.root);
 	const usage = journal.records.filter((r) => r.k === "u");

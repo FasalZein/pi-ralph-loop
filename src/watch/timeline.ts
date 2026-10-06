@@ -1,5 +1,5 @@
 import type { RalphLoopState } from "../types.js";
-import type { Boundary, CommitEvent, Duration, Issue, JournalView, ObservedItem, RunStart, Span, Timeline } from "./types.js";
+import type { Alert, Boundary, CommitEvent, IterationEntry, Duration, Issue, JournalView, ObservedItem, RunStart, Span, Timeline } from "./types.js";
 
 /** Timing uses fresh facts only. Unknown coverage is not a zero-length interval. */
 export function deriveTimeline(input: {
@@ -88,4 +88,44 @@ export function deriveTimeline(input: {
 	const median = n === 0 ? null : n % 2 ? values[Math.floor(n / 2)] : (values[n / 2 - 1] + values[n / 2]) / 2;
 	const itemsLeft = items.filter((i) => !i.passes).length;
 	return { timeline: { coverage, boundaries, stopped, elapsed, currentItem, durations, eta: { estimateMs: median === null ? null : median * itemsLeft, n, itemsLeft } }, issues };
+}
+
+/** Owner Q2 on #17: correlate by commit time; never guess a SHA from ambiguous evidence. */
+export function deriveIterations(input: {
+	journal: JournalView | null; commits: readonly CommitEvent[] | null; alerts: readonly Alert[]; items?: readonly ObservedItem[];
+}): readonly IterationEntry[] | null {
+	const { journal, commits, alerts, items = [] } = input;
+	if (!journal) return null;
+	const entries: IterationEntry[] = [];
+	let boundary: { at: string; launch: string; token: string } | null = null;
+	let startedAt: string | null = null;
+	const incomplete = journal.rotated || journal.badLines > 0 || journal.records[0]?.k !== "run" || journal.records.some((r) => r.k === "d" && r.e === "gap");
+	if (incomplete) entries.push({ kind: "incomplete", at: journal.coverageStart ?? "", reason: "history incomplete" });
+	const ordered = commits !== null && commits.every((c, i) => c.committedAt !== null && c.parents.length === 1 && (i === 0 || Date.parse(c.committedAt) >= Date.parse(commits[i - 1].committedAt!)));
+	for (const r of journal.records) {
+		if (r.k === "loop") {
+			entries.push({ kind: "run", at: r.t, token: r.tok, phase: r.ph });
+			boundary = { at: r.t, launch: r.r, token: r.tok };
+			startedAt = r.sa;
+		} else if (r.k === "x") entries.push({ kind: "intervention", at: r.t, op: r.op, accepted: r.ok === 1, reason: r.why ?? null });
+		else if (r.k === "g") {
+			const from: number | null = boundary && boundary.launch === r.r && boundary.token === r.tok ? Date.parse(boundary.at) : null;
+			const candidates = from === null ? [] : (commits ?? []).filter((c) => c.committedAt !== null && Date.parse(c.committedAt) > from && Date.parse(c.committedAt) < Date.parse(r.t));
+			const c = !incomplete && ordered && candidates.length === 1 && candidates[0].passesKnown ? candidates[0] : null;
+			const commit = c?.sha ?? null;
+			// Rebuild pending items at the gate from pass commits. Already-passed items without
+			// a flip in base..HEAD were passed before this observed history.
+			const pending = !incomplete && ordered ? items.find((item) => {
+				const flips = (commits ?? []).filter((c) => c.passedItems.includes(item.key));
+				return (!item.passes || flips.length > 0) && !flips.some((c) => c.committedAt !== null && Date.parse(c.committedAt) <= Date.parse(r.t));
+			})?.key ?? null : null;
+			const marks: ("rejection" | "enforcer")[] = r.ok === 0 ? ["rejection"] : [];
+			if (commit && alerts.some((a) => a.commit === commit && a.run.launchId === r.r && a.run.loopToken === r.tok && a.run.startedAt === startedAt)) marks.push("enforcer");
+			entries.push({ kind: "gate", at: r.t, iteration: r.i, promise: r.p, item: c?.passedItems.length === 1 ? c.passedItems[0] : c?.blockerItem ?? pending, commit, accepted: r.ok === 1, reason: r.why ?? null, marks });
+			boundary = { at: r.t, launch: r.r, token: r.tok };
+			if (from === null) startedAt = null;
+		}
+	}
+	for (const c of commits ?? []) if (c.kind === "parent" && c.committedAt !== null) entries.push({ kind: "parent", at: c.committedAt, commit: c.sha, reason: c.parentReason });
+	return entries.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 }

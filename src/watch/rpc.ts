@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { object } from "./journal.js";
-import type { DriverEvent, IterationTotals, ToolEntry } from "./types.js";
+import { MESSAGE_CHARS, type DriverEvent, type IterationTotals, type ToolEntry } from "./types.js";
 
 export const TOOL_BUFFER_CALLS = 200;
 export const PI_READY_TIMEOUT_MS = 120_000;
@@ -62,6 +62,9 @@ export class RpcMonitor {
 		}
 		if (record.type === "message_end" && object(record.message) && record.message.role === "assistant") {
 			const message = record.message;
+			const content = Array.isArray(message.content) ? message.content : [];
+			const assistantText = content.flatMap((part: unknown) => object(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n").slice(0, MESSAGE_CHARS);
+			if (assistantText) this.emit({ kind: "message", text: assistantText });
 			const raw = object(message.usage) ? message.usage : {};
 			const usage = { input: number(raw.input), output: number(raw.output), cacheRead: number(raw.cacheRead), cacheWrite: number(raw.cacheWrite) };
 			const costUsd = object(raw.cost) ? number(raw.cost.total) : 0;

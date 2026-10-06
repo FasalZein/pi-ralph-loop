@@ -1,4 +1,4 @@
-import { connectEvents } from "./events.js";
+import { connectEvents, matchingHello } from "./events.js";
 import { deriveLiveness } from "./health.js";
 import { openLoop, type ObservationRuntime } from "./loop-state.js";
 import type { LoopSnapshot } from "./types.js";
@@ -39,8 +39,7 @@ export async function readStatus(root: string, runtime: StatusRuntime = {}): Pro
 			if (signal.aborted) throw signal.reason;
 			if (first.done || first.value.type !== "hello") throw new Error("Driver hello unavailable");
 			const hello = first.value;
-			if (snapshot.sources.state.status !== "fresh" || snapshot.run.loopToken === null || snapshot.run.startedAt === null || hello.loop?.token !== snapshot.run.loopToken || hello.loop.startedAt !== snapshot.run.startedAt) throw new Error("Driver hello does not match fresh loop identity");
-			liveness = deriveLiveness(snapshot, { connected: true, lastPiAt: hello.lastPiAt }, runtime.observation?.now() ?? new Date());
+			liveness = deriveLiveness(snapshot, matchingHello(snapshot, hello), runtime.observation?.now() ?? new Date());
 			if (liveness.stalled === "unavailable") warnings.push("activity: driver has no event receive time");
 		} catch (error) {
 			warnings.push(`activity unavailable: ${error instanceof Error ? error.message : String(error)}`);

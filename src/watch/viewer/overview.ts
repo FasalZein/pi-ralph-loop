@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { deriveLiveness } from "../health.js";
 import type { Alert, ItemStatus, LoopSnapshot, ObservedAttempt, ObservedItem } from "../types.js";
+import type { LiveFeed } from "./live.js";
 import { clean, fit, style } from "./layout.js";
 
 /**
@@ -73,8 +74,8 @@ const findItem = (snapshot: LoopSnapshot, key: string | null): ObservedItem | nu
 	key === null ? null : snapshot.items.find((item) => item.key === key) ?? null;
 
 /** Status badge. Owner Q3 on #15: NEEDS YOU only when the stopped item is blocked. Owner D1: health through deriveLiveness. */
-export function badge(snapshot: LoopSnapshot, now: number): string {
-	const health = deriveLiveness(snapshot, null, now).badge;
+export function badge(snapshot: LoopSnapshot, now: number, live: LiveFeed | null = null): string {
+	const health = deriveLiveness(snapshot, live, now).badge;
 	switch (health) {
 		case "running": return style.accent("● RUNNING");
 		case "stale": return style.yellow("◐ STALE");
@@ -104,17 +105,19 @@ const abbreviate = (text: string, width: number): string => (width <= 0 ? "" : v
  * heartbeat age shows when the title and one worktree column still fit. Identity text on the left
  * gives way: the model drops first, then the branch and then the worktree are abbreviated.
  */
-export function headerLine(snapshot: LoopSnapshot | null, worktree: string, width: number, cols: number): string {
+export function headerLine(snapshot: LoopSnapshot | null, worktree: string, width: number, cols: number, activity: LiveFeed | null = null, now: number = Date.now()): string {
 	const elapsed = snapshot?.timeline.elapsed;
 	const usage = snapshot?.usage;
 	const branch = snapshot?.git?.branch;
 	const model = snapshot?.state?.model_id;
 	const hb = snapshot?.health.heartbeatAgeMs;
 	const live = snapshot?.health.state === "running" || snapshot?.health.state === "stale";
+	const eventAge = snapshot ? deriveLiveness(snapshot, activity, now).lastEventAgeMs : null;
 	const title = ` ${style.accent("◆")} ${style.bold("Ralph Watch")}`;
 	const rightPart = (withHb: boolean) => {
 		const parts = [
 			withHb && live && hb !== null && hb !== undefined ? `hb ${formatDuration(hb)}` : null,
+			activity ? (eventAge !== null ? `event ${formatDuration(eventAge)}` : "activity unavailable") : null,
 			elapsed ? `Time ${formatDuration(elapsed.wallMs)}` : null,
 			usage && cols >= TOKENS_FROM_COLS ? `In ${formatTokens(usage.input)} · Cached ${formatTokens(usage.cacheRead)} · Out ${formatTokens(usage.output)}` : null,
 			usage ? `$${usage.costUsd.toFixed(2)}` : null,
@@ -141,7 +144,7 @@ export function headerLine(snapshot: LoopSnapshot | null, worktree: string, widt
 
 type StatusParts = { badge: string; bar: ((width: number) => string) | null; count: string | null; iteration: string | null; left: string | null; eta: string | null };
 
-function statusParts(snapshot: LoopSnapshot, now: number): StatusParts {
+function statusParts(snapshot: LoopSnapshot, now: number, live: LiveFeed | null): StatusParts {
 	const total = snapshot.items.length;
 	const passed = snapshot.items.filter((item) => item.passes).length;
 	const state = snapshot.state;
@@ -158,7 +161,7 @@ function statusParts(snapshot: LoopSnapshot, now: number): StatusParts {
 		eta = estimate === null ? "ETA n/a" : `ETA ~${formatDuration(estimate)} n=${snapshot.timeline.eta.n}`;
 	}
 	return {
-		badge: badge(snapshot, now),
+		badge: badge(snapshot, now, live),
 		bar: total > 0 ? (width) => progressBar(passed, total, width) : null,
 		count: total > 0 ? `${passed}/${total}` : null,
 		iteration: state ? `iteration ${state.iteration}/${state.max_iterations}` : null,
@@ -170,10 +173,10 @@ function statusParts(snapshot: LoopSnapshot, now: number): StatusParts {
  * Status rows for the desktop frame (design spec section 3): one row from 150 columns, else two
  * (bar and count; then iteration, items left, ETA and the chip). `chip` is null until persisted alerts exist (owner Q1 on #15).
  */
-export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1 | 2, now: number, error: string | null, chip: string | null = null): string[] {
+export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1 | 2, now: number, error: string | null, chip: string | null = null, live: LiveFeed | null = null): string[] {
 	const failure = error === null ? null : style.red(`✕ refresh failed: ${clean(error)}`);
 	if (!snapshot) return [` ${failure ?? style.dim("reading loop state…")}`];
-	const p = statusParts(snapshot, now);
+	const p = statusParts(snapshot, now, live);
 	const lead = ` ${p.badge}${" ".repeat(BADGE_GAP)}`;
 	const tail = (parts: readonly (string | null)[]) => parts.filter((part): part is string => part !== null);
 	const withBar = (before: string, after: string) => {
@@ -199,14 +202,18 @@ export function statusRows(snapshot: LoopSnapshot | null, width: number, rows: 1
 }
 
 /** Phone status block (design spec section 4): badge, bar with count, then iteration · items left · ETA. */
-export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, now: number, error: string | null): string[] {
+export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, now: number, error: string | null, live: LiveFeed | null = null): string[] {
 	const failure = error === null ? null : style.red(`✕ refresh failed: ${clean(error)}`);
 	if (!snapshot) return [` ${failure ?? style.dim("reading loop state…")}`];
-	const p = statusParts(snapshot, now);
+	const p = statusParts(snapshot, now, live);
 	const rows = [` ${p.badge}${failure ? `   ${failure}` : ""}`];
 	if (p.bar && p.count) rows.push(` ${p.bar(Math.max(0, width - 1 - 2 - visibleWidth(p.count) - 1))}  ${p.count}`);
 	const facts = [p.iteration, p.left, p.eta].filter((part): part is string => part !== null);
 	if (facts.length) rows.push(` ${facts.join(" · ")}`);
+	if (live) {
+		const age = deriveLiveness(snapshot, live, now).lastEventAgeMs;
+		rows.push(` hb ${snapshot.health.heartbeatAgeMs === null ? "unavailable" : formatDuration(snapshot.health.heartbeatAgeMs)} · ${age === null ? "activity unavailable" : `event ${formatDuration(age)}`}`);
+	}
 	return rows;
 }
 
@@ -374,7 +381,7 @@ export function currentBody(snapshot: LoopSnapshot | null, width: number): strin
 	return rows.length && rows[0] === "" ? rows.slice(1) : rows;
 }
 
-/** Iterations column at 170+ columns: run and iteration count only (owner Q5 on #15). */
+/** Iterations column at 170+ columns: durable run, intervention and gate history (#17). */
 export function iterationsTitle(snapshot: LoopSnapshot | null, width: number): string {
 	const runs = snapshot?.runStarts.length ?? 0;
 	return spread(style.bold("Iterations"), runs > 0 ? `run ${runs}` : "", width);
@@ -382,5 +389,16 @@ export function iterationsTitle(snapshot: LoopSnapshot | null, width: number): s
 
 export function iterationsBody(snapshot: LoopSnapshot | null): string[] {
 	const state = snapshot?.state;
-	return state ? [`iteration ${state.iteration}/${state.max_iterations}`] : [];
+	const entries = snapshot?.iterations;
+	if (entries === null) return [...(state ? [`iteration ${state.iteration}/${state.max_iterations}`] : []), "history unavailable"];
+	const rows = [...(entries ?? [])].reverse().map((e) => {
+		switch (e.kind) {
+			case "run": return `run ${clean(e.phase)} ${clean(e.at)}`;
+			case "intervention": return `${style.blue("✎")} ${e.op}${e.accepted ? "" : " rejected"}${e.reason ? ` ${clean(e.reason)}` : ""}`;
+			case "gate": return `${e.marks.length ? (e.marks.includes("rejection") ? style.red("✕ ") : style.yellow("⚠ ")) : ""}it${e.iteration} ${clean(e.item ?? "?")} ${e.promise}${e.commit ? ` ${e.commit.slice(0, 7)}` : ""}${!e.accepted && e.reason ? ` ${clean(e.reason)}` : ""}`;
+			case "parent": return `${style.blue("✎")} parent ${e.commit.slice(0, 7)}${e.reason ? ` ${clean(e.reason)}` : ""}`;
+			case "incomplete": return clean(e.reason);
+		}
+	});
+	return [...(state ? [`iteration ${state.iteration}/${state.max_iterations}`] : []), ...rows];
 }

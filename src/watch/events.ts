@@ -1,6 +1,6 @@
 import { connect } from "node:net";
 import { ControlError, parseEventFrame, readMetadata } from "./transport.js";
-import type { EventFrame, RunKey } from "./types.js";
+import type { EventFrame, LoopSnapshot, RunKey } from "./types.js";
 
 /** Read-only replay then live stream. Pull-based reads leave backpressure local. */
 export async function* connectEvents(target: { root: string; run?: RunKey }, signal?: AbortSignal): AsyncIterable<EventFrame> {
@@ -39,3 +39,9 @@ export async function* connectEvents(target: { root: string; run?: RunKey }, sig
 	} finally { signal?.removeEventListener("abort", abort); socket.destroy(); }
 }
 
+
+/** Fresh state and hello must agree before either status or viewer trusts live evidence. */
+export function matchingHello(snapshot: LoopSnapshot, hello: Extract<EventFrame, { type: "hello" }>): { connected: true; lastPiAt: string | null } {
+	if (snapshot.sources.state.status !== "fresh" || snapshot.run.loopToken === null || snapshot.run.startedAt === null || hello.loop?.token !== snapshot.run.loopToken || hello.loop.startedAt !== snapshot.run.startedAt || (snapshot.run.launchId !== null && snapshot.run.launchId !== hello.launchId)) throw new Error("Driver hello does not match fresh loop identity");
+	return { connected: true, lastPiAt: hello.lastPiAt };
+}

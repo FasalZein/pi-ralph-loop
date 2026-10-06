@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { openLoop } from "../src/watch/loop-state.ts";
-import type { LoopReader, LoopSnapshot } from "../src/watch/types.ts";
+import { emptyTotals } from "../src/watch/rpc.ts";
+import type { EventFrame, LoopReader, LoopSnapshot } from "../src/watch/types.ts";
 import { runViewer, type ViewerRuntime } from "../src/watch/viewer.ts";
 import { allocate } from "../src/watch/viewer/layout.ts";
 import { clock, Fixture, T } from "./fixtures/loop-state.ts";
@@ -33,7 +34,7 @@ type Harness = {
 	closed: () => boolean;
 };
 
-function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) => LoopReader = (r) => r): Harness {
+function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) => LoopReader = (r) => r, connectEvents?: ViewerRuntime["connectEvents"]): Harness {
 	let now = Date.parse(NOW);
 	let tickFn: (() => void) | null = null;
 	let intervalMs: number | null = null;
@@ -41,6 +42,7 @@ function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) =>
 	let closed = false;
 	const runtime: ViewerRuntime = {
 		terminal: term,
+		connectEvents,
 		now: () => now,
 		setInterval: (fn, ms) => { tickFn = fn; intervalMs = ms; return 1; },
 		clearInterval: () => { tickFn = null; },
@@ -100,7 +102,7 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	// split divider, main, closing divider, footer, bottom.
 	assert.match(s[0], /^╭─+╮$/);
 	// Started 10:00, observed 12:00, heartbeat now; no journal, so no cost.
-	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S+ {2}⎇ \S+ +hb 0s · Time 2h 00m │$/);
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state… +hb 0s · activity unavailable · Time 2h 00m │$/);
 	assert.match(s[2], /^├─+┤$/);
 	// Bar: 78 inner - " ● RUNNING   " (13) - "  1/2  " (7) = 58 columns; 1/2 passed fills 29.
 	assert.equal(s[3], `│ ● RUNNING   ${"█".repeat(29)}${"⣿".repeat(29)}  1/2  │`);
@@ -110,13 +112,14 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	// Owner Q2 on #15: list column clamp(34, 60, round(0.38 * 80)) = 34; current item 80 - 3 - 34 = 43, junction at 44.
 	assert.equal(s[5].indexOf("┬"), 44);
 	assert.match(s[5], /^├─+┬─+┤$/);
-	for (let row = 6; row <= 20; row++) {
+	for (let row = 6; row <= 19; row++) {
 		assert.equal(s[row][0], "│");
 		assert.equal(s[row][44], "│");
 		assert.equal(s[row][79], "│");
 	}
 	assert.equal(s[21].indexOf("┴"), 44);
-	assert.match(s[22], /^│ ⇧Q Quit +│$/);
+	assert.match(s[20], /^│ activity unavailable.*│$/);
+	assert.match(s[22], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
 	assert.match(s[23], /^╰─+╯$/);
 	assert.match(s[6], /^│ ● Current item B {2}Evil +title +│ Items +1\/2 │$/);
 	// Category "c". Run count and time on item need complete history (journal coverage), so both are omitted.
@@ -139,12 +142,13 @@ test("desktop frame at 200x50: status in one row and three columns Items 46, mid
 	// One status row from 150 columns, so the split divider is row 4. Owner Q2: 46 | 200 - 4 - 46 - 64 = 86 | 64.
 	assert.equal(s[4].indexOf("┬"), 47);
 	assert.equal(s[4].lastIndexOf("┬"), 134);
-	for (let row = 5; row <= 46; row++) for (const col of [0, 47, 134, 199]) assert.equal(s[row][col], "│");
+	for (let row = 5; row <= 45; row++) for (const col of [0, 47, 134, 199]) assert.equal(s[row][col], "│");
 	assert.equal(s[47].indexOf("┴"), 47);
 	assert.equal(s[47].lastIndexOf("┴"), 134);
 	assert.match(s[5], /^│ Items +1\/2 │ ● Current item B {2}Evil +title +│ Iterations +run 1 │$/);
 	assert.match(s[6], /^│ ✓ A Parse config +│ c +│ iteration 1\/9 +│$/);
-	assert.match(s[48], /^│ ⇧Q Quit +│$/);
+	assert.match(s[46], /^│ activity unavailable.*│$/);
+	assert.match(s[48], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
 	assert.match(s[49], /^╰─+╯$/);
 	await quitByKeys(h);
 });
@@ -161,7 +165,7 @@ test("at 150 columns the header keeps the token group with a long branch and mod
 	await until(() => h.term.text().includes("Cached"), "header with tokens");
 	const s = h.term.screen();
 	// Left: title 14 + 2 + worktree (ralph-loop-state-XXXXXX, 23) + 2 + branch 29 = 70; the model (+26) would pass 148 - 2 - 65.
-	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S{6} {2}⎇ rw\/typed-session-validation +hb 0s · Time 2h 00m · In 3\.2M · Cached 41\.6M · Out 215k · \$18\.61 │$/);
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S{6} {2}⎇ rw\/typed-sessi… +hb 0s · activity unavailable · Time 2h 00m · In 3\.2M · Cached 41\.6M · Out 215k · \$18\.61 │$/);
 	assert.equal([...s[1]].length, 150);
 	await quitByKeys(h);
 });
@@ -177,12 +181,14 @@ test("resize to phone width drops the outer frame; a tiny terminal renders trunc
 	// Design spec section 4: header (2), rule, status (3), rule, current item, rule, tabs/keys.
 	assert.match(s[0], /^ ◆ Ralph Watch +$/);
 	assert.match(s[1], /^ ralph-loop-state-\S+ · \S+ +$/);
-	for (const row of [2, 6, 22]) assert.match(s[row], /^─{79}$/);
+	for (const row of [2, 7, 21]) assert.match(s[row], /^─{79}$/);
 	assert.match(s[3], /^ ● RUNNING +$/);
 	assert.match(s[4], /^ █+⣿+ {2}1\/2 $/);
 	assert.match(s[5], /^ iteration 1\/9 · 1 item left · ETA n\/a +$/);
-	assert.match(s[7], /^ ● Current item B {2}Evil +title +$/);
-	assert.match(s[23], /^ ⇧Q Quit +$/);
+	assert.match(s[6], /^ hb 0s · activity unavailable +$/);
+	assert.match(s[8], /^ ● Current item B {2}Evil +title +$/);
+	assert.match(s[22], /^ activity unavailable.*$/);
+	assert.match(s[23], /^ a Activity  Esc Back  F Filter  · ⇧Q Quit +$/);
 	// Owner, 2026-10-01: no minimum size; render the phone layout and truncate.
 	h.term.resize(12, 3);
 	await until(() => h.term.screen()[0].startsWith(" ◆ Ralph Wa"), "tiny frame");
@@ -392,4 +398,97 @@ test("runViewer rejects a missing root before it opens the alternate screen", as
 	}), /ENOENT|no such file/);
 	assert.equal(term.started, false);
 	assert.equal(term.writes.length, 0);
+});
+
+
+const liveHello = (nextSeq = 1, lastPiAt = NOW): Extract<EventFrame, { type: "hello" }> => ({ v: 1, type: "hello", launchId: "L1", pid: 1, nextSeq, lastPiAt, loop: { token: "run-a", startedAt: T("10:00"), iteration: 1 }, tools: [{ id: "replayed", name: "read", label: "buffered.ts", startedAt: NOW, endedAt: null }], totals: emptyTotals(), counters: { dialogsCancelled: 0, refusals: 0, badRecords: 0, badFacts: 0, subscriberDrops: 0 }, state: "launched" });
+const waitAbort = (signal?: AbortSignal) => new Promise<void>((resolve) => {
+	if (signal?.aborted) resolve(); else signal?.addEventListener("abort", () => resolve(), { once: true });
+});
+
+for (const [cols, rows] of [[80, 24], [120, 40], [200, 50], [60, 30]]) test(`live feed at ${cols}x${rows}: replay, messages, filter keys and sanitized terminal output`, async (t) => {
+	const f = runningLoop(t);
+	const h = start(f.root, new ReplayTerminal(cols, rows), (r) => r, async function* (_, signal) {
+		yield liveHello();
+		yield { v: 1, type: "event", seq: 1, at: NOW, event: { kind: "message", text: "agent text\x1b]0;HOSTILE\x07\x1b[2J\r\u009b" } };
+		await waitAbort(signal);
+	});
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("agent text"), "overview live row");
+	h.term.send("a");
+	await until(() => h.term.text().includes("Activity · all"), "Activity screen");
+	assert.match(h.term.text(), /Read buffered.ts/);
+	assert.match(h.term.text(), /◆ agent text/);
+	h.term.send("F");
+	await until(() => h.term.text().includes("Activity · tools"), "tools filter");
+	assert.ok(!h.term.text().includes("agent text"));
+	h.term.send("F");
+	await until(() => h.term.text().includes("Activity · messages"), "messages filter");
+	assert.ok(!h.term.text().includes("buffered.ts"));
+	h.term.send("F");
+	await until(() => h.term.text().includes("Activity · errors"), "errors filter");
+	h.term.send("F");
+	await until(() => h.term.text().includes("Activity · all"), "all filter");
+	h.term.send("\x1b");
+	await until(() => h.term.text().includes("Current item"), "back to overview");
+	assert.doesNotMatch(h.term.writes.join(""), /HOSTILE|\u009b|\x1b]0;/);
+	await quitByKeys(h);
+});
+
+test("event disconnect never invents STALLED; reconnect waits for the refresh tick and shows a gap", async (t) => {
+	const f = runningLoop(t);
+	let attempts = 0;
+	const h = start(f.root, new ReplayTerminal(200, 50), (r) => r, async function* (_, signal) {
+		attempts++;
+		yield liveHello(attempts === 1 ? 1 : 5, T("11:00"));
+		if (attempts === 1) throw new Error("lost stream");
+		await waitAbort(signal);
+	});
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("lost stream"), "disconnect row");
+	assert.ok(!h.term.text().includes("STALLED"));
+	assert.equal(attempts, 1);
+	h.tick();
+	await until(() => h.term.text().includes("STALLED"), "reconnected stale pi receive time");
+	assert.equal(attempts, 2);
+	assert.match(h.term.text(), /event 1h 00m/);
+	h.term.send("a");
+	await until(() => h.term.text().includes("Activity · all") && h.term.text().includes("activity gap"), "gap row");
+	assert.match(h.term.text(), /Read buffered.ts/);
+	await quitByKeys(h);
+});
+
+test("a mismatched hello stays unavailable and does not establish live liveness", async (t) => {
+	const f = runningLoop(t);
+	const h = start(f.root, new ReplayTerminal(200, 50), (r) => r, async function* () {
+		yield { ...liveHello(1, T("10:00")), loop: { token: "other", startedAt: T("10:00"), iteration: 1 } };
+	});
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("does not match"), "identity failure");
+	assert.ok(!h.term.text().includes("STALLED"));
+	assert.ok(!h.term.text().includes("buffered.ts"));
+	await quitByKeys(h);
+});
+
+test("a relaunch reconnects to the fresh run and clears old activity; a quiet restart cannot prove a stall", async (t) => {
+	const f = runningLoop(t);
+	let attempts = 0;
+	const h = start(f.root, new ReplayTerminal(200, 50), (r) => r, async function* (_, signal) {
+		attempts++;
+		if (attempts === 1) yield liveHello();
+		else yield { ...liveHello(), lastPiAt: null, loop: { token: "run-b", startedAt: NOW, iteration: 1 }, tools: [{ id: "fresh", name: "edit", label: "new.ts", startedAt: null, endedAt: null }] };
+		await waitAbort(signal);
+	});
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("buffered.ts"), "old run replay");
+	f.state(true, NOW, "run-b", { owner_heartbeat_at: NOW });
+	h.tick();
+	await until(() => h.term.text().includes("new.ts"), "new run replay");
+	assert.equal(attempts, 2);
+	assert.ok(!h.term.text().includes("STALLED"));
+	h.term.send("a");
+	await until(() => h.term.text().includes("Activity · all"), "new run Activity");
+	assert.ok(!h.term.text().includes("buffered.ts"));
+	assert.match(h.term.text(), /Edit new.ts/);
+	await quitByKeys(h);
 });

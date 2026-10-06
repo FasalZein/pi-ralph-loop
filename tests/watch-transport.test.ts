@@ -149,3 +149,11 @@ test("transport: recovers stale socket but refuses a live socket", async (t) => 
 	try { await assert.rejects(new LineServer(path, () => {}).listen(), { code: "driver-active" }); }
 	finally { await server.close(); }
 });
+
+test("events: message frames validate the owner-adopted 500-character cap", async () => {
+	const { parseEventFrame } = await import("../src/watch/transport.ts");
+	const frame = (text: unknown) => JSON.stringify({ v: 1, type: "event", seq: 1, at: "2026-10-06T10:00:00.000Z", event: { kind: "message", text } });
+	assert.equal(parseEventFrame(frame("a".repeat(500)))?.type, "event");
+	assert.equal(parseEventFrame(frame("a".repeat(501))), null);
+	assert.equal(parseEventFrame(frame(42)), null);
+});
