@@ -17,7 +17,7 @@ import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
 	CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
-	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, SourceName, SourceReport,
+	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, RunUsage, SourceName, SourceReport,
 } from "./types.js";
 
 const LOOP_FILE = ".ralph/loop.md";
@@ -301,7 +301,19 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		sources,
 		retained,
 		issues,
+		usage: runUsage(journal, state?.loop_token ?? null),
 	} satisfies LoopSnapshot);
+}
+
+/** Each `u` record holds the usage since the previous flush, so a sum counts every message once. */
+function runUsage(journal: JournalView | null, token: string | null): RunUsage | null {
+	if (!journal || token === null) return null;
+	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+	for (const r of journal.records) {
+		if (r.k !== "u" || r.tok !== token) continue;
+		usage.input += r.in; usage.output += r.out; usage.cacheRead += r.cr; usage.cacheWrite += r.cw; usage.costUsd += r.c;
+	}
+	return usage;
 }
 
 function itemTitle(item: BundleItem, key: string, mission: Mission | null): string {

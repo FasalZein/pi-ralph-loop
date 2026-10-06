@@ -294,6 +294,8 @@ export type LoopSnapshot = {
 	readonly sources: Readonly<Record<SourceName, SourceReport>>;
 	readonly retained: RetainedValues;
 	readonly issues: readonly Issue[];
+	/** Journal usage summed for the current loop token (owner Q4 on #15); null without fresh state and journal. */
+	readonly usage: RunUsage | null;
 };
 
 export type LoopReader = {
@@ -302,6 +304,8 @@ export type LoopReader = {
 };
 
 export type Usage = { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number };
+/** Token and cost totals of one run. */
+export type RunUsage = Usage & { readonly costUsd: number };
 export type IterationTotals = Usage & { readonly costUsd: number; readonly messages: number; readonly dialogsCancelled: number; readonly refusals: number };
 export type ToolEntry = {
 	readonly id: string;

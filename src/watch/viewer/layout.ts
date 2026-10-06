@@ -29,25 +29,6 @@ export class Stack extends Container {
 }
 
 /**
- * Split `total` into integer parts proportional to `weights` that sum exactly to `total`.
- * Largest remainder; ties go to the earlier part.
- */
-export function splitExact(total: number, weights: readonly number[]): number[] {
-	const sum = weights.reduce((a, b) => a + b, 0);
-	if (total <= 0 || sum <= 0) return weights.map(() => 0);
-	const exact = weights.map((w) => (total * w) / sum);
-	const parts = exact.map(Math.floor);
-	let left = total - parts.reduce((a, b) => a + b, 0);
-	const order = exact.map((value, index) => ({ index, frac: value - Math.floor(value) })).sort((a, b) => b.frac - a.frac || a.index - b.index);
-	for (const { index } of order) {
-		if (left <= 0) break;
-		parts[index]++;
-		left--;
-	}
-	return parts;
-}
-
-/**
  * Give each size in order until `total` runs out; the single "rest" entry takes what fixed sizes leave.
  * The result always sums to `total`. A small terminal truncates from the bottom (owner, 2026-10-01: no minimum size).
  */
@@ -106,14 +87,14 @@ export class Lines implements Component {
 
 /** A titled region. The frame draws the borders it shares with its neighbours (design spec: Look A). */
 export class Panel implements Component {
-	constructor(private readonly title: () => string, private readonly body: (width: number) => readonly string[], private readonly name: string) {}
+	constructor(private readonly title: (width: number) => string, private readonly body: (width: number) => readonly string[], private readonly name: string) {}
 
 	render(width: number): string[] {
 		const inner = Math.max(0, width - 2);
 		const pad = (line: string) => fit(` ${fit(line, inner)} `, width);
 		let title: string;
 		try {
-			title = this.title();
+			title = this.title(inner);
 		} catch {
 			title = style.bold(this.name);
 		}

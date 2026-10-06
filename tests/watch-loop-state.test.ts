@@ -551,3 +551,30 @@ test("openLoop rejects a missing root and a mismatched mission", async () => {
 	} finally { f.close(); g.close(); }
 });
 
+
+// ---- Usage (owner Q4 on #15: header tokens and cost cover the current run) ----
+
+test("usage sums journal usage records of the current loop token only", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		const u = (tok: string | null, i: number, n: number) => ({ v: 1 as const, k: "u" as const, r: "L1", t: T("10:30"), tok, i, in: n, out: 2 * n, cr: 3 * n, cw: 4 * n, c: n / 100, n: 1, dc: 0, pr: 0 });
+		f.journal([u("run-old", 1, 1000), u("run-a", 1, 10), u("run-a", 1, 20), u("run-a", 2, 5), u(null, 1, 7000)]);
+		f.state(true, T("10:00"), "run-a");
+		const s = await readOnce(f);
+		// Hand sum for run-a: 10 + 20 + 5 = 35 input; output, cache read and cache write scale by 2, 3 and 4.
+		assert.deepEqual({ ...s.usage, costUsd: Number(s.usage!.costUsd.toFixed(6)) }, { input: 35, output: 70, cacheRead: 105, cacheWrite: 140, costUsd: 0.35 });
+		// No state means no current token: nothing proves which records belong to the run.
+		rmSync(path.join(f.root, ".ralph/loop.md"));
+		assert.equal((await readOnce(f)).usage, null);
+	} finally { f.close(); }
+});
+
+test("usage is null without a fresh journal and zero for a run with no usage records yet", async () => {
+	const f = new Fixture([{ id: "A", passes: false }]);
+	try {
+		f.state(true, T("10:00"), "run-a");
+		assert.equal((await readOnce(f)).usage, null);
+		f.journal([{ v: 1, k: "loop", r: "L1", t: T("10:00"), tok: "run-a", sa: T("10:00"), i: 1, ph: "initialized" }]);
+		assert.deepEqual((await readOnce(f)).usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 });
+	} finally { f.close(); }
+});

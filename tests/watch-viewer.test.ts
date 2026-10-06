@@ -4,7 +4,7 @@ import test from "node:test";
 import { openLoop } from "../src/watch/loop-state.ts";
 import type { LoopReader, LoopSnapshot } from "../src/watch/types.ts";
 import { runViewer, type ViewerRuntime } from "../src/watch/viewer.ts";
-import { allocate, splitExact } from "../src/watch/viewer/layout.ts";
+import { allocate } from "../src/watch/viewer/layout.ts";
 import { clock, Fixture, T } from "./fixtures/loop-state.ts";
 import { ReplayTerminal } from "./fixtures/replay-terminal.ts";
 
@@ -81,17 +81,6 @@ const quitByKeys = async (h: Harness) => {
 
 // ---- Layout helpers ----
 
-test("splitExact returns integer parts that sum to the total", () => {
-	// Hand-computed largest remainder: 120 * 3/5 = 72, 120 * 2/5 = 48 (design spec: grow gave 95/25).
-	assert.deepEqual(splitExact(120, [3, 2]), [72, 48]);
-	// 77 * 50/76 = 50.66, 77 * 26/76 = 26.34; the one leftover column goes to the larger remainder.
-	assert.deepEqual(splitExact(77, [50, 26]), [51, 26]);
-	// 197 * 50/76 = 129.61, 197 * 26/76 = 67.39.
-	assert.deepEqual(splitExact(197, [50, 26]), [130, 67]);
-	assert.deepEqual(splitExact(10, [1, 1, 1]), [4, 3, 3]);
-	assert.deepEqual(splitExact(0, [1, 1]), [0, 0]);
-});
-
 test("allocate fills fixed rows, gives the rest to the flexible row and truncates from the bottom", () => {
 	assert.deepEqual(allocate(24, [1, 2, "rest", 1]), [1, 2, 20, 1]);
 	assert.deepEqual(allocate(3, [1, 2, "rest", 1]), [1, 2, 0, 0]);
@@ -110,28 +99,35 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	// Rows (design spec section 3, two status rows below 150 columns): top, header, divider, status x2,
 	// split divider, main, closing divider, footer, bottom.
 	assert.match(s[0], /^╭─+╮$/);
-	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S+ {2}⎇ \S+ +│$/);
+	// Started 10:00, observed 12:00, heartbeat now; no journal, so no cost.
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S+ {2}⎇ \S+ +hb 0s · Time 2h 00m │$/);
 	assert.match(s[2], /^├─+┤$/);
-	assert.match(s[3], /^│ ● RUNNING {3}1\/2 items +│$/);
-	assert.match(s[4], /^│ +│$/);
-	// Inner width 77 splits 50:26 into 51 and 26 (hand-computed above), so the junction is column 52.
-	assert.equal(s[5].indexOf("┬"), 52);
+	// Bar: 78 inner - " ● RUNNING   " (13) - "  1/2  " (7) = 58 columns; 1/2 passed fills 29.
+	assert.equal(s[3], `│ ● RUNNING   ${"█".repeat(29)}${"⣿".repeat(29)}  1/2  │`);
+	// Without a journal the timing coverage is incomplete, so no duration is measured: ETA n/a (spec #1 story 20).
+	// One item left, 8 iterations left: no warning.
+	assert.match(s[4], /^│ {13}iteration 1\/9 {2}1 item left {2}ETA n\/a +│$/);
+	// Owner Q2 on #15: list column clamp(34, 60, round(0.38 * 80)) = 34; current item 80 - 3 - 34 = 43, junction at 44.
+	assert.equal(s[5].indexOf("┬"), 44);
 	assert.match(s[5], /^├─+┬─+┤$/);
 	for (let row = 6; row <= 20; row++) {
 		assert.equal(s[row][0], "│");
-		assert.equal(s[row][52], "│");
+		assert.equal(s[row][44], "│");
 		assert.equal(s[row][79], "│");
 	}
-	assert.equal(s[21].indexOf("┴"), 52);
+	assert.equal(s[21].indexOf("┴"), 44);
 	assert.match(s[22], /^│ ⇧Q Quit +│$/);
 	assert.match(s[23], /^╰─+╯$/);
-	assert.match(s[6], /^│ Current item +│ Items {2}1\/2 +│$/);
-	assert.match(s[7], /^│ ● B Evil +title +│ ✓ A Parse config +│$/);
+	assert.match(s[6], /^│ ● Current item B {2}Evil +title +│ Items +1\/2 │$/);
+	// Category "c" and the run in which B became current; time on item needs journal coverage, so it is omitted.
+	assert.match(s[7], /^│ c · 1 run +│ ✓ A Parse config +│$/);
 	assert.match(s[8], /^│ +│ ● B Evil +title +│$/);
+	assert.match(s[9], /^│ Steps +│ +│$/);
+	assert.match(s[10], /^│ 1 s +│ +│$/);
 	await quitByKeys(h);
 });
 
-test("desktop frame at 200x50: status in one row and the wider exact split", async (t) => {
+test("desktop frame at 200x50: status in one row and three columns Items 46, middle 86, side 64", async (t) => {
 	const f = runningLoop(t);
 	const h = start(f.root, new ReplayTerminal(200, 50));
 	await until(() => h.term.text().includes("RUNNING"), "first frame");
@@ -139,11 +135,15 @@ test("desktop frame at 200x50: status in one row and the wider exact split", asy
 	assert.equal(s.length, 50);
 	for (const row of s) assert.equal([...row].length, 200);
 	assert.match(s[0], /^╭─+╮$/);
-	assert.match(s[3], /^│ ● RUNNING {3}1\/2 items +│$/);
-	// One status row from 150 columns, so the split divider is row 4. Inner 197 splits into 130 and 67.
-	assert.equal(s[4].indexOf("┬"), 131);
-	for (let row = 5; row <= 46; row++) assert.equal(s[row][131], "│");
-	assert.equal(s[47].indexOf("┴"), 131);
+	assert.match(s[3], /^│ ● RUNNING {3}█+⣿+ {2}1\/2 {2}ETA n\/a {3}iteration 1\/9 {2}1 item left {2}│$/);
+	// One status row from 150 columns, so the split divider is row 4. Owner Q2: 46 | 200 - 4 - 46 - 64 = 86 | 64.
+	assert.equal(s[4].indexOf("┬"), 47);
+	assert.equal(s[4].lastIndexOf("┬"), 134);
+	for (let row = 5; row <= 46; row++) for (const col of [0, 47, 134, 199]) assert.equal(s[row][col], "│");
+	assert.equal(s[47].indexOf("┴"), 47);
+	assert.equal(s[47].lastIndexOf("┴"), 134);
+	assert.match(s[5], /^│ Items +1\/2 │ ● Current item B {2}Evil +title +│ Iterations +run 1 │$/);
+	assert.match(s[6], /^│ ✓ A Parse config +│ c · 1 run +│ iteration 1\/9 +│$/);
 	assert.match(s[48], /^│ ⇧Q Quit +│$/);
 	assert.match(s[49], /^╰─+╯$/);
 	await quitByKeys(h);
@@ -161,8 +161,10 @@ test("resize to phone width drops the outer frame; a tiny terminal renders trunc
 	assert.match(s[0], /^ ◆ Ralph Watch +$/);
 	assert.match(s[1], /^ ralph-loop-state-\S+ · \S+ +$/);
 	for (const row of [2, 6, 22]) assert.match(s[row], /^─{79}$/);
-	assert.match(s[3], /^ ● RUNNING {3}1\/2 items +$/);
-	assert.match(s[7], /^ Current item +$/);
+	assert.match(s[3], /^ ● RUNNING +$/);
+	assert.match(s[4], /^ █+⣿+ {2}1\/2 $/);
+	assert.match(s[5], /^ iteration 1\/9 · 1 item left · ETA n\/a +$/);
+	assert.match(s[7], /^ ● Current item B {2}Evil +title +$/);
 	assert.match(s[23], /^ ⇧Q Quit +$/);
 	// Owner, 2026-10-01: no minimum size; render the phone layout and truncate.
 	h.term.resize(12, 3);
@@ -310,9 +312,9 @@ test("a panel error shows inline in that panel; the rest of the frame stays", as
 	}));
 	await until(() => h.term.text().includes("failed"), "panel error");
 	const s = h.term.screen();
-	assert.match(s[6], /^│ Current item +│ Items {2}1\/2 +│$/);
+	assert.match(s[6], /^│ Current item +│ Items +1\/2 │$/);
 	assert.match(s[7], /^│ ✕ Current item failed: bad item +│ ✓ A Parse config +│$/);
-	assert.match(s[3], /^│ ● RUNNING {3}1\/2 items +│$/);
+	assert.match(s[3], /^│ ● RUNNING {3}█+⣿+ {2}1\/2 {2}│$/);
 	assert.match(s[23], /^╰─+╯$/);
 	await quitByKeys(h);
 });
@@ -331,7 +333,7 @@ test("a refresh failure redraws with the error, keeps running and recovers on th
 	await until(() => h.term.text().includes("refresh failed: disk gone"), "error line");
 	const s = h.term.screen();
 	// The last good snapshot stays on screen next to the error.
-	assert.match(s[3], /^│ ● RUNNING {3}1\/2 items {3}✕ refresh failed: disk gone +│$/);
+	assert.match(s[3], /^│ ● RUNNING {3}█+[▏▎▍▌▋▊▉]?⣿+ {2}1\/2 {2}✕ refresh failed: disk gone {2}│$/);
 	assert.match(s[0], /^╭─+╮$/);
 	assert.equal(h.resolved(), false);
 	fail = false;

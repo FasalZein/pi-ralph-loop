@@ -1,8 +1,9 @@
 import path from "node:path";
 import { type Component, isKeyRelease, type KeyId, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
 import { openLoop } from "./loop-state.js";
-import type { ItemStatus, LoopReader, LoopSnapshot } from "./types.js";
-import { allocate, clean, fit, Lines, message, Panel, type Region, splitExact, Stack, style } from "./viewer/layout.js";
+import type { LoopReader, LoopSnapshot } from "./types.js";
+import { allocate, clean, fit, Lines, message, Panel, type Region, Stack, style } from "./viewer/layout.js";
+import { currentBody, currentTitle, headerLine, itemRows, itemsTitle, iterationsBody, iterationsTitle, phoneStatusRows, statusRows } from "./viewer/overview.js";
 
 // Authority: spec #1 story 46 and the thresholds table ("Viewer refresh about 2 s"); design spec Behaviour.
 export const REFRESH_MS = 2_000;
@@ -16,8 +17,14 @@ export const PHONE_BELOW_COLS = 80;
 export const ONE_ROW_STATUS_COLS = 150;
 // Authority: design spec section 4: the phone status block has three rows.
 const PHONE_STATUS_ROWS = 3;
-// Authority: design spec section 3 diagram: current item 50 and item list 26 inner columns at 80 columns.
-const MAIN_SPLIT = [50, 26] as const;
+// Authority: design spec section 3: three columns (Items, Current item, Iterations) from 170 columns.
+export const THREE_COLUMNS_COLS = 170;
+// Authority: owner Q2 on #15 (prototype values, approved captures ov-80x24 and ov-120x40): below 170 columns
+// the item list column is clamp(34, 60, round(0.38 * columns)).
+const LIST_COL = { min: 34, max: 60, share: 0.38 } as const;
+// Authority: owner Q2 on #15 (capture ov-200x50): from 170 columns Items 46 and the side column 64; the middle takes the rest.
+const ITEMS_COL = 46;
+const SIDE_COL = 64;
 // Authority: pi interactive mode drains Kitty key releases for up to 1 s before it stops the terminal.
 const DRAIN_INPUT_MS = 1_000;
 
@@ -46,26 +53,6 @@ type ViewerState = {
 	lastCtrlCAt: number | null;
 };
 
-const GLYPH: Record<ItemStatus, string> = {
-	passed: style.green("✓"),
-	working: style.accent("●"),
-	retry: style.yellow("↻"),
-	blocked: style.red("✕"),
-	stopped: "■",
-	pending: style.dim("○"),
-};
-
-function badge(snapshot: LoopSnapshot): string {
-	const health = snapshot.health;
-	switch (health.state) {
-		case "running": return style.accent("● RUNNING");
-		case "stale": return style.yellow("◐ STALE");
-		case "stopped": return `■ STOPPED${health.stopped?.reason ? ` ${clean(health.stopped.reason)}` : ""}`;
-		case "not-started": return style.dim("○ NOT STARTED");
-		case "unknown": return style.yellow("STATE UNKNOWN");
-	}
-}
-
 /**
  * The top-level render boundary. pi-tui runs `doRender()` from its own render timer without an
  * exception handler, so a layout or root failure there would crash the process with the terminal
@@ -91,12 +78,6 @@ class GuardedAltScreen extends TuiAltScreen {
 const QUIT_PROMPT = `Quit Ralph Watch? The loop keeps running.   ${style.bold("y")} quit   ${style.bold("n")} stay`;
 const QUIT_KEYS = ` ${style.bold("⇧Q")} Quit`;
 
-const itemLabel = (snapshot: LoopSnapshot, key: string | null): string | null => {
-	if (key === null) return null;
-	const item = snapshot.items.find((candidate) => candidate.key === key);
-	return item ? clean(`${item.id ?? item.key} ${item.title}`) : clean(key);
-};
-
 /** The standalone Ralph Watch viewer. Resolves after a deliberate quit; never exits the process. */
 export async function runViewer(spec: { readonly roots: readonly string[]; readonly initialRoot?: string }, runtime: ViewerRuntime = defaultRuntime()): Promise<void> {
 	const root = spec.initialRoot ?? spec.roots[0];
@@ -120,39 +101,23 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	// ---- Regions ----
 	const worktree = clean(path.basename(root));
 	const branch = () => state.snapshot?.git?.branch ? clean(state.snapshot.git.branch) : null;
-	const statusLine = (): string => {
-		const parts: string[] = [];
-		const snapshot = state.snapshot;
-		if (snapshot) {
-			parts.push(badge(snapshot));
-			if (snapshot.items.length > 0) parts.push(`${snapshot.items.filter((item) => item.passes).length}/${snapshot.items.length} items`);
-		} else if (!state.error) parts.push(style.dim("reading loop state…"));
-		if (state.error) parts.push(style.red(`✕ refresh failed: ${clean(state.error)}`));
-		return parts.join("   ");
-	};
-	const header = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}  ${worktree}${branch() ? `  ⎇ ${branch()}` : ""}`], "header");
+	const now = () => runtime.now();
+	const header = new Lines((width) => [headerLine(state.snapshot, worktree, width, terminal.columns)], "header");
 	const phoneHeader = new Lines(() => [` ${style.accent("◆")} ${style.bold("Ralph Watch")}`, ` ${worktree}${branch() ? ` · ${branch()}` : ""}`], "header");
-	const status = new Lines(() => [` ${statusLine()}`], "status");
+	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error), "status");
+	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error), "status");
 	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS], "footer");
-	const current = new Panel(() => style.bold("Current item"), () => {
-		const snapshot = state.snapshot;
-		if (!snapshot) return [];
-		const running = itemLabel(snapshot, snapshot.currentItem);
-		if (running) return [`${style.accent("●")} ${running}`];
-		const stopped = itemLabel(snapshot, snapshot.stoppedItem);
-		return stopped ? [`■ ${stopped}`] : [];
-	}, "Current item");
-	const items = new Panel(() => {
-		const list = state.snapshot?.items ?? [];
-		return `${style.bold("Items")}${list.length ? style.dim(`  ${list.filter((item) => item.passes).length}/${list.length}`) : ""}`;
-	}, () => (state.snapshot?.items ?? []).map((item) => `${GLYPH[item.status]} ${clean(`${item.id ?? item.key} ${item.title}`)}`), "Items");
+	const current = new Panel(() => currentTitle(state.snapshot), (width) => currentBody(state.snapshot, width), "Current item");
+	const items = new Panel((width) => itemsTitle(state.snapshot, width), (width) => itemRows(state.snapshot, width), "Items");
+	const iterations = new Panel((width) => iterationsTitle(state.snapshot, width), () => iterationsBody(state.snapshot), "Iterations");
 
 	// ---- Frame (Look A on desktop, rules only on phones) ----
-	let split: readonly number[] = [0, 0];
+	// Inner column widths of the main row, left to right; junctions sit between them.
+	let columns: readonly number[] = [];
 	const rule = (left: string, fill: string, right: string, junction?: string) => new Lines((width) => {
 		const inner = Math.max(0, width - 2);
-		const body = junction ? `${fill.repeat(split[0])}${junction}${fill.repeat(Math.max(0, inner - split[0] - 1))}` : fill.repeat(inner);
-		return [style.dim(`${left}${body}${right}`)];
+		const body = junction ? columns.map((size) => fill.repeat(size)).join(junction) : fill.repeat(inner);
+		return [style.dim(`${left}${fit(body, inner)}${right}`)];
 	}, "frame");
 	const top = rule("╭", "─", "╮");
 	const divider = rule("├", "─", "┤");
@@ -164,21 +129,24 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const vrule = new Lines(() => Array.from({ length: terminal.rows }, () => style.dim("│")), "frame");
 	const framed = (component: Component) => new Stack("hstack", () => [{ component: vrule, size: 1 }, { component, size: Math.max(0, terminal.columns - 2) }, { component: vrule, size: 1 }]);
 	const [fHeader, fStatus, fFooter] = [header, status, footer].map(framed);
-	const mainRow = new Stack("hstack", () => [
-		{ component: vrule, size: 1 }, { component: current, size: split[0] },
-		{ component: vrule, size: 1 }, { component: items, size: split[1] },
-		{ component: vrule, size: 1 },
-	]);
+	const mainRow = new Stack("hstack", () => {
+		const panels = columns.length === 3 ? [items, current, iterations] : [current, items];
+		return [...panels.flatMap((component, index) => [{ component: vrule, size: 1 }, { component, size: columns[index] ?? 0 }]), { component: vrule, size: 1 }];
+	});
 
 	const regions = (): Region[] => {
 		const cols = terminal.columns;
 		const rows = terminal.rows;
 		if (cols < PHONE_BELOW_COLS) {
-			const layout = [phoneHeader, phoneRule, status, phoneRule, current, phoneRule, footer];
+			const layout = [phoneHeader, phoneRule, phoneStatus, phoneRule, current, phoneRule, footer];
 			const sizes = allocate(rows, [2, 1, PHONE_STATUS_ROWS, 1, "rest", 1, 1]);
 			return layout.map((component, index) => ({ component, size: sizes[index] }));
 		}
-		split = splitExact(cols - 3, MAIN_SPLIT);
+		if (cols >= THREE_COLUMNS_COLS) columns = [ITEMS_COL, Math.max(0, cols - 4 - ITEMS_COL - SIDE_COL), SIDE_COL];
+		else {
+			const list = Math.min(LIST_COL.max, Math.max(LIST_COL.min, Math.round(LIST_COL.share * cols)));
+			columns = [Math.max(0, cols - 3 - list), list];
+		}
 		const statusRows = cols >= ONE_ROW_STATUS_COLS ? 1 : 2;
 		const layout = [top, fHeader, divider, fStatus, open, mainRow, close, fFooter, bottom];
 		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1]);
