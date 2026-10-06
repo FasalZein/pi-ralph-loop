@@ -63,7 +63,7 @@ export class RpcMonitor {
 		if (record.type === "message_end" && object(record.message) && record.message.role === "assistant") {
 			const message = record.message;
 			const content = Array.isArray(message.content) ? message.content : [];
-			const assistantText = content.flatMap((part: unknown) => object(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n").slice(0, MESSAGE_CHARS);
+			const assistantText = Array.from(content.flatMap((part: unknown) => object(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n")).slice(0, MESSAGE_CHARS).join("");
 			if (assistantText) this.emit({ kind: "message", text: assistantText });
 			const raw = object(message.usage) ? message.usage : {};
 			const usage = { input: number(raw.input), output: number(raw.output), cacheRead: number(raw.cacheRead), cacheWrite: number(raw.cacheWrite) };

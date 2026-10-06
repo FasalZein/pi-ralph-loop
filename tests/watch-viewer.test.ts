@@ -102,7 +102,7 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	// split divider, main, closing divider, footer, bottom.
 	assert.match(s[0], /^╭─+╮$/);
 	// Started 10:00, observed 12:00, heartbeat now; no journal, so no cost.
-	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state… +hb 0s · activity unavailable · Time 2h 00m │$/);
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S+ {2}⎇ \S+ +hb 0s · event · Time 2h 00m │$/);
 	assert.match(s[2], /^├─+┤$/);
 	// Bar: 78 inner - " ● RUNNING   " (13) - "  1/2  " (7) = 58 columns; 1/2 passed fills 29.
 	assert.equal(s[3], `│ ● RUNNING   ${"█".repeat(29)}${"⣿".repeat(29)}  1/2  │`);
@@ -112,13 +112,14 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	// Owner Q2 on #15: list column clamp(34, 60, round(0.38 * 80)) = 34; current item 80 - 3 - 34 = 43, junction at 44.
 	assert.equal(s[5].indexOf("┬"), 44);
 	assert.match(s[5], /^├─+┬─+┤$/);
-	for (let row = 6; row <= 19; row++) {
+	for (let row = 6; row <= 18; row++) {
 		assert.equal(s[row][0], "│");
 		assert.equal(s[row][44], "│");
 		assert.equal(s[row][79], "│");
 	}
-	assert.equal(s[21].indexOf("┴"), 44);
+	assert.equal(s[19].indexOf("┴"), 44);
 	assert.match(s[20], /^│ activity unavailable.*│$/);
+	assert.match(s[21], /^├─+┤$/);
 	assert.match(s[22], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
 	assert.match(s[23], /^╰─+╯$/);
 	assert.match(s[6], /^│ ● Current item B {2}Evil +title +│ Items +1\/2 │$/);
@@ -142,12 +143,13 @@ test("desktop frame at 200x50: status in one row and three columns Items 46, mid
 	// One status row from 150 columns, so the split divider is row 4. Owner Q2: 46 | 200 - 4 - 46 - 64 = 86 | 64.
 	assert.equal(s[4].indexOf("┬"), 47);
 	assert.equal(s[4].lastIndexOf("┬"), 134);
-	for (let row = 5; row <= 45; row++) for (const col of [0, 47, 134, 199]) assert.equal(s[row][col], "│");
-	assert.equal(s[47].indexOf("┴"), 47);
-	assert.equal(s[47].lastIndexOf("┴"), 134);
+	for (let row = 5; row <= 44; row++) for (const col of [0, 47, 134, 199]) assert.equal(s[row][col], "│");
+	assert.equal(s[45].indexOf("┴"), 47);
+	assert.equal(s[45].lastIndexOf("┴"), 134);
 	assert.match(s[5], /^│ Items +1\/2 │ ● Current item B {2}Evil +title +│ Iterations +run 1 │$/);
 	assert.match(s[6], /^│ ✓ A Parse config +│ c +│ iteration 1\/9 +│$/);
 	assert.match(s[46], /^│ activity unavailable.*│$/);
+	assert.match(s[47], /^├─+┤$/);
 	assert.match(s[48], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
 	assert.match(s[49], /^╰─+╯$/);
 	await quitByKeys(h);
@@ -165,7 +167,7 @@ test("at 150 columns the header keeps the token group with a long branch and mod
 	await until(() => h.term.text().includes("Cached"), "header with tokens");
 	const s = h.term.screen();
 	// Left: title 14 + 2 + worktree (ralph-loop-state-XXXXXX, 23) + 2 + branch 29 = 70; the model (+26) would pass 148 - 2 - 65.
-	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S{6} {2}⎇ rw\/typed-sessi… +hb 0s · activity unavailable · Time 2h 00m · In 3\.2M · Cached 41\.6M · Out 215k · \$18\.61 │$/);
+	assert.match(s[1], /^│ ◆ Ralph Watch {2}ralph-loop-state-\S{6} {2}⎇ rw\/typed-session-validation +hb 0s · event · Time 2h 00m · In 3\.2M · Cached 41\.6M · Out 215k · \$18\.61 │$/);
 	assert.equal([...s[1]].length, 150);
 	await quitByKeys(h);
 });
@@ -185,7 +187,7 @@ test("resize to phone width drops the outer frame; a tiny terminal renders trunc
 	assert.match(s[3], /^ ● RUNNING +$/);
 	assert.match(s[4], /^ █+⣿+ {2}1\/2 $/);
 	assert.match(s[5], /^ iteration 1\/9 · 1 item left · ETA n\/a +$/);
-	assert.match(s[6], /^ hb 0s · activity unavailable +$/);
+	assert.match(s[6], /^ hb 0s · event +$/);
 	assert.match(s[8], /^ ● Current item B {2}Evil +title +$/);
 	assert.match(s[22], /^ activity unavailable.*$/);
 	assert.match(s[23], /^ a Activity  Esc Back  F Filter  · ⇧Q Quit +$/);
@@ -490,5 +492,36 @@ test("a relaunch reconnects to the fresh run and clears old activity; a quiet re
 	await until(() => h.term.text().includes("Activity · all"), "new run Activity");
 	assert.ok(!h.term.text().includes("buffered.ts"));
 	assert.match(h.term.text(), /Edit new.ts/);
+	await quitByKeys(h);
+});
+
+for (const cols of [80, 150, 170, 200]) test(`desktop ${cols} columns closes column rules before Live, then separates the footer`, async (t) => {
+	const f = runningLoop(t);
+	const h = start(f.root, new ReplayTerminal(cols, 24));
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("RUNNING"), "desktop frame");
+	const rows = h.term.screen();
+	const split = cols >= 150 ? 4 : 5;
+	const junctions = [...rows[split]].flatMap((c, i) => c === "┬" ? [i] : []);
+	assert.equal(junctions.length, cols >= 170 ? 2 : 1);
+	for (const col of junctions) {
+		assert.equal(rows[18][col], "│", "column reaches the closing divider");
+		assert.equal(rows[19][col], "┴", "junction directly under the column");
+	}
+	assert.match(rows[20], /^│ activity unavailable.*│$/);
+	assert.match(rows[21], /^├─+┤$/);
+	assert.match(rows[22], /^│ a Activity.*Quit.*│$/);
+	await quitByKeys(h);
+});
+
+test("80-column unavailable header keeps the branch and leaves the full unavailable text only in Live", async (t) => {
+	const f = runningLoop(t);
+	f.git("checkout", "-qb", "r1");
+	const h = start(f.root, new ReplayTerminal(80, 24));
+	t.after(async () => { if (!h.resolved()) { h.term.send("\x03"); h.term.send("\x03"); await h.done; } });
+	await until(() => h.term.text().includes("RUNNING"), "unavailable frame");
+	assert.match(h.term.screen()[1], /⎇ r1/);
+	assert.match(h.term.screen()[1], /event/);
+	assert.equal(h.term.text().split("activity unavailable").length - 1, 1);
 	await quitByKeys(h);
 });

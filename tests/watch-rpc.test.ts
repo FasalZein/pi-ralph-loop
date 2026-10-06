@@ -107,3 +107,10 @@ test("RPC: an error notify is reported; info notify is not", () => {
 	monitor.record({ type: "extension_ui_request", id: "2", method: "notify", notifyType: "error", message: "A Ralph loop is already running" }, () => {});
 	assert.deepEqual(errors, ["A Ralph loop is already running"]);
 });
+
+test("RPC: assistant cap counts code points and keeps the emoji at character 500 intact", () => {
+	const events: DriverEvent[] = [];
+	const monitor = new RpcMonitor((e) => events.push(e));
+	monitor.record({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `${"a".repeat(499)}😀extra` }] } }, () => {});
+	assert.deepEqual(events.filter((e) => e.kind === "message"), [{ kind: "message", text: `${"a".repeat(499)}😀` }]);
+});

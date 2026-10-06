@@ -251,7 +251,7 @@ function validEvent(value: unknown): value is DriverEvent {
 	switch (value.kind) {
 		case "activity": return true;
 		case "tool-start": case "tool-end": return validTool(value.tool);
-		case "message": return typeof value.text === "string" && value.text.length <= MESSAGE_CHARS;
+		case "message": return typeof value.text === "string" && Array.from(value.text).length <= MESSAGE_CHARS;
 		case "assistant-end": return object(value.usage) && ["input", "output", "cacheRead", "cacheWrite"].every((key) => object(value.usage) && finite(value.usage[key])) && finite(value.costUsd) && (value.stopReason === null || typeof value.stopReason === "string") && (value.model === null || typeof value.model === "string");
 		case "dialog-cancelled": return typeof value.method === "string" && (value.title === null || typeof value.title === "string");
 		case "refusal": return typeof value.tool === "string" && typeof value.text === "string";

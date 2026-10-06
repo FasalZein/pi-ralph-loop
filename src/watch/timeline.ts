@@ -99,6 +99,7 @@ export function deriveIterations(input: {
 	const entries: IterationEntry[] = [];
 	let boundary: { at: string; launch: string; token: string } | null = null;
 	let startedAt: string | null = null;
+	const iterationStarts = new Map<string, number>();
 	const incomplete = journal.rotated || journal.badLines > 0 || journal.records[0]?.k !== "run" || journal.records.some((r) => r.k === "d" && r.e === "gap");
 	if (incomplete) entries.push({ kind: "incomplete", at: journal.coverageStart ?? "", reason: "history incomplete" });
 	const ordered = commits !== null && commits.every((c, i) => c.committedAt !== null && c.parents.length === 1 && (i === 0 || Date.parse(c.committedAt) >= Date.parse(commits[i - 1].committedAt!)));
@@ -107,23 +108,29 @@ export function deriveIterations(input: {
 			entries.push({ kind: "run", at: r.t, token: r.tok, phase: r.ph });
 			boundary = { at: r.t, launch: r.r, token: r.tok };
 			startedAt = r.sa;
+			iterationStarts.set(JSON.stringify([r.r, r.tok, r.i]), Date.parse(r.t));
 		} else if (r.k === "x") entries.push({ kind: "intervention", at: r.t, op: r.op, accepted: r.ok === 1, reason: r.why ?? null });
 		else if (r.k === "g") {
 			const from: number | null = boundary && boundary.launch === r.r && boundary.token === r.tok ? Date.parse(boundary.at) : null;
+			const itemFrom = iterationStarts.get(JSON.stringify([r.r, r.tok, r.i])) ?? null;
 			const candidates = from === null ? [] : (commits ?? []).filter((c) => c.committedAt !== null && Date.parse(c.committedAt) > from && Date.parse(c.committedAt) < Date.parse(r.t));
 			const c = !incomplete && ordered && candidates.length === 1 && candidates[0].passesKnown ? candidates[0] : null;
 			const commit = c?.sha ?? null;
-			// Rebuild pending items at the gate from pass commits. Already-passed items without
+			// Rebuild pending items at iteration start, not after this iteration passed one. Already-passed items without
 			// a flip in base..HEAD were passed before this observed history.
-			const pending = !incomplete && ordered ? items.find((item) => {
+			// Git times have whole-second precision; a pass in the start second is ambiguous.
+			const startSecondAmbiguous = itemFrom !== null && (commits ?? []).some((c) => c.passedItems.length > 0 && c.committedAt !== null && Math.floor(Date.parse(c.committedAt) / 1000) === Math.floor(itemFrom / 1000));
+			const knownItemStart = !startSecondAmbiguous && itemFrom !== null && Number.isFinite(itemFrom) && (commits ?? []).every((c) => c.passesKnown || (c.committedAt !== null && (Date.parse(c.committedAt) < itemFrom || Date.parse(c.committedAt) > Date.parse(r.t))));
+			const pending = !incomplete && ordered && knownItemStart && itemFrom !== null ? items.find((item) => {
 				const flips = (commits ?? []).filter((c) => c.passedItems.includes(item.key));
-				return (!item.passes || flips.length > 0) && !flips.some((c) => c.committedAt !== null && Date.parse(c.committedAt) <= Date.parse(r.t));
+				return (!item.passes || flips.length > 0) && !flips.some((c) => c.committedAt !== null && Date.parse(c.committedAt) <= itemFrom);
 			})?.key ?? null : null;
 			const marks: ("rejection" | "enforcer")[] = r.ok === 0 ? ["rejection"] : [];
 			if (commit && alerts.some((a) => a.commit === commit && a.run.launchId === r.r && a.run.loopToken === r.tok && a.run.startedAt === startedAt)) marks.push("enforcer");
 			entries.push({ kind: "gate", at: r.t, iteration: r.i, promise: r.p, item: c?.passedItems.length === 1 ? c.passedItems[0] : c?.blockerItem ?? pending, commit, accepted: r.ok === 1, reason: r.why ?? null, marks });
 			boundary = { at: r.t, launch: r.r, token: r.tok };
 			if (from === null) startedAt = null;
+			if (r.ok === 1 && r.p === "NEXT") iterationStarts.set(JSON.stringify([r.r, r.tok, r.i + 1]), Date.parse(r.t));
 		}
 	}
 	for (const c of commits ?? []) if (c.kind === "parent" && c.committedAt !== null) entries.push({ kind: "parent", at: c.committedAt, commit: c.sha, reason: c.parentReason });

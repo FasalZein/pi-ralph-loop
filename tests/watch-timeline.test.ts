@@ -370,7 +370,7 @@ test("iteration gates retain NEXT, STOP, COMPLETE and WAIT; only rejections and 
 	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
 	try {
 		const pass = f.pass("A", T("10:30"));
-		const decision = (time: string, p: "NEXT" | "STOP" | "COMPLETE" | "WAIT", ok: 0 | 1 = 1): JournalRecord => ({ v: 1, k: "g", r: "L1", t: iso(time), tok: "run-a", i: 1, p, ok });
+		const decision = (time: string, p: "NEXT" | "STOP" | "COMPLETE" | "WAIT", ok: 0 | 1 = 1): JournalRecord => ({ v: 1, k: "g", r: "L1", t: iso(time), tok: "run-a", i: 2, p, ok });
 		const records: JournalRecord[] = [run("L1", "10:00"), loop("L1", "10:00", "run-a"),
 			gate("L1", "10:31", "run-a"),
 			decision("10:32", "WAIT", 0),
@@ -391,5 +391,24 @@ test("iteration gates retain NEXT, STOP, COMPLETE and WAIT; only rejections and 
 		assert.ok(incomplete?.filter((e) => e.kind === "gate").every((e) => e.commit === null));
 		const ambiguous = deriveIterations({ journal, commits: [...snapshot.git!.commits!, { ...snapshot.git!.commits!.at(-1)!, sha: "another" }], alerts: [] });
 		assert.equal(ambiguous?.find((e) => e.kind === "gate")?.commit, null);
+	} finally { f.close(); }
+});
+
+test("ambiguous NEXT labels the item pending at iteration start, including a rejected retry", async () => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	try {
+		f.commit("helper", T("10:20")); f.pass("A", T("10:30"));
+		f.journal([run("L1", "10:00"), loop("L1", "10:00", "run-a"),
+			{ v: 1, k: "g", r: "L1", t: T("10:31"), tok: "run-a", i: 1, p: "NEXT", ok: 0 },
+			{ v: 1, k: "g", r: "L1", t: T("10:32"), tok: "run-a", i: 1, p: "NEXT", ok: 1 }]);
+		f.state(true, T("10:00"));
+		const snapshot = await readOnce(f);
+		assert.deepEqual(snapshot.iterations?.filter((e) => e.kind === "gate").map((e) => [e.item, e.commit]), [["A", null], ["A", null]]);
+		// Git's whole-second time cannot order a pass against a start in that same second.
+		f.journal([run("L1", "10:00"), { ...loop("L1", "10:30", "run-a", "10:00"), t: "2026-09-30T10:30:00.001Z" }, gate("L1", "10:31", "run-a")]);
+		assert.equal((await readOnce(f)).iterations?.find((e) => e.kind === "gate")?.item, null);
+		// Without the run/iteration start record, current items cannot establish a historical label.
+		f.journal([run("L1", "10:00"), gate("L1", "10:31", "run-a")]);
+		assert.equal((await readOnce(f)).iterations?.find((e) => e.kind === "gate")?.item, null);
 	} finally { f.close(); }
 });

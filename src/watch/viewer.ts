@@ -166,8 +166,8 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 			columns = [Math.max(0, cols - 3 - list), list];
 		}
 		const statusRows = cols >= ONE_ROW_STATUS_COLS ? 1 : 2;
-		const layout = [top, fHeader, divider, fStatus, open, mainRow, fLive, close, fFooter, bottom];
-		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1, 1]);
+		const layout = [top, fHeader, divider, fStatus, open, mainRow, close, fLive, divider, fFooter, bottom];
+		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1, 1, 1]);
 		return layout.map((component, index) => ({ component, size: sizes[index] }));
 	};
 	tui.setLayoutRoot(new Stack("vstack", regions));

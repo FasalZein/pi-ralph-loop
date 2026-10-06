@@ -117,7 +117,7 @@ export function headerLine(snapshot: LoopSnapshot | null, worktree: string, widt
 	const rightPart = (withHb: boolean) => {
 		const parts = [
 			withHb && live && hb !== null && hb !== undefined ? `hb ${formatDuration(hb)}` : null,
-			activity ? (eventAge !== null ? `event ${formatDuration(eventAge)}` : "activity unavailable") : null,
+			activity ? (eventAge !== null ? `event ${formatDuration(eventAge)}` : "event") : null,
 			elapsed ? `Time ${formatDuration(elapsed.wallMs)}` : null,
 			usage && cols >= TOKENS_FROM_COLS ? `In ${formatTokens(usage.input)} · Cached ${formatTokens(usage.cacheRead)} · Out ${formatTokens(usage.output)}` : null,
 			usage ? `$${usage.costUsd.toFixed(2)}` : null,
@@ -212,7 +212,7 @@ export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, no
 	if (facts.length) rows.push(` ${facts.join(" · ")}`);
 	if (live) {
 		const age = deriveLiveness(snapshot, live, now).lastEventAgeMs;
-		rows.push(` hb ${snapshot.health.heartbeatAgeMs === null ? "unavailable" : formatDuration(snapshot.health.heartbeatAgeMs)} · ${age === null ? "activity unavailable" : `event ${formatDuration(age)}`}`);
+		rows.push(` hb ${snapshot.health.heartbeatAgeMs === null ? "unavailable" : formatDuration(snapshot.health.heartbeatAgeMs)} · ${age === null ? "event" : `event ${formatDuration(age)}`}`);
 	}
 	return rows;
 }
