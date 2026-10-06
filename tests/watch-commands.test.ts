@@ -385,3 +385,17 @@ for (const role of ["dead", "silent"] as const) test(`launch never dispatches wh
 	if (role === "dead") assert.ok(base.calls.includes("close"));
 	else assert.equal(readHostRecord(root)?.launchId !== undefined, true);
 });
+
+test("relaunch recovers both exited roles after a driver crash leaves stale running state", async t => {
+	const root = scratch(t);
+	state(root, { running: true, owner_pid: null, owner_heartbeat_at: null });
+	writeHostRecord({ ...handleFor(root, "crashed-launch"), enforcer: { windowId: "@2", paneId: "%2" } });
+	const { host, calls, closed } = recordingHost(true);
+	const checked: string[] = [];
+	const outcome = await execute({ kind: "launch", root, mode: "relaunch" }, { host: { ...host, async paneDead(handle, signal) { checked.push(handle.paneId); return host.paneDead(handle, signal); } }, ...quiet });
+	// The recording host starts no new driver. Its later readiness failure must not prevent old-host recovery.
+	assert.ok(!outcome.ok && /exited before it was ready/.test(outcome.error), JSON.stringify(outcome));
+	assert.deepEqual(calls.slice(0, 3), ["verify", "close", "open"]);
+	assert.deepEqual(checked.slice(0, 2), ["%1", "%2"]);
+	assert.equal(closed[0], "crashed-launch"); assert.equal(readHostRecord(root), null);
+});

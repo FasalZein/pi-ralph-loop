@@ -198,3 +198,47 @@ test("restarting after STOPPED does not append another final summary for the sam
 		assert.equal(records.filter(a => a.rule === "loop-ended").length, 1);
 	} finally { f.close(); }
 });
+
+for (const ending of ["closed", "pi-exited-disconnect"] as const) test(`driver ${ending} ends enforcement even when loop.md still says running`, async () => {
+	const f = new Fixture([], { plain: true }); const abort = new AbortController(); let stops = 0; let polls = 0;
+	try {
+		f.state(true, T("09:00"), "crashed");
+		writeFileSync(path.join(f.root, "bad.ts"), "// @ts-ignore\n");
+		const result = await runEnforcer({ root: f.root, mission: await loadMission(f.root), run: { launchId: "crash", loopToken: "crashed", startedAt: T("09:00") }, branch: f.git("symbolic-ref", "--short", "HEAD") }, {
+			signal: abort.signal, observation: clock(), log: () => {},
+			async *events() {
+				yield { v: 1, type: "lifecycle", seq: 1, at: T("12:00"), state: "pi-exited", code: 1 };
+				if (ending === "closed") yield { v: 1, type: "lifecycle", seq: 2, at: T("12:00"), state: "closed" };
+				else throw new Error("event stream lost after pi exit");
+			},
+			async stop(run) { stops++; return { id: "stop", run, phase: "accepted" }; },
+			async sleep() { if (++polls === 2) abort.abort(); },
+		});
+		assert.equal(result.reason, "stopped"); assert.equal(stops, 0);
+		const alerts = readFileSync(path.join(f.root, ".ralph/enforcer-alerts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+		assert.equal(alerts.filter(a => a.rule === "loop-ended").length, 1);
+		assert.match(alerts.find(a => a.rule === "loop-ended").evidence[0], /driver-closed/);
+		assert.equal(JSON.parse(readFileSync(path.join(f.root, ".ralph/enforcer.json"), "utf8")).state, "stopped");
+	} finally { f.close(); }
+});
+
+for (const storage of ["tracked", "untracked"] as const) test(`non-ignored ${storage} loop.md heartbeats do not starve live debt probes`, async () => {
+	const f = new Fixture([], { plain: true, extra: { rules: { "debt-measure-rise": "hard" }, measure: { command: [process.execPath, "-e", 'console.log("{\\"debt\\":1}")'], start: { debt: 0 } } } });
+	const abort = new AbortController(); let polls = 0; let stops = 0;
+	try {
+		writeFileSync(path.join(f.root, ".gitignore"), ".ralph/journal*.jsonl\n");
+		f.state(true, T("09:00"), "heartbeats", { owner_heartbeat_at: T("12:00") });
+		if (storage === "tracked") f.commit("track runtime state", T("09:30"));
+		const mission = await loadMission(f.root);
+		await runEnforcer({ root: f.root, mission, run: { launchId: "heartbeat", loopToken: "heartbeats", startedAt: T("09:00") }, branch: f.git("symbolic-ref", "--short", "HEAD") }, {
+			signal: abort.signal, observation: clock(), log: () => {},
+			async stop(run) { stops++; return { id: "stop", run, phase: "accepted" }; },
+			async sleep() {
+				if (++polls === 3) abort.abort();
+				else { await new Promise(resolve => setTimeout(resolve, 100)); f.state(true, T("09:00"), "heartbeats", { owner_heartbeat_at: T(`12:0${polls}`) }); }
+			},
+		});
+		assert.equal(stops, 1);
+		assert.match(readFileSync(path.join(f.root, ".ralph/enforcer-alerts.jsonl"), "utf8"), /debt-measure-rise/);
+	} finally { f.close(); }
+});

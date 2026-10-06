@@ -8,24 +8,33 @@ export const PROBE_STDOUT_BYTES = 1024 * 1024;
 type Task = { readonly version: string; readonly child: ChildProcess; readonly done: Promise<void>; result: ProbeResult<string> | null; running: boolean };
 const unavailable = (reason: string): ProbeResult<never> => ({ kind: "unavailable", reason });
 /** One in-flight process per argv. A hung probe stays unavailable without blocking observation. */
-export function probeRunner(root: string, mission: Mission, runtime: { readonly observation?: ObservationRuntime; readonly signal?: AbortSignal } = {}) {
+export function probeRunner(root: string, mission: Mission, runtime: { readonly observation?: ObservationRuntime; readonly signal?: AbortSignal; readonly log?: (message: string) => void } = {}) {
 	const abort = new AbortController();
 	const signal = runtime.signal ? AbortSignal.any([runtime.signal, abort.signal]) : abort.signal;
 	const spawned = new WeakSet<ChildProcess>();
 	const terminated = new WeakSet<ChildProcess>();
 	const tasks = new Map<string, Task>();
 	const activeTasks = new Set<Task>();
-	function kill(child: ChildProcess) {
-		if (!child.pid || terminated.has(child)) return;
-		// Before the spawn event, the detached process group may not exist yet.
-		// After close, its PID may already have been reused. Never signal that group.
-		if ((child.exitCode !== null || child.signalCode !== null) && child.stdout?.destroyed) return;
-		if (!spawned.has(child)) { if (child.kill("SIGKILL")) terminated.add(child); return; }
-		try { process.kill(-child.pid, "SIGKILL"); terminated.add(child); }
+	const log = runtime.log ?? console.error;
+	/** Termination failures are operational records, never exceptions from stream callbacks. */
+	function kill(child: ChildProcess): string | null {
+		if (!child.pid || terminated.has(child)) return null;
+		if ((child.exitCode !== null || child.signalCode !== null) && child.stdout?.destroyed) return null;
+		const direct = (): string | null => {
+			try { if (child.kill("SIGKILL")) terminated.add(child); return null; }
+			catch (error) { return `probe termination unavailable: ${error instanceof Error ? error.message : String(error)}`; }
+		};
+		// A detached group may not exist before spawn. Direct-child signalling uses
+		// the owned child handle, not a possibly stale or inaccessible group.
+		if (!spawned.has(child)) return direct();
+		try { process.kill(-child.pid, "SIGKILL"); terminated.add(child); return null; }
 		catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "ESRCH") throw error;
-			if (child.exitCode === null && child.signalCode === null && child.kill("SIGKILL")) terminated.add(child);
+			if (code === "ESRCH" || code === "EPERM") {
+				if (child.exitCode !== null || child.signalCode !== null) return null;
+				return direct();
+			}
+			return `probe termination unavailable: ${error instanceof Error ? error.message : String(error)}`;
 		}
 	}
 	function command(key: string, argv: readonly string[], version: string): ProbeResult<string> {
@@ -47,7 +56,11 @@ export function probeRunner(root: string, mission: Mission, runtime: { readonly 
 			child.stdout!.on("data", (buffer: Buffer) => {
 				if (active.result) return;
 				size += buffer.length;
-				if (size > PROBE_STDOUT_BYTES) { active.result = unavailable("probe stdout exceeds 1 MiB"); kill(child); }
+				if (size > PROBE_STDOUT_BYTES) {
+					active.result = unavailable("probe stdout exceeds 1 MiB");
+					const failure = kill(child);
+					if (failure) { active.result = unavailable(`probe stdout exceeds 1 MiB; ${failure}`); log(failure); }
+				}
 				else buffers.push(buffer);
 			});
 			child.on("error", error => { active.result = unavailable(error.message); });
@@ -80,6 +93,18 @@ export function probeRunner(root: string, mission: Mission, runtime: { readonly 
 			}
 			return { ...(measure ? { measure: measure.kind === "ok" ? parseMeasureOutput(measure.value) : measure } : {}), importers };
 		},
-		async close(): Promise<void> { abort.abort(); const pending = [...activeTasks]; for (const task of pending) if (task.running) kill(task.child); await Promise.all(pending.map(task => task.done)); },
+		async close(): Promise<void> {
+			abort.abort(); const pending = [...activeTasks]; const waiting: Promise<void>[] = [];
+			for (const task of pending) {
+				const failure = task.running ? kill(task.child) : null;
+				if (failure) {
+					log(failure); task.result = unavailable(failure);
+					// A live process we cannot signal needs operator cleanup. Do not let
+					// it prevent the enforcer from publishing down and closing its reader.
+					task.child.stdout?.destroy(); task.child.unref(); activeTasks.delete(task);
+				} else waiting.push(task.done);
+			}
+			await Promise.all(waiting);
+		},
 	};
 }

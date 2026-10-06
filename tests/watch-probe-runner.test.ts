@@ -69,3 +69,25 @@ test("a probe's worktree edit invalidates its output at completion", async () =>
 		assert.equal(await readGitVersion(f.root), version);
 	} finally { await runner.close(); f.close(); }
 });
+
+for (const operation of ["stdout cap", "shutdown"] as const) test(`EPERM from group termination during ${operation} uses direct-child cleanup without throwing`, async () => {
+	const { readFileSync, existsSync } = await import("node:fs"); const { join } = await import("node:path");
+	const code = `require("node:fs").writeFileSync(".ralph/driver.json", String(process.pid)); ${operation === "stdout cap" ? 'process.stdout.write("x".repeat(1024*1024+1));' : ''} setInterval(()=>{},1000)`;
+	const f = new Fixture([], { plain: true, extra: { measure: { command: [process.execPath, "-e", code], start: {} } } });
+	const originalKill = process.kill; let denied = 0;
+	const runner = probeRunner(f.root, await loadMission(f.root));
+	try {
+		process.kill = (pid, signal) => { if (pid < 0) { denied++; throw Object.assign(new Error("group permission denied"), { code: "EPERM" }); } return originalKill(pid, signal); };
+		const version = await readGitVersion(f.root); runner.read(version);
+		for (let n = 0; n < 100 && (!existsSync(join(f.root, ".ralph/driver.json")) || operation === "stdout cap" && denied === 0); n++) await wait();
+		await runner.close();
+		assert.ok(denied > 0);
+		const pid = Number(readFileSync(join(f.root, ".ralph/driver.json"), "utf8"));
+		assert.throws(() => originalKill(pid, 0), { code: "ESRCH" });
+	} finally {
+		process.kill = originalKill;
+		// Use the real kill to clean the regression's child even if the old implementation throws.
+		if (existsSync(join(f.root, ".ralph/driver.json"))) { try { originalKill(Number(readFileSync(join(f.root, ".ralph/driver.json"), "utf8")), "SIGKILL"); } catch { /* already gone */ } }
+		await runner.close(); f.close();
+	}
+});

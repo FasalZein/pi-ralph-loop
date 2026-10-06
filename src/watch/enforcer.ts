@@ -1,4 +1,4 @@
-import { enforcerRuntimePath } from "./alert-log.js";
+import { launcherRuntimePath } from "./runtime-paths.js";
 import path from "node:path";
 import type { EnforcementProbes } from "./probes.js";
 import { argumentsOnly } from "./test-edit.js";
@@ -258,11 +258,7 @@ function commitItem(commit: CommitEvent): string | null {
 	return commit.passedItems.length === 1 ? commit.passedItems[0] : null;
 }
 
-/** Launcher-owned files are not author bundle policy. mission.json is checked by T12. */
+/** Items/progress have dedicated policy checks; mission changes are checked by the process. */
 function bundleRuntimePath(file: string): boolean {
-	return enforcerRuntimePath(file) || ["items.json", "progress.md", "mission.json", "loop.md", "driver.json", "driver.lock", "launch.lock", "rpc.in", "steer", "watch-host.json"].some(name => file === `.ralph/${name}`)
-		|| file.startsWith(".ralph/steer/")
-		|| /^\.ralph\/launch-[^/]+\.json(?:\.\d+\.tmp)?$/.test(file)
-		|| /^\.ralph\/(?:watch-host|driver)\.json\.\d+\.tmp$/.test(file)
-		|| /^\.ralph\/journal(?:\.\d+)?\.jsonl$/.test(file);
+	return launcherRuntimePath(file) || ["items.json", "progress.md", "mission.json"].some(name => file === `.ralph/${name}`);
 }

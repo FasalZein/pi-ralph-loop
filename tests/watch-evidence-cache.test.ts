@@ -27,3 +27,23 @@ test("unchanged warm polls reuse live evidence; content, index, untracked, mode 
 		await reader.read(); assert.equal(diffs, 0);
 	} finally { await reader.close(); f.close(); }
 });
+
+test("probe stamps ignore operational runtime files but retain item, progress and mission policy edits", async () => {
+	const { readGitVersion } = await import("../src/watch/loop-state.ts");
+	const { mkdirSync, readFileSync } = await import("node:fs");
+	const f = new Fixture([], { plain: true });
+	try {
+		writeFileSync(path.join(f.root, ".gitignore"), "");
+		const before = await readGitVersion(f.root);
+		mkdirSync(path.join(f.root, ".ralph/steer"));
+		for (const name of ["loop.md", "driver.json", "driver.lock", "launch.lock", "rpc.in", "watch-host.json", "launch-owned.json", "driver.json.123.tmp", "watch-host.json.123.tmp", "steer/note.txt", "journal.jsonl", "journal.1.jsonl", "enforcer.json", "enforcer-alerts.jsonl"]) {
+			writeFileSync(path.join(f.root, ".ralph", name), "runtime update\n");
+			assert.equal(await readGitVersion(f.root), before, name);
+		}
+		for (const name of ["items.json", "progress.md", "mission.json"]) {
+			const file = path.join(f.root, ".ralph", name);
+			const prior = await readGitVersion(f.root); writeFileSync(file, `${readFileSync(file, "utf8")}\n`);
+			assert.notEqual(await readGitVersion(f.root), prior, name);
+		}
+	} finally { f.close(); }
+});

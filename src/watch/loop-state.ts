@@ -14,6 +14,7 @@ import { collectPolicyEvidence, keyItems, type KeyedItem } from "./policy-eviden
 import { GIT_BINARY_SNIFF_BYTES, parseDiff, textContent } from "./file-content.js";
 import { linearRegex } from "./regex.js";
 import { isJsTs, isTestPath } from "./content.js";
+import { launcherRuntimePath } from "./runtime-paths.js";
 import { enforcerRuntimePath, readAlerts, readEnforcerStatus } from "./alert-log.js";
 import { isAlive } from "./transport.js";
 import { parseJournal } from "./journal.js";
@@ -133,6 +134,7 @@ export type LoopObservation = {
 	readonly evidence: ContentEvidence | null;
 	readonly gitVersion?: string | null;
 	readonly enforcer?: LoopSnapshot["enforcer"];
+	readonly enforcerAlerts?: readonly import("./types.js").Alert[];
 	readonly journal: Result<JournalView>;
 	readonly counterBaseline: CounterBaseline | null;
 	/** State run starts observed by this reader; fresh journal starts are merged during derivation. */
@@ -295,8 +297,8 @@ export function deriveLoopSnapshot(o: LoopObservation): LoopSnapshot {
 		retained,
 		issues,
 		usage: runUsage(journal, state?.loop_token ?? null),
-		// Persisted enforcer alerts mark timeline gates; deriveIterations matches each alert to its own run.
-		iterations: deriveIterations({ journal, commits, items, alerts: o.enforcer?.alerts ?? [] }),
+		// All persisted alerts mark historical gates; only the verdict chip filters to the current launch.
+		iterations: deriveIterations({ journal, commits, items, alerts: o.enforcerAlerts ?? [] }),
 		gitVersion: o.git.status === "fresh" ? o.gitVersion ?? null : null,
 		enforcer: o.enforcer && (!launchId || o.enforcer.status.run.launchId === launchId) ? o.enforcer : null,
 	} satisfies LoopSnapshot);
@@ -376,7 +378,7 @@ async function collectGitStamp(root: string, rt: ObservationRuntime, signal: Abo
 	const indexStamp = await rt.stat(indexPath);
 	// The index version is part of the stamp: a staged A-to-B-to-A edit in the window is a change.
 	const index = indexStamp ? [sha256(await rt.readRange(indexPath, 0)), indexStamp.ino, indexStamp.size, String(indexStamp.mtimeNs)] : "absent";
-	const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl" && !enforcerRuntimePath(p)))].sort();
+	const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && !launcherRuntimePath(p)))].sort();
 	const content: string[] = [];
 	for (const rel of dirty) {
 		const full = path.join(root, rel);
@@ -917,21 +919,22 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 				}
 			}
 			let enforcer: LoopSnapshot["enforcer"] = null;
+			let enforcerAlerts: readonly import("./types.js").Alert[] = [];
+			let alertError: string | null = null;
+			try { enforcerAlerts = await readAlerts(root); }
+			catch (error) { alertError = message(error); issues.push({ source: "enforcer", kind: "unavailable", detail: alertError }); }
 			try {
 				const status = await readEnforcerStatus(root);
 				if (status) {
-					try {
-						const alerts = (await readAlerts(root)).filter(a => a.run.launchId === status.run.launchId);
-						enforcer = { alerts, status: !isAlive(status.pid) && status.state !== "stopped" ? { ...status, state: "down" } : status, commitsChecked: status.commitsChecked };
-					} catch (error) {
-						enforcer = { alerts: [], status: { ...status, state: "unavailable" }, commitsChecked: status.commitsChecked };
-						issues.push({ source: "enforcer", kind: "unavailable", detail: message(error) });
-					}
+					const alerts = enforcerAlerts.filter(a => a.run.launchId === status.run.launchId);
+					const viewStatus = alertError !== null ? { ...status, state: "unavailable" as const }
+						: !isAlive(status.pid) && status.state !== "stopped" ? { ...status, state: "down" as const } : status;
+					enforcer = { alerts, status: viewStatus, commitsChecked: status.commitsChecked };
 				}
 			} catch (error) { issues.push({ source: "enforcer", kind: "unavailable", detail: message(error) }); }
 			const snapshot = deriveLoopSnapshot({
 				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
-				git, history, evidence, gitVersion: before?.digest ?? null, enforcer, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
+				git, history, evidence, gitVersion: before?.digest ?? null, enforcer, enforcerAlerts, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
 			if (journalResult.status === "fresh") lastGood.journal = { value: journalResult.value, observedAt };
 			if (stateResult.status === "fresh") {

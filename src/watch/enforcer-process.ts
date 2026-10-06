@@ -39,7 +39,8 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 	const eventSignal = runtime.signal ? AbortSignal.any([runtime.signal, eventAbort.signal]) : eventAbort.signal;
 	let live: { connected: boolean; lastPiAt: string | null } = { connected: false, lastPiAt: null };
 	let loop = spec.run.loopToken && spec.run.startedAt ? { token: spec.run.loopToken, startedAt: spec.run.startedAt } : null;
-	let notLaunched = false;
+	let driverEnd: "not-launched" | "driver-closed" | null = null;
+	let piExited = false;
 	const events = (async () => {
 		try {
 			for await (const frame of (runtime.events ?? connectEvents)({ root: spec.root, run: spec.run }, eventSignal)) {
@@ -50,10 +51,13 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 						const fact = frame.event.fact;
 						loop = { token: fact.run.loopToken, startedAt: fact.run.startedAt };
 					}
-				} else if (frame.type === "lifecycle" && frame.state === "closed" && !loop) notLaunched = true;
+				} else if (frame.type === "lifecycle") {
+					if (frame.state === "pi-exited") piExited = true;
+					if (frame.state === "closed") driverEnd = loop ? "driver-closed" : "not-launched";
+				}
 			}
 		} catch (error) { if (!eventSignal.aborted) log(`ralph enforcer: activity unavailable: ${message(error)}`); }
-		finally { live.connected = false; }
+		finally { if (piExited && !eventSignal.aborted) driverEnd ??= loop ? "driver-closed" : "not-launched"; live.connected = false; }
 	})();
 	try {
 		while (!runtime.signal?.aborted) {
@@ -90,8 +94,9 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 						}
 					}
 				}
-				const ended = notLaunched || !!loop && isTerminal(snapshot, loop);
-				if (ended && !records.some(a => a.run.launchId === run.launchId && a.rule === "loop-ended")) alerts.push(emit("loop-ended", "INFO", [`reason: ${notLaunched ? "not-launched" : snapshot.state?.stop_reason ?? "unknown"}`, `stop: ${JSON.stringify(stop)}`, `findings: ${JSON.stringify(records.filter(a => a.run.launchId === run.launchId).reduce((counts, a) => ({ ...counts, [a.level]: counts[a.level] + 1 }), { HARD: 0, WARN: 0, INFO: 0 }))}`]));
+				const terminal = !!loop && isTerminal(snapshot, loop);
+				const ended = driverEnd !== null || terminal;
+				if (ended && !records.some(a => a.run.launchId === run.launchId && a.rule === "loop-ended")) alerts.push(emit("loop-ended", "INFO", [`reason: ${terminal ? snapshot.state?.stop_reason ?? "unknown" : driverEnd ?? "unknown"}`, `stop: ${JSON.stringify(stop)}`, `findings: ${JSON.stringify(records.filter(a => a.run.launchId === run.launchId).reduce((counts, a) => ({ ...counts, [a.level]: counts[a.level] + 1 }), { HARD: 0, WARN: 0, INFO: 0 }))}`]));
 				const known = new Set(records.map(alertIdentity));
 				const added = alerts.filter(a => { const id = alertIdentity(a); if (known.has(id)) return false; known.add(id); return true; });
 				await append(spec.root, added); records = [...records, ...added];
@@ -99,9 +104,11 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 				const counts = { HARD: 0, WARN: 0, INFO: 0 }; for (const a of own) counts[a.level]++;
 				const hard = alerts.some(a => a.level === "HARD");
 				last = { v: 1, pid: process.pid, run, configHash: spec.mission.configHash, state: ended ? "stopped" : hard || stop ? "stopping" : torn || !snapshot.git || !snapshot.evidence || snapshot.evidence.index.status !== "fresh" || snapshot.evidence.worktree.status !== "fresh" || snapshot.evidence.baseAncestor === null || snapshot.sources.history.status !== "fresh" ? "unavailable" : "ready", polledAt: snapshot.observedAt, commitsChecked: snapshot.git?.commits?.length ?? 0, counts, stop };
-				if (!ended && hard && !(stop && (stop.phase === "accepted" || stop.phase === "completed"))) {
+				if (!ended && !driverEnd && hard && !(stop && (stop.phase === "accepted" || stop.phase === "completed"))) {
 					stop = { phase: "intent" }; last = { ...last, stop };
 					await write(spec.root, last);
+					// A close received during persistence ends the launch without dispatch.
+					if (driverEnd) continue;
 					try {
 						// Authority: owner #10, stop acknowledgement deadline 15 s.
 						const timeout = AbortSignal.timeout(STOP_ACK_TIMEOUT_MS);

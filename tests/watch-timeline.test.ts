@@ -412,3 +412,22 @@ test("ambiguous NEXT labels the item pending at iteration start, including a rej
 		assert.equal((await readOnce(f)).iterations?.find((e) => e.kind === "gate")?.item, null);
 	} finally { f.close(); }
 });
+
+test("openLoop preserves enforcer gate marks from both launches while the chip shows only the latest launch", async () => {
+	const { appendAlerts, writeEnforcerStatus } = await import("../src/watch/alert-log.ts");
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", passes: false }]);
+	try {
+		const first = f.pass("A", T("10:30")); const second = f.pass("B", T("11:30"));
+		f.journal([run("L1", "10:00"), loop("L1", "10:00", "run-a"), gate("L1", "10:31", "run-a"), run("L2", "11:00"), loop("L2", "11:00", "run-b"), gate("L2", "11:31", "run-b")]);
+		f.state(true, T("11:00"), "run-b");
+		const current = { launchId: "L2", loopToken: "run-b", startedAt: T("11:00") };
+		await appendAlerts(f.root, [
+			{ timestamp: T("10:30"), rule: "scope", level: "WARN", commit: first, item: "A", evidence: ["first"], run: { launchId: "L1", loopToken: "run-a", startedAt: T("10:00") } },
+			{ timestamp: T("11:30"), rule: "scope", level: "WARN", commit: second, item: "B", evidence: ["second"], run: current },
+		]);
+		await writeEnforcerStatus(f.root, { v: 1, pid: process.pid, run: current, configHash: "hash", state: "ready", polledAt: T("12:00"), commitsChecked: 2, counts: { HARD: 0, WARN: 1, INFO: 0 }, stop: null });
+		const s = await readOnce(f);
+		assert.deepEqual(s.iterations?.filter(e => e.kind === "gate").map(e => e.marks), [["enforcer"], ["enforcer"]]);
+		assert.equal(s.enforcer?.alerts.length, 1); assert.equal(s.enforcer?.alerts[0].run.launchId, "L2");
+	} finally { f.close(); }
+});
