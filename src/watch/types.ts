@@ -208,6 +208,8 @@ export type FileChange = {
 			readonly kind: "lines";
 			/** Every line of the new side, so a construct may span into context lines. */
 			readonly lines: readonly string[];
+			/** Old side from the same whole-file diff; empty for an addition. */
+			readonly oldLines: readonly string[];
 			/** 1-based numbers of the added lines, ascending. */
 			readonly added: readonly number[];
 			/** Per line, for JS/TS files only. */

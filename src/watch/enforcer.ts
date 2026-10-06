@@ -85,7 +85,7 @@ export function evaluate(snapshot: LoopSnapshot, mission: Mission, launch: Launc
 
 	for (const [name, seam] of [["index", evidence.index], ["worktree", evidence.worktree]] as const) {
 		if (seam.status !== "fresh") incomplete(name, name === "worktree" ? [...SEAM_RULES, "debt-measure-rise"] : SEAM_RULES, seam.error);
-		else { check(seam.changes, name, null, snapshot.currentItem); policy(seam.policy, seam.changes, name, null, snapshot.currentItem, null); scope(seam.changes, name, null, snapshot.currentItem); }
+		else { check(seam.changes, name, null, snapshot.currentItem); policy(seam.policy, seam.changes, name, null, snapshot.currentItem, snapshot.currentItem); scope(seam.changes, name, null, snapshot.currentItem); }
 	}
 	if (evidence.worktree.status === "fresh") measure();
 	return [...alerts.values()];
@@ -109,7 +109,7 @@ export function evaluate(snapshot: LoopSnapshot, mission: Mission, launch: Launc
 		const policy = mission.scope.items.find(scope => scope.id === item);
 		if (!policy) { incomplete(seam, ["outside-item-and-importers"], `scope not configured for ${item}`, commit); return; }
 		const importers = probes.importers?.[item];
-		if (!importers || importers.kind === "unavailable") { emit("importer-unavailable", "WARN", item, commit, [`${seam}: ${importers?.reason ?? "importer result not supplied"}`]); return; }
+		if (!importers || importers.kind === "unavailable") { emit("importer-check-unavailable", "WARN", item, commit, [`${seam}: ${importers?.reason ?? "importer result not supplied"}`]); return; }
 		const permitted = [...policy.allowedPaths, ...policy.targets, ...importers.value];
 		const outside = authorChanges.filter(change => !permitted.some(allowed => allowed === "." || change.path === allowed || change.path.startsWith(`${allowed}/`)));
 		if (outside.length) raise("outside-item-and-importers", item, commit, [`${seam}: paths outside ${item} and its importers`, ...outside.map(change => change.path)]);
@@ -259,6 +259,9 @@ function commitItem(commit: CommitEvent): string | null {
 
 /** Launcher-owned files are not author bundle policy. mission.json is checked by T12. */
 function bundleRuntimePath(file: string): boolean {
-	return ["items.json", "progress.md", "mission.json", "loop.md", "driver.json", "driver.lock", "rpc.in", "steer", "watch-host.json"].some(name => file === `.ralph/${name}`)
+	return ["items.json", "progress.md", "mission.json", "loop.md", "driver.json", "driver.lock", "launch.lock", "rpc.in", "steer", "watch-host.json"].some(name => file === `.ralph/${name}`)
+		|| file.startsWith(".ralph/steer/")
+		|| /^\.ralph\/launch-[^/]+\.json(?:\.\d+\.tmp)?$/.test(file)
+		|| /^\.ralph\/(?:watch-host|driver)\.json\.\d+\.tmp$/.test(file)
 		|| /^\.ralph\/journal(?:\.\d+)?\.jsonl$/.test(file);
 }

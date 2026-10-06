@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { evaluate } from "../src/watch/enforcer.js";
-import { Fixture, readOnce, T } from "./fixtures/loop-state.ts";
+import { clock, Fixture, readOnce, T } from "./fixtures/loop-state.ts";
 
 const SEAMS = ["commit", "index", "worktree"] as const;
 type Seam = typeof SEAMS[number];
@@ -196,7 +196,7 @@ for (const seam of SEAMS) test(`scope allows item paths, targets and injected im
 		assert.ok(found[0].evidence.join("\n").includes("lib/outside.ts"));
 		assert.ok(!found[0].evidence.join("\n").includes("lib/importer.ts"));
 		const missing = evaluate(s, s.mission!, { branch: f.git("symbolic-ref", "--short", "HEAD") });
-		assert.ok(missing.some(a => a.rule === "importer-unavailable" && a.level === "WARN"));
+		assert.ok(missing.some(a => a.rule === "importer-check-unavailable" && a.level === "WARN"));
 		assert.equal(missing.some(a => a.rule === "outside-item-and-importers"), false);
 	} finally { f.close(); }
 });
@@ -303,5 +303,75 @@ test("approved HEAD exempts item order, receipt scope and importer scope only", 
 		const approved = await alerts(f);
 		assert.equal(approved.s.git?.head, sha);
 		assert.deepEqual(approved.alerts.map(a => [a.level, a.rule, a.commit]), [["INFO", "approved-parent-commit", sha]]);
+	} finally { f.close(); }
+});
+
+// Round 1: stat-only dirtiness must not prove a protected-path violation.
+test("identical-byte protected rewrite is clean; real edit is HARD without index writes", async () => {
+	const { utimesSync, statSync } = await import("node:fs");
+	const f = fixture({ protected: { paths: ["policy/shape.json"] }, rules: { "protected-path": "hard" } });
+	try {
+		const file = path.join(f.root, "policy/shape.json"), index = path.join(f.root, ".git/index");
+		const bytes = readFileSync(file), indexBytes = readFileSync(index), ino = statSync(index).ino;
+		writeFileSync(file, bytes); utimesSync(file, new Date(), new Date(Date.now() + 5000));
+		assert.equal(f.git("ls-files", "-m", "-z"), "");
+		assert.deepEqual((await alerts(f)).alerts, []);
+		assert.deepEqual(readFileSync(index), indexBytes); assert.equal(statSync(index).ino, ino);
+		writeFileSync(file, '{"data":{"rule":3}}\n');
+		assert.ok(f.git("ls-files", "-m", "-z").includes("policy/shape.json"));
+		has(await alerts(f), "protected-path");
+		assert.deepEqual(readFileSync(index), indexBytes); assert.equal(statSync(index).ino, ino);
+	} finally { f.close(); }
+});
+
+test("managed bundle launch and steer files are runtime state, not bundle edits", async () => {
+	const f = fixture();
+	try {
+		for (const file of ["launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json", "launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json.123.tmp", "launch.lock", "steer/request.txt", "steer/nested/queued.txt", "watch-host.json.123.tmp", "driver.json.123.tmp"]) write(f, `.ralph/${file}`, "runtime\n");
+		assert.deepEqual((await alerts(f)).alerts, []);
+		write(f, ".ralph/author-notes.json", "{}\n"); has(await alerts(f), "bundle-state-edit", "WARN");
+	} finally { f.close(); }
+});
+for (const seam of ["index", "worktree"] as const) test(`current item regression notes alone are allowed before blocker commit (${seam})`, async () => {
+	const f = fixture(); f.state(true, T("09:45"));
+	try {
+		land(f, seam, () => { f.items[0].regression_notes = "Gate failed"; f.writeBundle(); });
+		assert.deepEqual((await alerts(f)).alerts, []);
+		land(f, seam, () => { f.items[0].title = "Changed title"; f.writeBundle(); });
+		has(await alerts(f), "items-beyond-pass-flips", "WARN");
+	} finally { f.close(); }
+});
+
+for (const seam of ["index", "worktree"] as const) test(`one whole-file test diff supplies both sides and argument classification (${seam})`, async () => {
+	const f = fixture({ scope: { testGlobs: ["spec/**"] }, testEdit: { mode: "arguments-only", functions: ["check"] } });
+	try {
+		land(f, seam, () => write(f, "spec/a.test.ts", "check(2);\n"));
+		const base = clock(); let diffs = 0;
+		const s = await readOnce(f, { ...base, git(root, args, signal) {
+			if (args.includes("-U2147483647") && args.at(-1) === "spec/a.test.ts") diffs++;
+			return base.git(root, args, signal);
+		} });
+		assert.equal(diffs, 1);
+		const found = s.evidence![seam]; assert.equal(found.status, "fresh");
+		if (found.status === "fresh") assert.deepEqual(found.policy.oldLines["spec/a.test.ts"], ["check(1);"]);
+		assert.deepEqual(evaluate(s, s.mission!, { branch: f.git("symbolic-ref", "--short", "HEAD") }), []);
+	} finally { f.close(); }
+});
+test("empty-tree hash failure makes only its commit evidence unavailable", async () => {
+	const f = fixture();
+	try {
+		land(f, "commit", () => write(f, "lib/a.ts", "// @ts-ignore\nexport const a = 2;\n"));
+		const base = clock(); let failed = false;
+		const s = await readOnce(f, { ...base, git(root, args, signal) {
+			if (args[0] === "hash-object" && !failed) { failed = true; throw new Error("injected hash-object failure"); }
+			return base.git(root, args, signal);
+		} });
+		assert.ok(failed); assert.ok(s.git); assert.ok(s.evidence);
+		const commits = s.git.commits!;
+		assert.equal(s.evidence.commits[commits[0].sha].status, "unavailable");
+		assert.equal(s.evidence.commits[commits[1].sha].status, "fresh");
+		assert.equal(s.evidence.index.status, "fresh"); assert.equal(s.evidence.worktree.status, "fresh");
+		const found = { s, alerts: evaluate(s, s.mission!, { branch: f.git("symbolic-ref", "--short", "HEAD") }) };
+		has(found, "coverage-incomplete", "WARN"); has(found, "suppression-comment");
 	} finally { f.close(); }
 });

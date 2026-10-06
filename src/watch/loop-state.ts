@@ -10,15 +10,16 @@ import type { BundleItem } from "../bundle/types.js";
 import { readStateDocument } from "../state.js";
 import type { RalphLoopState } from "../types.js";
 import { loadMission, MissionConfigError } from "./config.js";
-import { debtSide, itemsDiff } from "./policy-evidence.js";
+import { collectPolicyEvidence, keyItems, type KeyedItem } from "./policy-evidence.js";
+import { GIT_BINARY_SNIFF_BYTES, parseDiff, textContent } from "./file-content.js";
 import { linearRegex } from "./regex.js";
-import { grammarOf, isJsTs, isTestPath, lexLines } from "./content.js";
+import { isJsTs, isTestPath } from "./content.js";
 import { parseJournal } from "./journal.js";
 import { deriveTimeline } from "./timeline.js";
 import { deriveHealth, type CounterBaseline } from "./health.js";
 import { parseProgress, type AttemptCard } from "./progress.js";
 import type {
-	CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, SeamPolicyEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
+	CommitEvent, ContentEvidence, FileChange, GitObservation, SeamEvidence, Issue, ItemStatus, LoopReader, LoopSnapshot, Mission,
 	JournalRecord, JournalView, ObservedAttempt, ObservedItem, RetainedValues, RunStart, RunUsage, SourceName, SourceReport,
 } from "./types.js";
 
@@ -103,8 +104,6 @@ export const defaultRuntime: ObservationRuntime = {
 	},
 };
 
-type KeyedItem = { readonly key: string; readonly index: number; readonly item: BundleItem };
-
 /**
  * The one result shape for every observed source. Ordinary failures are
  * values, never exceptions, and always carry their cause.
@@ -143,20 +142,6 @@ export type LoopObservation = {
 
 const nonBlank = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 
-/**
- * Item key: explicit nonblank id, else `index:N`. Descriptions are never keys.
- * A present id or title that is not a nonblank string is invalid, not absent.
- */
-export function keyItems(items: readonly BundleItem[]): KeyedItem[] | string {
-	const keyed: KeyedItem[] = [];
-	for (const [index, item] of items.entries()) {
-		if (item.id !== undefined && !nonBlank(item.id)) return `items[${index}].id must be a nonblank string`;
-		if (item.title !== undefined && !nonBlank(item.title)) return `items[${index}].title must be a nonblank string`;
-		keyed.push({ key: (item.id as string | undefined) ?? `index:${index}`, index, item });
-	}
-	if (new Set(keyed.map((k) => k.key)).size !== keyed.length) return "duplicate bundle item key";
-	return keyed;
-}
 
 function freeze<T>(value: T): T {
 	if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -708,36 +693,14 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		return parseDiff(rel, out);
 	}
 
-	/** Hunk headers carry the new-side line numbers; context and added rows give every new-side line. */
-	function parseDiff(rel: string, out: string): FileChange["content"] {
-		const rows = out.split("\n");
-		const added: number[] = [];
-		const lines: string[] = [];
-		let hunk = false;
-		let seenHunk = false;
-		let n = 0;
-		for (const row of rows) {
-			const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(row);
-			if (header) { hunk = seenHunk = true; n = Number(header[1]); continue; }
-			if (!hunk) continue;
-			if (row.startsWith("+")) { added.push(n); lines[n - 1] = row.slice(1); n++; }
-			else if (row.startsWith(" ")) { lines[n - 1] = row.slice(1); n++; }
-			else if (!row.startsWith("-") && !row.startsWith("\\")) hunk = false;
-		}
-		if (!seenHunk && rows.some((row) => row.startsWith("Binary files ") || row === "GIT binary patch")) return { kind: "unavailable", reason: "binary" };
-		return textContent(rel, lines, added);
-	}
-
-	function textContent(rel: string, sparse: readonly string[], added: readonly number[]): FileChange["content"] {
-		const lines = Array.from(sparse, (line) => line ?? "");
-		return { kind: "lines", lines, added, lexed: isJsTs(rel) ? lexLines(lines.join("\n"), grammarOf(rel)) : null };
-	}
-
 	async function seam(range: readonly string[], signal: AbortSignal): Promise<FileChange[]> {
 		const parts = (await rt.git(root, ["diff", "--name-status", "-z", ...DIFF, ...range], signal)).split("\0");
 		const changes: FileChange[] = [];
+		// ls-files compares content without refreshing the on-disk index.
+		const modified = range.length === 0 ? new Set((await rt.git(root, ["ls-files", "-m", "-z"], signal)).split("\0")) : null;
 		for (let i = 0; i + 1 < parts.length; i += 2) {
 			const [status, rel] = [parts[i], parts[i + 1]];
+			if (status === "M" && modified && !modified.has(rel)) continue;
 			if (!STATUSES.has(status)) throw new Error(`unexpected diff status ${JSON.stringify(status)} for ${JSON.stringify(rel)}`);
 			const content: FileChange["content"] = status === "D" || !scanned(rel) ? { kind: "skipped" }
 				: status === "U" ? { kind: "unavailable", reason: "unmerged" }
@@ -754,18 +717,19 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		const changes: FileChange[] = [];
 		for (const rel of paths) {
 			if (!scanned(rel)) { changes.push({ path: rel, status: "A", content: { kind: "skipped" } }); continue; }
-			const full = path.join(root, rel);
-			const info = await lstat(full);
-			if (!info.isFile()) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "not a regular file" } }); continue; }
-			const bytes = await liveRead(full, () => rt.readRange(full, 0));
-			// Git's own heuristic: a NUL in the first 8000 bytes means binary.
-			if (bytes.subarray(0, 8000).includes(0)) { changes.push({ path: rel, status: "A", content: { kind: "unavailable", reason: "binary" } }); continue; }
-			const text = bytes.toString("utf8");
-			const rows = text.split("\n");
-			if (text.endsWith("\n")) rows.pop();
-			changes.push({ path: rel, status: "A", content: textContent(rel, rows, rows.map((_, i) => i + 1)) });
+			changes.push({ path: rel, status: "A", content: await untrackedContent(rel) });
 		}
 		return changes;
+	}
+
+	async function untrackedContent(rel: string): Promise<FileChange["content"]> {
+		const full = path.join(root, rel);
+		if (!(await lstat(full)).isFile()) return { kind: "unavailable", reason: "not a regular file" };
+		const bytes = await liveRead(full, () => rt.readRange(full, 0));
+		if (bytes.subarray(0, GIT_BINARY_SNIFF_BYTES).includes(0)) return { kind: "unavailable", reason: "binary" };
+		const text = bytes.toString("utf8"), rows = text.split("\n");
+		if (text.endsWith("\n")) rows.pop();
+		return textContent(rel, rows, rows.map((_, i) => i + 1));
 	}
 
 	/**
@@ -791,76 +755,25 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		return false;
 	}
 
-	/** Whole-file diff sides share the same git window as generic content evidence. */
-	async function policyEvidence(range: readonly string[], changes: readonly FileChange[], signal: AbortSignal): Promise<SeamPolicyEvidence> {
-		const numstat: { path: string; added: number | null; removed: number | null }[] = [];
-		// No line-count policy exists without thresholds. Avoid extra subprocesses
-		// on plain loops and on the viewer's common no-policy read path.
-		const stats = mission?.thresholds ? await rt.git(root, ["diff", "--numstat", "-z", ...DIFF, ...range], signal) : "";
-		for (const row of stats.split("\0").filter(Boolean)) {
-			const first = row.indexOf("\t"), second = row.indexOf("\t", first + 1);
-			if (first < 0 || second < 0) throw new Error("invalid numstat row");
-			const count = (text: string) => { if (text === "-") return null; if (!/^\d+$/.test(text)) throw new Error("invalid numstat count"); return Number(text); };
-			numstat.push({ path: row.slice(second + 1), added: count(row.slice(0, first)), removed: count(row.slice(first + 1, second)) });
-		}
-		const debt: Record<string, { before: import("./types.js").DebtSide; after: import("./types.js").DebtSide }> = Object.create(null);
-		const oldLines: Record<string, readonly string[]> = Object.create(null);
-		let items: SeamPolicyEvidence["items"] = null;
-		for (const change of changes) {
-			const rel = change.path;
-			const baselines = mission?.baselines.filter(b => b.file === rel) ?? [];
-			const itemFile = mission?.bundle !== null && mission?.task.kind === "bundle" && rel === ITEMS_FILE;
-			const test = isTestPath(mission, rel);
-			const untracked = range.length === 0 && change.status === "A";
-			if (!baselines.length && !itemFile && !test && !(untracked && mission?.thresholds?.largeDiffLines !== undefined)) {
-				if (untracked && mission?.thresholds) numstat.push({ path: rel, added: null, removed: 0 });
-				continue;
-			}
-			let before: string | null = change.status === "A" ? null : "";
-			let after: string | null = change.status === "D" ? null : "";
-			let failure: string | null = null;
-			try {
-				if (change.status === "U" || change.status === "T") throw new Error("unmerged or non-regular file");
-				if (untracked) {
-					const full = path.join(root, rel);
-					if (!(await lstat(full)).isFile()) throw new Error("not a regular file");
-					const bytes = await liveRead(full, () => rt.readRange(full, 0));
-					if (bytes.subarray(0, 8000).includes(0)) throw new Error("binary");
-					after = bytes.toString("utf8");
-				} else {
-					const read = () => rt.git(root, ["--literal-pathspecs", "diff", WHOLE_FILE_CONTEXT, ...DIFF, ...range, "--", rel], signal);
-					const text = range.length === 0 ? await liveRead(path.join(root, rel), read) : await read();
-					if (text.split("\n").some(row => row.startsWith("Binary files ") || row === "GIT binary patch")) throw new Error("binary");
-					const old: string[] = [], now: string[] = [];
-					let hunk = false;
-					for (const row of text.split("\n")) {
-						if (row.startsWith("@@ ")) { hunk = true; continue; }
-						if (!hunk) continue;
-						if (row.startsWith(" ") || row.startsWith("-")) old.push(row.slice(1));
-						if (row.startsWith(" ") || row.startsWith("+")) now.push(row.slice(1));
-					}
-					if (before !== null) before = old.join("\n");
-					if (after !== null) after = now.join("\n");
-				}
-			} catch (error) { if (signal.aborted) throw error; failure = message(error); }
-			if (untracked && mission?.thresholds) numstat.push({ path: rel, added: failure ? null : after === "" ? 0 : after!.split("\n").length - (after!.endsWith("\n") ? 1 : 0), removed: 0 });
-			if (test && !failure) oldLines[rel] = before === null || before === "" ? [] : before.split("\n");
-			if (itemFile) items = failure ? { unavailable: failure } : itemsDiff(before, after);
-			for (const baseline of baselines) debt[baseline.name] = failure ? { before: { kind: "invalid", reason: failure }, after: { kind: "invalid", reason: failure } }
-				: { before: debtSide(before, baseline), after: debtSide(after, baseline) };
-		}
-		return { numstat, items, debt, oldLines };
+	async function policy(range: readonly string[], changes: readonly FileChange[], signal: AbortSignal) {
+		return collectPolicyEvidence(changes, mission, range.length === 0, {
+			numstat: () => rt.git(root, ["diff", "--numstat", "-z", ...DIFF, ...range], signal),
+			content: change => range.length === 0 && change.status === "A"
+				? untrackedContent(change.path) : diffContent(range, change.path, signal),
+		}, signal);
 	}
 
 	const commitEvidence = new Map<string, SeamEvidence>();
 	async function readEvidence(history: Result<readonly CommitEvent[]>, baseAncestor: boolean | null, signal: AbortSignal): Promise<ContentEvidence> {
 		liveReads = new Map();
 		liveRaced = false;
-		const attempt = async (range: readonly string[], read: () => Promise<FileChange[]>): Promise<SeamEvidence> => {
-			try {
-				const changes = await read();
-				return { status: "fresh", changes, policy: await policyEvidence(range, changes, signal) };
-			} catch (error) {
+		const readSeam = async (range: readonly string[], read: () => Promise<FileChange[]>): Promise<SeamEvidence> => {
+			const changes = await read();
+			return { status: "fresh", changes, policy: await policy(range, changes, signal) };
+		};
+		const attempt = async (read: () => Promise<SeamEvidence>): Promise<SeamEvidence> => {
+			try { return await read(); }
+			catch (error) {
 				if (signal.aborted) throw error;
 				return { status: "unavailable", error: message(error) };
 			}
@@ -869,16 +782,18 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 		for (const c of history.status === "fresh" ? history.value : []) {
 			let found = commitEvidence.get(c.sha);
 			if (!found) {
-				emptyTree ??= (await rt.git(root, ["hash-object", "-t", "tree", "/dev/null"], signal)).trim();
-				const range = [c.parents[0] ?? emptyTree, c.sha];
-				found = await attempt(range, () => seam(range, signal));
+				found = await attempt(async () => {
+					emptyTree ??= (await rt.git(root, ["hash-object", "-t", "tree", "/dev/null"], signal)).trim();
+					const range = [c.parents[0] ?? emptyTree, c.sha];
+					return readSeam(range, () => seam(range, signal));
+				});
 				// Commits are immutable: cache evidence, never a failure.
 				if (found.status === "fresh") commitEvidence.set(c.sha, found);
 			}
 			commits[c.sha] = found;
 		}
-		const index = await attempt(["--cached", "HEAD"], () => seam(["--cached", "HEAD"], signal));
-		const worktree = await attempt([], async () => [...await seam([], signal), ...await untracked(signal)]);
+		const index = await attempt(() => readSeam(["--cached", "HEAD"], () => seam(["--cached", "HEAD"], signal)));
+		const worktree = await attempt(() => readSeam([], async () => [...await seam([], signal), ...await untracked(signal)]));
 		return { baseAncestor, commits, index, worktree };
 	}
 
