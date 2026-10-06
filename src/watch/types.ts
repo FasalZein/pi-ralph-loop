@@ -217,8 +217,29 @@ export type FileChange = {
 		| { readonly kind: "unavailable"; readonly reason: string };
 };
 
+export type DebtSide =
+	| { readonly kind: "ok"; readonly value: Readonly<Record<string, number>> | readonly string[] }
+	| { readonly kind: "absent" }
+	| { readonly kind: "invalid"; readonly reason: string };
+export type ItemsDiff = {
+	readonly inserted: readonly string[];
+	readonly removed: readonly string[];
+	readonly unpassed: readonly string[];
+	readonly passed: readonly string[];
+	readonly edited: readonly { readonly key: string; readonly fields: readonly string[] }[];
+	readonly beforePending: readonly string[];
+	readonly documentEdited: boolean;
+};
+export type SeamPolicyEvidence = {
+	/** Counts are collected only with configured thresholds; null means binary/unavailable. */
+	readonly numstat: readonly { readonly path: string; readonly added: number | null; readonly removed: number | null }[];
+	readonly items: ItemsDiff | { readonly unavailable: string } | null;
+	readonly debt: Readonly<Record<string, { readonly before: DebtSide; readonly after: DebtSide }>>;
+	readonly oldLines: Readonly<Record<string, readonly string[]>>;
+};
+
 export type SeamEvidence =
-	| { readonly status: "fresh"; readonly changes: readonly FileChange[] }
+	| { readonly status: "fresh"; readonly changes: readonly FileChange[]; readonly policy: SeamPolicyEvidence }
 	| { readonly status: "unavailable"; readonly error: string };
 
 /**

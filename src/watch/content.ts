@@ -1,4 +1,5 @@
 import path from "node:path";
+import { linearRegex } from "./regex.js";
 
 import type { Mission } from "./types.js";
 
@@ -11,7 +12,7 @@ export const isJsTs = (file: string): boolean => JS_TS_EXTENSIONS.includes(path.
 export function isTestPath(mission: Mission | null, file: string): boolean {
 	if (!mission) return false;
 	const { testGlobs, testRegex } = mission.scope;
-	return testGlobs.some((glob) => path.posix.matchesGlob(file, glob)) || (testRegex !== null && new RegExp(testRegex).test(file));
+	return testGlobs.some((glob) => path.posix.matchesGlob(file, glob)) || (testRegex !== null && linearRegex(testRegex).test(file));
 }
 
 /**
@@ -196,4 +197,10 @@ export function lexLines(text: string, grammar: Grammar): LexedLine[] {
 		start = end + 1;
 	}
 	return lines;
+}
+
+/** Source discovery is explicit policy, never a default source root. */
+export function isSourcePath(mission: Mission, file: string): boolean {
+	return mission.scope.sourceGlobs.some(glob => path.posix.matchesGlob(file, glob))
+		|| (mission.scope.sourceRegex !== null && linearRegex(mission.scope.sourceRegex).test(file));
 }

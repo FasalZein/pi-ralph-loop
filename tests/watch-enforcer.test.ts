@@ -18,7 +18,10 @@ type Seam = (typeof SEAMS)[number];
 
 type Scratch = { f: Fixture; launch: LaunchBaseline };
 function scratch(extra: Record<string, unknown> = TEST_DISCOVERY, plain = false): Scratch {
-	const f = new Fixture([{ id: "A", passes: false }], { extra, plain });
+	// These tests isolate T10 generic safety rules; T11 policy tests enable
+	// their own rules explicitly in watch-enforcer-policy.test.ts.
+	const policy = { ...extra, rules: { "test-edit": "off", "multiple-item-pass": "off", "items-beyond-pass-flips": "off", "bundle-state-edit": "off", ...(typeof extra.rules === "object" ? extra.rules : {}) } };
+	const f = new Fixture([{ id: "A", passes: false }], { extra: policy, plain });
 	write(f, "src/a.ts", "export const a = 1;\n");
 	write(f, "tests/a.test.ts", "import { it } from \"node:test\";\nit(\"a\", () => {});\n");
 	f.commit("baseline files", T("09:30"));

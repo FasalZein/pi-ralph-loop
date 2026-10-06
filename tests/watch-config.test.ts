@@ -585,3 +585,24 @@ for (const source of ["^never-empty (?<item>[a-z]+)$", "(?<=prefix)(?<item>suffi
 		assert.deepEqual((await loadMission(f.root)).blocker, f.config.blocker);
 	} finally { f.close(); }
 });
+
+for (const field of ["testRegex", "sourceRegex"]) {
+	for (const pattern of ["(a)\\1", "(?=a)a"]) test(`linear regex rejects ${field} ${pattern}`, async () => {
+		await invalid(`/scope/${field}`, f => { f.config.scope = { [field]: pattern }; }, /linear time/);
+	});
+}
+test("linear regex rejects blocker lookaround at launch", async () => {
+	await invalid("/blocker/subjectRegex", f => {
+		f.config.blocker = { subjectRegex: "(?=a)(?<item>a)", itemGroup: "item" };
+	}, /linear time/);
+});
+test("linear regex accepts nested quantifiers and matches adversarial input promptly", async () => {
+	const f = fixture();
+	try {
+		f.config.scope = { testRegex: "^(a+)+$", sourceRegex: "^(a+)+$" }; f.save();
+		const mission = await loadMission(f.root);
+		const { isTestPath, isSourcePath } = await import("../src/watch/content.js");
+		assert.equal(isTestPath(mission, "a".repeat(100000) + "b"), false);
+		assert.equal(isSourcePath(mission, "a".repeat(100000) + "b"), false);
+	} finally { f.close(); }
+});

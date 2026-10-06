@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { linearRegex } from "./regex.js";
+
 import { loadRalphBundle } from "../bundle/index.js";
 import { validateRequiredFile } from "../bundle/paths.js";
 import { isRecord } from "../bundle/schema.js";
@@ -119,7 +121,7 @@ function globPath(root: string, value: unknown, field: string): string {
 }
 function regex(value: unknown, field: string): string {
 	if (typeof value !== "string") fail(field, "must be a regex source string");
-	boundary(field, () => new RegExp(value));
+	boundary(field, () => linearRegex(value));
 	return value;
 }
 function argv(root: string, value: unknown, field: string): string[] {
@@ -263,7 +265,7 @@ function blockerPolicy(value: unknown): MissionPolicy["blocker"] {
 	const itemGroup = text(blocker.itemGroup, "/blocker/itemGroup");
 	// The empty alternative always matches. The engine still exposes every
 	// declared group, including groups that did not participate in the match.
-	const groups = boundary("/blocker/subjectRegex", () => new RegExp(`(?:${subjectRegex})|`).exec("")?.groups ?? {});
+	const groups = boundary("/blocker/subjectRegex", () => linearRegex(`(?:${subjectRegex})|`).exec("")?.groups ?? {});
 	if (!Object.hasOwn(groups, itemGroup)) fail("/blocker/itemGroup", "must identify a named capture in subjectRegex");
 	return { subjectRegex, itemGroup };
 }
