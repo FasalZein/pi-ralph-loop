@@ -386,7 +386,8 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const quit = async () => {
 		if (stopped) return;
 		stopped = true;
-		// The event stream and a running read end before the terminal is released.
+		// Cancel the event stream and a running read first, then wait for both to end before the terminal is released.
+		abort.abort();
 		connection?.abort.abort();
 		await connection?.task;
 		await inflight;

@@ -373,6 +373,30 @@ test("a refresh failure redraws with the error, keeps running and recovers on th
 	await quitByKeys(h);
 });
 
+test("quit cancels a read that waits for cancellation, then exits and closes the reader", async (t) => {
+	const f = runningLoop(t);
+	let hold = false;
+	let held = false;
+	const h = start(f.root, new ReplayTerminal(80, 24), (reader) => ({
+		read: async (signal) => {
+			if (hold) {
+				held = true;
+				// Settles only when the viewer cancels it.
+				await new Promise<void>((resolve) => { if (signal?.aborted) resolve(); else signal?.addEventListener("abort", () => resolve(), { once: true }); });
+				throw new Error("aborted");
+			}
+			return reader.read(signal);
+		},
+		close: () => reader.close(),
+	}));
+	await until(() => h.term.text().includes("RUNNING"), "first frame");
+	hold = true;
+	h.tick();
+	await until(() => held, "held read");
+	await quitByKeys(h);
+	assert.equal(h.closed(), true);
+});
+
 test("a slow read is never overlapped by the next refresh tick", async (t) => {
 	const f = runningLoop(t);
 	let release: (() => void) | null = null;
