@@ -364,7 +364,7 @@ const message = (error: unknown) => (error instanceof Error ? error.message : St
 
 type Sourced<T> = { readonly result: Result<T>; readonly stamp: FileStamp | null };
 
-async function collectGitStamp(root: string, rt: ObservationRuntime, signal: AbortSignal, hashContent: (full: string) => Promise<string>): Promise<{ head: string; branch: string | null; digest: string }> {
+async function collectGitStamp(root: string, rt: ObservationRuntime, signal: AbortSignal, hashContent: (full: string) => Promise<string>): Promise<{ head: string; branch: string | null; digest: string; probeDigest: string }> {
 	const head = (await rt.git(root, ["rev-parse", "--verify", "HEAD"], signal)).trim();
 	let branch: string | null;
 	try {
@@ -378,25 +378,29 @@ async function collectGitStamp(root: string, rt: ObservationRuntime, signal: Abo
 	const indexStamp = await rt.stat(indexPath);
 	// The index version is part of the stamp: a staged A-to-B-to-A edit in the window is a change.
 	const index = indexStamp ? [sha256(await rt.readRange(indexPath, 0)), indexStamp.ino, indexStamp.size, String(indexStamp.mtimeNs)] : "absent";
-	const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && !launcherRuntimePath(p)))].sort();
+	const dirty = [...new Set((await rt.git(root, ["ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard"], signal)).split("\0").filter((p) => !!p && p !== ".ralph/journal.jsonl" && p !== ".ralph/journal.1.jsonl" && !enforcerRuntimePath(p)))].sort();
 	const content: string[] = [];
+	const probeContent: string[] = [];
 	for (const rel of dirty) {
 		const full = path.join(root, rel);
 		const info = await lstat(full).catch((error: unknown) => {
 			if (isMissing(error)) return null;
 			throw error;
 		});
-		if (!info) content.push(`${rel}\0deleted`);
-		else if (info.isSymbolicLink()) content.push(`${rel}\0link\0${await readlink(full)}`);
-		else if (info.isFile()) content.push(`${rel}\0${info.mode}\0${await hashContent(full)}`);
-		else content.push(`${rel}\0${info.mode}`);
+		const entry = !info ? `${rel}\0deleted`
+			: info.isSymbolicLink() ? `${rel}\0link\0${await readlink(full)}`
+			: info.isFile() ? `${rel}\0${info.mode}\0${await hashContent(full)}` : `${rel}\0${info.mode}`;
+		content.push(entry);
+		if (!launcherRuntimePath(rel)) probeContent.push(entry);
 	}
-	return { head, branch, digest: sha256(JSON.stringify([head, branch, index, content])) };
+	// Runtime paths still invalidate observations and cached policy evidence.
+	// Only probe stability ignores operational rewrites such as owner heartbeats.
+	return { head, branch, digest: sha256(JSON.stringify([head, branch, index, content])), probeDigest: sha256(JSON.stringify([head, branch, index, probeContent])) };
 }
 
 /** A probe's completion stamp uses the same read-only git boundary as observation. */
 export async function readGitVersion(root: string, runtime: ObservationRuntime = defaultRuntime, signal: AbortSignal = new AbortController().signal): Promise<string> {
-	return (await collectGitStamp(root, runtime, signal, async full => sha256(await runtime.readRange(full, 0)))).digest;
+	return (await collectGitStamp(root, runtime, signal, async full => sha256(await runtime.readRange(full, 0)))).probeDigest;
 }
 
 /**
@@ -599,7 +603,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 	 * deleted or untracked nonignored path. Any failure except the detached-HEAD
 	 * exit and a missing path throws.
 	 */
-	async function gitStamp(signal: AbortSignal): Promise<{ head: string; branch: string | null; digest: string }> {
+	async function gitStamp(signal: AbortSignal): Promise<{ head: string; branch: string | null; digest: string; probeDigest: string }> {
 		return collectGitStamp(root, rt, signal, contentHash);
 	}
 
@@ -934,7 +938,7 @@ export function openLoop(inputRoot: string, opts: { mission?: Mission; runtime?:
 			} catch (error) { issues.push({ source: "enforcer", kind: "unavailable", detail: message(error) }); }
 			const snapshot = deriveLoopSnapshot({
 				root, observedAt, mission, state: stateResult, items: itemsResult, progress: progressResult,
-				git, history, evidence, gitVersion: before?.digest ?? null, enforcer, enforcerAlerts, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
+				git, history, evidence, gitVersion: before?.probeDigest ?? null, enforcer, enforcerAlerts, journal: journalResult, counterBaseline, runStarts, progressAt: progressAtPass, lastGood, issues,
 			});
 			if (journalResult.status === "fresh") lastGood.journal = { value: journalResult.value, observedAt };
 			if (stateResult.status === "fresh") {

@@ -242,3 +242,35 @@ for (const storage of ["tracked", "untracked"] as const) test(`non-ignored ${sto
 		assert.match(readFileSync(path.join(f.root, ".ralph/enforcer-alerts.jsonl"), "utf8"), /debt-measure-rise/);
 	} finally { f.close(); }
 });
+
+for (const loss of ["hard crash", "already dead", "live socket loss", "foreign launch crash"] as const) test(`event stream ${loss} ends enforcement only if the same launch's driver PID is dead`, { timeout: 10_000 }, async () => {
+	const { spawn } = await import("node:child_process");
+	const { writeMetadata, readMetadata } = await import("../src/watch/transport.ts");
+	const f = new Fixture([], { plain: true }); const abort = new AbortController(); let polls = 0; let stops = 0;
+	const socket = path.join(f.root, "events.sock");
+	const hello = { v: 1, type: "hello", launchId: loss === "foreign launch crash" ? "foreign" : "killed", nextSeq: 1, lastPiAt: T("12:00"), loop: { token: "crashed", startedAt: T("09:00"), iteration: 1 }, tools: [], totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, messages: 0, dialogsCancelled: 0, refusals: 0 }, counters: { dialogsCancelled: 0, refusals: 0, badRecords: 0, badFacts: 0, subscriberDrops: 0 }, state: "launched" };
+	const child = spawn(process.execPath, ["-e", `require('node:net').createServer(socket => { socket.write(JSON.stringify({...${JSON.stringify(hello)}, pid:process.pid})+'\\n'); ${loss === "live socket loss" ? "socket.end();" : ""} }).listen(${JSON.stringify(socket)}, () => console.log('ready'));`], { stdio: ["ignore", "pipe", "pipe"] });
+	const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+	try {
+		await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); child.once("exit", () => reject(new Error("driver exited before ready"))); });
+		assert.ok(child.pid);
+		writeMetadata(f.root, { v: 1, pid: child.pid, launchId: hello.launchId, eventSocket: socket, factSocket: socket, fifo: path.join(f.root, ".ralph/rpc.in"), startedAt: T("09:00") });
+		if (loss === "already dead") {
+			child.kill("SIGKILL"); await exited;
+			assert.throws(() => readMetadata(f.root), /Driver is not live/);
+			assert.equal(readMetadata(f.root, { allowDead: true }).pid, child.pid);
+		}
+		f.state(true, T("09:00"), "crashed", { owner_heartbeat_at: T("12:00") });
+		const result = await runEnforcer({ root: f.root, mission: await loadMission(f.root), run: { launchId: "killed", loopToken: "crashed", startedAt: T("09:00") }, branch: f.git("symbolic-ref", "--short", "HEAD") }, {
+			signal: abort.signal, observation: clock(), log: () => {},
+			async stop(run) { stops++; return { id: "stop", run, phase: "accepted" }; },
+			async sleep() { if (++polls === 1 && loss !== "live socket loss" && loss !== "already dead") { child.kill("SIGKILL"); await exited; } if (polls === 3) abort.abort(); },
+		});
+		assert.equal(result.reason, loss === "hard crash" || loss === "already dead" ? "stopped" : "aborted"); assert.equal(stops, 0);
+		if (loss === "hard crash" || loss === "already dead") {
+			const records = readFileSync(path.join(f.root, ".ralph/enforcer-alerts.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+			assert.equal(records.filter(a => a.rule === "loop-ended").length, 1);
+			assert.match(records.find(a => a.rule === "loop-ended").evidence[0], /driver-closed/);
+		}
+	} finally { abort.abort(); child.kill("SIGKILL"); await exited; f.close(); }
+});

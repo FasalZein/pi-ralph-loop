@@ -5,6 +5,7 @@ import { evaluate } from "./enforcer.js";
 import { appendAlerts, alertIdentity, readAlerts, readEnforcerStatus, writeEnforcerStatus, findingIdentity, type EnforcerStatus, type StopRecord } from "./alert-log.js";
 import { deriveLiveness } from "./health.js";
 import { connectEvents, isTerminal, controlLoop } from "./driver.js";
+import { isAlive, readMetadata } from "./transport.js";
 import { openLoop, type ObservationRuntime } from "./loop-state.js";
 import type { Alert, LaunchBaseline, Mission, Receipt, RunKey } from "./types.js";
 
@@ -41,10 +42,16 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 	let loop = spec.run.loopToken && spec.run.startedAt ? { token: spec.run.loopToken, startedAt: spec.run.startedAt } : null;
 	let driverEnd: "not-launched" | "driver-closed" | null = null;
 	let piExited = false;
+	let driverPid: number | null = null;
+	let streamFailed = false;
+	try {
+		const metadata = readMetadata(spec.root, { allowDead: true });
+		if (metadata.launchId === spec.run.launchId) driverPid = metadata.pid;
+	} catch { /* Without a validated launch identity, socket loss proves no driver death. */ }
 	const events = (async () => {
 		try {
 			for await (const frame of (runtime.events ?? connectEvents)({ root: spec.root, run: spec.run }, eventSignal)) {
-				if (frame.type === "hello") { live = { connected: true, lastPiAt: frame.lastPiAt }; loop = frame.loop ?? loop; }
+				if (frame.type === "hello") { if (frame.launchId === spec.run.launchId) driverPid = frame.pid; live = { connected: true, lastPiAt: frame.lastPiAt }; loop = frame.loop ?? loop; }
 				else if (frame.type === "event") {
 					live.lastPiAt = frame.at;
 					if (frame.event.kind === "fact" && (frame.event.fact.kind === "iteration-start")) {
@@ -56,12 +63,23 @@ export async function runEnforcer(spec: EnforcerSpec, runtime: EnforcementRuntim
 					if (frame.state === "closed") driverEnd = loop ? "driver-closed" : "not-launched";
 				}
 			}
-		} catch (error) { if (!eventSignal.aborted) log(`ralph enforcer: activity unavailable: ${message(error)}`); }
+		} catch (error) {
+			if (!eventSignal.aborted) {
+				streamFailed = true;
+				log(`ralph enforcer: activity unavailable: ${message(error)}`);
+				// Capture the PID only from this launch's validated metadata/hello.
+				// A different launch must never supply the PID for a death check.
+				if (driverPid !== null && !isAlive(driverPid)) driverEnd = "driver-closed";
+			}
+		}
 		finally { if (piExited && !eventSignal.aborted) driverEnd ??= loop ? "driver-closed" : "not-launched"; live.connected = false; }
 	})();
 	try {
 		while (!runtime.signal?.aborted) {
 			const snapshot = await reader.read(runtime.signal);
+			// A disconnect can precede OS reaping of a killed driver. Recheck on
+			// later polls rather than treating that transient PID liveness as permanent.
+			if (streamFailed && driverPid !== null && !isAlive(driverPid)) driverEnd = "driver-closed";
 			const run = { ...snapshot.run, launchId: spec.run.launchId };
 			const emit = (rule: string, level: Alert["level"], evidence: readonly string[]): Alert => ({ timestamp: snapshot.observedAt, level, rule, evidence, item: null, commit: null, run });
 			try {

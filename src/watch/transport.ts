@@ -215,11 +215,12 @@ export function writeMetadata(root: string, metadata: DriverMetadata): void {
 	try { writeFileSync(temporary, JSON.stringify(metadata), { mode: 0o600 }); renameSync(temporary, path); }
 	finally { if (existsSync(temporary)) unlinkSync(temporary); }
 }
-export function readMetadata(root: string): DriverMetadata {
+/** Controls require a live driver by default. Observers may read a dead identity to prove launch end. */
+export function readMetadata(root: string, options: { readonly allowDead?: boolean } = {}): DriverMetadata {
 	let value: unknown;
 	try { value = JSON.parse(readFileSync(join(root, ".ralph/driver.json"), "utf8")); }
 	catch { throw new ControlError("no-driver", "Driver metadata is missing or invalid"); }
-	if (!object(value) || value.v !== 1 || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.launchId !== "string" || typeof value.eventSocket !== "string" || typeof value.factSocket !== "string" || typeof value.fifo !== "string" || typeof value.startedAt !== "string" || !isAlive(value.pid)) throw new ControlError("no-driver", "Driver is not live");
+	if (!object(value) || value.v !== 1 || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.launchId !== "string" || typeof value.eventSocket !== "string" || typeof value.factSocket !== "string" || typeof value.fifo !== "string" || typeof value.startedAt !== "string" || (!options.allowDead && !isAlive(value.pid))) throw new ControlError("no-driver", "Driver is not live");
 	return { v: 1, pid: value.pid, launchId: value.launchId, eventSocket: value.eventSocket, factSocket: value.factSocket, fifo: value.fifo, startedAt: value.startedAt };
 }
 function validFact(value: unknown): value is LoopFact {

@@ -327,9 +327,11 @@ test("identical-byte protected rewrite is clean; real edit is HARD without index
 test("managed bundle launch and steer files are runtime state, not bundle edits", async () => {
 	const f = fixture();
 	try {
-		for (const file of ["launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json", "launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json.123.tmp", "launch.lock", "steer/request.txt", "steer/nested/queued.txt", "watch-host.json.123.tmp", "driver.json.123.tmp"]) write(f, `.ralph/${file}`, "runtime\n");
+		for (const file of ["launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json", "launch-9b9fe773-a490-413a-9e0b-33515c5f0ad1.json.123.tmp", "launch.lock", "steer/9b9fe773-a490-413a-9e0b-33515c5f0ad1.txt", "watch-host.json.123.tmp", "driver.json.123.tmp"]) write(f, `.ralph/${file}`, "runtime\n");
 		assert.deepEqual((await alerts(f)).alerts, []);
-		write(f, ".ralph/author-notes.json", "{}\n"); has(await alerts(f), "bundle-state-edit", "WARN");
+		for (const author of ["author-notes.json", "steer/request.txt", "steer/nested/queued.txt", "launch-notes.json"]) {
+			write(f, `.ralph/${author}`, "notes\n"); has(await alerts(f), "bundle-state-edit", "WARN");
+		}
 	} finally { f.close(); }
 });
 for (const seam of ["index", "worktree"] as const) test(`current item regression notes alone are allowed before blocker commit (${seam})`, async () => {
