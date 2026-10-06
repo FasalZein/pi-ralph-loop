@@ -243,17 +243,18 @@ test("a fence indented four spaces in a nested list is a proof block for fields 
 	assert.deepEqual(split.map((c) => c.id), ["X12", "X13"]);
 });
 
-test("the per-file analysis budget nulls later fields but keeps raw, id, outcome and resolution", () => {
-	// Each entry is ~40 KiB, so the 64 KiB file budget covers the first and part of the second.
+test("the per-file analysis budget is spent newest first and nulls older fields but keeps raw, id, outcome and resolution", () => {
+	// Each entry is ~40 KiB. Owner Q4 on #16: the 64 KiB budget is spent newest entry first, so it
+	// covers the last entry and part of the third; the first two entries become heading-only.
 	const pad = "- note " + "x".repeat(40 * 1_024) + "\n";
 	const entry = (id: string, outcome: string) => `# ${id} ${outcome}: work\n- Diagnosis: Cause here.\n${pad}`;
 	const raw = entry("A", "blocked") + entry("B", "passed") + entry("C", "blocked") + entry("A", "passed");
 	const cards = parseProgress(raw);
 	assert.equal(cards.length, 4);
-	assert.equal(cards[0].fields?.cause, "Cause here.");
-	assert.equal(cards[1].fields?.cause, "Cause here.");
-	assert.equal(cards[2].fields, null);
-	assert.equal(cards[3].fields, null);
+	assert.equal(cards[0].fields, null);
+	assert.equal(cards[1].fields, null);
+	assert.equal(cards[2].fields?.cause, "Cause here.");
+	assert.equal(cards[3].fields?.cause, "Cause here.");
 	assert.deepEqual(cards.map((c) => [c.id, c.outcome]), [["A", "blocked"], ["B", "passed"], ["C", "blocked"], ["A", "passed"]]);
 	assert.equal(cards[0].resolvedBy, 3);
 	assert.equal(cards.map((c) => c.raw).join(""), raw);

@@ -42,12 +42,8 @@ export function parseProgress(text: string): readonly AttemptCard[] {
 	let fenceLength: number | null = null;
 	let entryLevel = 0;
 	let itemEntry = false;
-	let budget = MAX_FILE_ANALYSIS_LENGTH;
-	const push = (raw: string) => {
-		const card = parseEntry(raw, cards.length, budget);
-		budget -= Math.min(raw.length, MAX_ENTRY_ANALYSIS_LENGTH);
-		cards.push(card);
-	};
+	const raws: string[] = [];
+	const push = (raw: string) => { raws.push(raw); };
 	for (const line of normalized.split("\n")) {
 		const marker = fenceMarker(line, fenceLength);
 		if (marker !== null) fenceLength = fenceLength === null ? marker : null;
@@ -69,6 +65,13 @@ export function parseProgress(text: string): readonly AttemptCard[] {
 		offset += line.length + 1;
 	}
 	if (normalized.slice(start).trim()) push(normalized.slice(start));
+	// Owner Q4 on #16: the file budget is spent newest entry first, so the entries an operator reads
+	// first (current item, latest blocker) keep their fields; the oldest entries become heading-only.
+	let budget = MAX_FILE_ANALYSIS_LENGTH;
+	for (let i = raws.length - 1; i >= 0; i--) {
+		cards[i] = parseEntry(raws[i], i, budget);
+		budget -= Math.min(raws[i].length, MAX_ENTRY_ANALYSIS_LENGTH);
+	}
 	const laterPass = new Map<string, number>();
 	for (let i = cards.length - 1; i >= 0; i--) {
 		const card = cards[i];

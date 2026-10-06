@@ -1,12 +1,15 @@
 import path from "node:path";
-import { type Component, isKeyRelease, type KeyId, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
+import { type Component, getKeybindings, isKeyRelease, type KeyId, matchesKey, ProcessTerminal, type Terminal, TuiAltScreen } from "@earendil-works/pi-tui";
 import { connectEvents, matchingHello } from "./events.js";
 import { activityRows, activityTitle } from "./viewer/activity.js";
 import { applyFrame, disconnect, emptyFeed, FILTERS, type FeedFilter, type LiveFeed } from "./viewer/live.js";
 import { openLoop } from "./loop-state.js";
 import type { LoopReader, LoopSnapshot } from "./types.js";
 import { allocate, clean, fit, Lines, message, Panel, type Region, Stack, style } from "./viewer/layout.js";
-import { enforcerChip, currentBody, currentTitle, headerLine, itemRows, itemsTitle, iterationsBody, iterationsTitle, phoneStatusRows, statusRows } from "./viewer/overview.js";
+import { detailBody, detailTitle, itemCommits } from "./viewer/detail.js";
+import { diffLines, type ShowCommit, showCommit, type ShownCommit } from "./viewer/diff.js";
+import { currentBody, currentTitle, enforcerChip, headerLine, itemRows, itemsTitle, iterationsBody, iterationsTitle, phoneStatusRows, short, spread, statusRows } from "./viewer/overview.js";
+import { progressBody, progressTitle } from "./viewer/progress-screen.js";
 
 // Authority: spec #1 story 46 and the thresholds table ("Viewer refresh about 2 s"); design spec Behaviour.
 export const REFRESH_MS = 2_000;
@@ -38,6 +41,8 @@ export type ViewerRuntime = {
 	readonly clearInterval: (handle: unknown) => void;
 	readonly openLoop: (root: string) => LoopReader;
 	readonly connectEvents?: typeof connectEvents;
+	/** Bounded read-only `git show` for the Diff screen; tests inject a recorder or a failing git. */
+	readonly showCommit?: ShowCommit;
 };
 
 const defaultRuntime = (): ViewerRuntime => ({
@@ -48,6 +53,20 @@ const defaultRuntime = (): ViewerRuntime => ({
 	openLoop: (root) => openLoop(root),
 });
 
+/**
+ * One level of the screen stack (Overview at the bottom; `Esc` pops one level, spec #1 story 95).
+ * Detail follows the item selection; Diff keeps the item it opened on and the commit index (newest first).
+ */
+type Screen =
+	| { readonly id: "overview" }
+	| { readonly id: "detail" }
+	| { readonly id: "diff"; readonly key: string; readonly index: number }
+	| { readonly id: "progress" }
+	| { readonly id: "activity" };
+
+/** The Diff screen's one read: the commit it shows and its result, coloured once. */
+type DiffRead = { readonly sha: string; readonly abort: AbortController; result: { readonly lines: readonly string[] } | { readonly error: string } | null };
+
 /** Mutable viewer state. Snapshots stay immutable and are only replaced. */
 type ViewerState = {
 	snapshot: LoopSnapshot | null;
@@ -55,7 +74,16 @@ type ViewerState = {
 	error: string | null;
 	confirmQuit: boolean;
 	lastCtrlCAt: number | null;
-	screen: "overview" | "activity";
+	stack: Screen[];
+	/** The selected item key; a key that disappears falls back to the default selection. */
+	selected: string | null;
+	/** Raw progress entries instead of parsed cards, in Detail and Progress (spec #1 story 44). */
+	raw: boolean;
+	/** First body row shown in the main panel of the top screen. */
+	scroll: number;
+	/** First row shown in the Items panel; follows the selection so the selected row stays visible. */
+	itemsTop: number;
+	diff: DiffRead | null;
 	filter: FeedFilter;
 	live: LiveFeed;
 };
@@ -83,7 +111,8 @@ class GuardedAltScreen extends TuiAltScreen {
 }
 
 const QUIT_PROMPT = `Quit Ralph Watch? The loop keeps running.   ${style.bold("y")} quit   ${style.bold("n")} stay`;
-const QUIT_KEYS = ` a Activity  Esc Back  F Filter  · ${style.bold("⇧Q")} Quit`;
+const QUIT_KEYS = ` ${style.bold("⇧Q")} Quit`;
+const hint = (keys: string, what: string) => `${style.bold(keys)} ${what}`;
 
 /** The standalone Ralph Watch viewer. Resolves after a deliberate quit; never exits the process. */
 export async function runViewer(spec: { readonly roots: readonly string[]; readonly initialRoot?: string }, runtime: ViewerRuntime = defaultRuntime()): Promise<void> {
@@ -92,7 +121,8 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	// Fails before the alternate screen opens, so a bad root prints a plain error.
 	const reader = runtime.openLoop(root);
 	const { terminal } = runtime;
-	const state: ViewerState = { snapshot: null, error: null, confirmQuit: false, lastCtrlCAt: null, screen: "overview", filter: "all", live: emptyFeed() };
+	const state: ViewerState = { snapshot: null, error: null, confirmQuit: false, lastCtrlCAt: null, stack: [{ id: "overview" }], selected: null, raw: false, scroll: 0, itemsTop: 0, diff: null, filter: "all", live: emptyFeed() };
+	const show = runtime.showCommit ?? showCommit;
 	// Drawn without pi-tui layout, so it works when the layout itself fails.
 	const drawRenderError = (error: unknown) => {
 		try {
@@ -104,6 +134,11 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 		}
 	};
 	const tui = new GuardedAltScreen(terminal, drawRenderError);
+	// TuiAltScreen's own viewport listener runs first and consumes PgUp/PgDn to scroll the whole root,
+	// which always fits the screen. Owner Q5 on #16 gives these keys to the screen bodies, so they are
+	// unbound for the viewer's lifetime (see `release`). Same API in pi-tui 0.84.4 and 1.0.4.
+	const keybindings = getKeybindings();
+	const userBindings = keybindings.getUserBindings();
 
 	// ---- Regions ----
 	const worktree = clean(path.basename(root));
@@ -120,15 +155,106 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	};
 	const status = new Lines((width) => statusRows(state.snapshot, width, terminal.columns >= ONE_ROW_STATUS_COLS ? 1 : 2, now(), state.error, chip(), state.live), "status");
 	const phoneStatus = new Lines((width) => phoneStatusRows(state.snapshot, width, now(), state.error, chip(), state.live), "status");
-	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : QUIT_KEYS], "footer");
-	const current = new Panel(() => currentTitle(state.snapshot), (width) => currentBody(state.snapshot, width), "Current item");
-	const items = new Panel((width) => itemsTitle(state.snapshot, width), (width) => itemRows(state.snapshot, width), "Items");
+	const footer = new Lines(() => [state.confirmQuit ? ` ${QUIT_PROMPT}` : ` ${[...hints(), QUIT_KEYS.trim()].join("  ")}`], "footer");
+	const items = new Panel((width) => itemsTitle(state.snapshot, width), (width) => itemsInView(itemRows(state.snapshot, width, highlight())), "Items");
+	// The highlight is decoration: a selection failure must not take the item list down with it.
+	const highlight = () => { try { return selectedKey(); } catch { return null; } };
+	// Rows of the main panel body; set by the layout pass, read by scrolling.
+	let bodyRows = 0;
+	// The Items panel shares the main row, so it has the same body height.
+	const itemsInView = (rows: readonly string[]) => {
+		const at = state.snapshot?.items.findIndex((item) => item.key === highlight()) ?? -1;
+		if (at >= 0 && at < state.itemsTop) state.itemsTop = at;
+		if (at >= 0 && at >= state.itemsTop + bodyRows) state.itemsTop = at - bodyRows + 1;
+		state.itemsTop = Math.max(0, Math.min(state.itemsTop, rows.length - bodyRows));
+		return rows.slice(state.itemsTop, state.itemsTop + bodyRows);
+	};
+	const scrolled = (lines: readonly string[]) => {
+		state.scroll = Math.max(0, Math.min(state.scroll, lines.length - bodyRows));
+		return lines.slice(state.scroll, state.scroll + bodyRows);
+	};
+	const current = new Panel(() => currentTitle(state.snapshot), (width) => scrolled(currentBody(state.snapshot, width)), "Current item");
+	const screenPanel = new Panel((width) => screenTitle(width), (width) => scrolled(screenBody(width)), "Screen");
+	// The main panel: Current item on Overview, else the top screen (the frame geometry stays).
+	const main = () => (topScreen().id === "overview" ? current : screenPanel);
 	const iterations = new Panel((width) => iterationsTitle(state.snapshot, width), () => iterationsBody(state.snapshot), "Iterations");
 
 	let activityHeight = 0;
 	const activityHeader = new Lines(() => [` ${activityTitle(state.filter)}`], "Activity");
 	const activity = new Lines((width) => activityRows(state.live, state.filter, width, activityHeight), "Activity");
 	const liveStrip = new Lines((width) => activityRows(state.live, "all", width, 1), "Activity");
+
+	// ---- Screens ----
+	const topScreen = (): Screen => state.stack[state.stack.length - 1];
+	const selectedKey = (): string | null => {
+		const snapshot = state.snapshot;
+		if (!snapshot) return null;
+		if (state.selected !== null && snapshot.items.some((item) => item.key === state.selected)) return state.selected;
+		return snapshot.currentItem ?? snapshot.stoppedItem ?? snapshot.items[0]?.key ?? null;
+	};
+	/** The Diff screen's commit: only commits from the fresh snapshot history are ever shown. */
+	const diffTarget = () => {
+		const screen = topScreen();
+		if (screen.id !== "diff" || !state.snapshot) return null;
+		const commits = itemCommits(state.snapshot, screen.key);
+		if (!commits.length) return null;
+		const index = Math.min(screen.index, commits.length - 1);
+		return { commit: commits[index], index, count: commits.length };
+	};
+	const loadDiff = () => {
+		const target = diffTarget();
+		if (state.diff && state.diff.sha !== target?.commit.sha) { state.diff.abort.abort(); state.diff = null; }
+		if (!target || state.diff) return;
+		const read: DiffRead = { sha: target.commit.sha, abort: new AbortController(), result: null };
+		state.diff = read;
+		show(root, read.sha, read.abort.signal).then(
+			(shown: ShownCommit) => { read.result = { lines: diffLines(shown) }; },
+			(error: unknown) => { read.result = { error: message(error) }; },
+		).finally(() => { if (!stopped && state.diff === read) tui.requestRender(); });
+	};
+	const screenTitle = (width: number): string => {
+		const screen = topScreen();
+		switch (screen.id) {
+			case "overview": case "activity": return currentTitle(state.snapshot);
+			case "detail": return detailTitle(state.snapshot, selectedKey());
+			case "progress": return progressTitle(state.snapshot, width);
+			case "diff": {
+				const target = diffTarget();
+				if (!target) return style.bold("Diff");
+				return spread(`${style.accent(short(target.commit.sha))} ${clean(target.commit.subject)}`, `${target.index + 1}/${target.count}`, width);
+			}
+		}
+	};
+	const screenBody = (width: number): readonly string[] => {
+		const screen = topScreen();
+		switch (screen.id) {
+			case "overview": case "activity": return currentBody(state.snapshot, width);
+			// Persisted enforcer alerts of the current launch (T12, #13); null when the enforcer view is absent.
+			case "detail": return detailBody(state.snapshot, selectedKey(), width, { raw: state.raw, alerts: state.snapshot?.enforcer?.alerts ?? null });
+			case "progress": return progressBody(state.snapshot, width, state.raw);
+			case "diff": {
+				if (!diffTarget()) return [style.dim(state.snapshot?.git?.commits ? "○ no commits for this item" : "○ commit history unknown")];
+				const result = state.diff?.result;
+				if (!result) return [style.dim("reading diff…")];
+				return "error" in result ? [style.red(`✕ git show failed: ${clean(result.error)}`)] : result.lines;
+			}
+		}
+	};
+	const hints = (): string[] => {
+		const screen = topScreen();
+		const rawHint = hint("P", state.raw ? "Parsed" : "Raw");
+		switch (screen.id) {
+			case "overview": return state.snapshot?.items.length ? [hint("↑↓", "Items"), hint("⏎", "Detail"), hint("p", "Progress"), hint("a", "Activity")] : [hint("p", "Progress"), hint("a", "Activity")];
+			case "activity": return [hint("F", "Filter"), hint("Esc", "Back")];
+			case "detail": {
+				const key = selectedKey();
+				const diff = state.snapshot && key !== null && itemCommits(state.snapshot, key).length ? [hint("D", "Diff")] : [];
+				return [hint("↑↓", "Items"), ...diff, rawHint, hint("Esc", "Back")];
+			}
+			case "diff": return [hint("[ ]", "Commit"), hint("↑↓", "Scroll"), hint("Esc", "Item")];
+			case "progress": return [hint("↑↓", "Scroll"), rawHint, hint("Esc", "Back")];
+		}
+	};
 
 	// ---- Frame (Look A on desktop, rules only on phones) ----
 	// Inner column widths of the main row, left to right; junctions sit between them.
@@ -149,22 +275,23 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 	const framed = (component: Component) => new Stack("hstack", () => [{ component: vrule, size: 1 }, { component, size: Math.max(0, terminal.columns - 2) }, { component: vrule, size: 1 }]);
 	const [fHeader, fStatus, fFooter, fLive] = [header, status, footer, liveStrip].map(framed);
 	const mainRow = new Stack("hstack", () => {
-		const panels = columns.length === 3 ? [items, current, iterations] : [current, items];
+		const panels = columns.length === 3 ? [items, main(), iterations] : [main(), items];
 		return [...panels.flatMap((component, index) => [{ component: vrule, size: 1 }, { component, size: columns[index] ?? 0 }]), { component: vrule, size: 1 }];
 	});
 
 	const regions = (): Region[] => {
 		const cols = terminal.columns;
 		const rows = terminal.rows;
-		if (state.screen === "activity") {
+		if (topScreen().id === "activity") {
 			activityHeight = Math.max(0, rows - 3);
 			const layout = [activityHeader, phoneRule, activity, footer];
 			const sizes = allocate(rows, [1, 1, "rest", 1]);
 			return layout.map((component, index) => ({ component, size: sizes[index] }));
 		}
 		if (cols < PHONE_BELOW_COLS) {
-			const layout = [phoneHeader, phoneRule, phoneStatus, phoneRule, current, phoneRule, liveStrip, footer];
+			const layout = [phoneHeader, phoneRule, phoneStatus, phoneRule, main(), phoneRule, liveStrip, footer];
 			const sizes = allocate(rows, [2, 1, PHONE_STATUS_ROWS + 1, 1, "rest", 1, 1, 1]);
+			bodyRows = Math.max(0, sizes[4] - 1);
 			return layout.map((component, index) => ({ component, size: sizes[index] }));
 		}
 		if (cols >= THREE_COLUMNS_COLS) columns = [ITEMS_COL, Math.max(0, cols - 4 - ITEMS_COL - SIDE_COL), SIDE_COL];
@@ -175,6 +302,7 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 		const statusRows = cols >= ONE_ROW_STATUS_COLS ? 1 : 2;
 		const layout = [top, fHeader, divider, fStatus, open, mainRow, close, fLive, divider, fFooter, bottom];
 		const sizes = allocate(rows, [1, 1, 1, statusRows, 1, "rest", 1, 1, 1, 1, 1]);
+		bodyRows = Math.max(0, sizes[5] - 1);
 		return layout.map((component, index) => ({ component, size: sizes[index] }));
 	};
 	tui.setLayoutRoot(new Stack("vstack", regions));
@@ -224,36 +352,90 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 		// A slow read never overlaps the next one.
 		if (stopped || inflight) return;
 		inflight = reader.read(abort.signal).then(
-			(snapshot) => { state.snapshot = snapshot; state.error = null; void attach(); },
+			(snapshot) => { state.snapshot = snapshot; state.error = null; void attach(); loadDiff(); },
 			(error: unknown) => { state.error = message(error); connection?.abort.abort(); state.live = disconnect(state.live, "snapshot unavailable"); },
 		).finally(() => { inflight = null; if (!stopped) tui.requestRender(); });
 	};
 
-	// ---- Keys ----
-	// Minimal navigation seam; T15 extends the screen field and key table.
-	const keymap: readonly { key: KeyId; act: () => void }[] = [
-		{ key: "a", act: () => { state.screen = "activity"; } },
-		{ key: "escape", act: () => { state.screen = "overview"; } },
-		{ key: "shift+f", act: () => { state.filter = FILTERS[(FILTERS.indexOf(state.filter) + 1) % FILTERS.length]; } },
-	];
+	// ---- Lifetime ----
+	let timer: unknown = null;
 	let finish!: () => void;
-	const done = new Promise<void>((resolve) => { finish = resolve; });
+	let fail!: (error: unknown) => void;
+	const done = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+	/**
+	 * The one viewer lifetime boundary, for a quit and for a failed start. Each step runs even when an
+	 * earlier one throws: the shared key bindings are restored and the reader is closed whatever the
+	 * terminal does. Quit closes viewer resources only; the loop and enforcer keep running.
+	 * Returns the terminal stop failure, if any.
+	 */
+	const release = async (): Promise<{ readonly error: unknown } | null> => {
+		stopped = true;
+		if (timer !== null) runtime.clearInterval(timer);
+		abort.abort();
+		state.diff?.abort.abort();
+		let failure: { readonly error: unknown } | null = null;
+		try {
+			tui.stop();
+		} catch (error) {
+			failure = { error };
+		}
+		keybindings.setUserBindings(userBindings);
+		await reader.close().catch(() => undefined);
+		return failure;
+	};
 	const quit = async () => {
 		if (stopped) return;
 		stopped = true;
-		runtime.clearInterval(timer);
-		abort.abort();
+		// The event stream and a running read end before the terminal is released.
 		connection?.abort.abort();
 		await connection?.task;
 		await inflight;
-		try {
-			await terminal.drainInput(DRAIN_INPUT_MS);
-		} finally {
-			tui.stop();
-			// Quit closes viewer resources only; the loop and enforcer keep running.
-			await reader.close().catch(() => undefined);
-			finish();
-		}
+		// A drain failure must not skip the release.
+		await terminal.drainInput(DRAIN_INPUT_MS).catch(() => undefined);
+		const failure = await release();
+		if (failure) fail(failure.error);
+		else finish();
+	};
+
+	// ---- Keys ----
+	const push = (screen: Screen) => { state.stack.push(screen); state.scroll = 0; };
+	const moveSelection = (by: number) => {
+		const list = state.snapshot?.items ?? [];
+		const at = list.findIndex((item) => item.key === selectedKey());
+		if (at < 0) return;
+		state.selected = list[Math.max(0, Math.min(list.length - 1, at + by))].key;
+		// The Items panel follows the selection when it draws (`itemsInView`).
+		state.scroll = 0;
+	};
+	/** Screen keys (design spec section 7, owner Q5 on #16). Returns false for a key this screen does not use. */
+	const navigate = (key: (...ids: KeyId[]) => boolean): boolean => {
+		const screen = topScreen();
+		// Authority: owner Q5 on #16: PgUp/PgDn scroll everywhere; ↑↓ and j k also scroll in Diff and Progress.
+		const scrolls = screen.id === "diff" || screen.id === "progress";
+		if (key("pageUp")) state.scroll = Math.max(0, state.scroll - Math.max(1, bodyRows - 1));
+		else if (key("pageDown")) state.scroll += Math.max(1, bodyRows - 1);
+		else if (key("up", "k")) { if (scrolls) state.scroll = Math.max(0, state.scroll - 1); else moveSelection(-1); }
+		else if (key("down", "j")) { if (scrolls) state.scroll += 1; else moveSelection(1); }
+		else if (key("escape")) { if (state.stack.length <= 1) return false; state.stack.pop(); state.scroll = 0; }
+		else if (screen.id === "overview" && key("a")) push({ id: "activity" });
+		else if (screen.id === "activity" && key("shift+f")) state.filter = FILTERS[(FILTERS.indexOf(state.filter) + 1) % FILTERS.length];
+		else if (screen.id === "overview" && key("enter", "return")) { if (selectedKey() === null) return false; push({ id: "detail" }); }
+		else if ((screen.id === "overview" || screen.id === "detail") && key("p")) push({ id: "progress" });
+		else if ((screen.id === "detail" || screen.id === "progress") && key("shift+p")) { state.raw = !state.raw; state.scroll = 0; }
+		else if (screen.id === "detail" && key("shift+d")) {
+			const itemKey = selectedKey();
+			if (itemKey === null || !state.snapshot || !itemCommits(state.snapshot, itemKey).length) return false;
+			push({ id: "diff", key: itemKey, index: 0 });
+		} else if (screen.id === "diff" && key("[", "]")) {
+			const target = diffTarget();
+			if (!target) return false;
+			// `[` steps to the older commit, `]` to the newer one; the list is newest first. Wraps around.
+			const step = key("[") ? 1 : -1;
+			state.stack[state.stack.length - 1] = { ...screen, index: (target.index + step + target.count) % target.count };
+			state.scroll = 0;
+		} else return false;
+		loadDiff();
+		return true;
 	};
 	tui.addInputListener((data) => {
 		// Kitty keyboard protocol terminals (herdr) also report key releases.
@@ -276,17 +458,20 @@ export async function runViewer(spec: { readonly roots: readonly string[]; reado
 			else return { consume: true };
 		} else if (key("shift+q")) state.confirmQuit = true;
 		else if (key("q")) tui.flash("Shift+Q to quit", HINT_MS);
-		else {
-			const entry = keymap.find((entry) => key(entry.key));
-			if (!entry) return undefined;
-			entry.act();
-		}
+		else if (!navigate(key)) return undefined;
 		tui.requestRender();
 		return { consume: true };
 	});
 
-	tui.start();
-	refresh();
-	const timer = runtime.setInterval(refresh, REFRESH_MS);
+	try {
+		keybindings.setUserBindings({ ...userBindings, "tui.altScreen.pageUp": [], "tui.altScreen.pageDown": [] });
+		tui.start();
+		refresh();
+		timer = runtime.setInterval(refresh, REFRESH_MS);
+	} catch (error) {
+		// A failed start leaves no disabled bindings, open reader or alternate screen behind.
+		await release();
+		throw error;
+	}
 	return done;
 }

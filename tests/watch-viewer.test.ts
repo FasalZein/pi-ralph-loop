@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+
+import { getKeybindings } from "@earendil-works/pi-tui";
 
 import { openLoop } from "../src/watch/loop-state.ts";
 import { emptyTotals } from "../src/watch/rpc.ts";
@@ -34,7 +38,8 @@ type Harness = {
 	closed: () => boolean;
 };
 
-function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) => LoopReader = (r) => r, connectEvents?: ViewerRuntime["connectEvents"]): Harness {
+function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) => LoopReader = (r) => r, more: Partial<ViewerRuntime> | ViewerRuntime["connectEvents"] = {}): Harness {
+	const extra: Partial<ViewerRuntime> = typeof more === "function" ? { connectEvents: more } : more;
 	let now = Date.parse(NOW);
 	let tickFn: (() => void) | null = null;
 	let intervalMs: number | null = null;
@@ -42,7 +47,6 @@ function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) =>
 	let closed = false;
 	const runtime: ViewerRuntime = {
 		terminal: term,
-		connectEvents,
 		now: () => now,
 		setInterval: (fn, ms) => { tickFn = fn; intervalMs = ms; return 1; },
 		clearInterval: () => { tickFn = null; },
@@ -53,6 +57,7 @@ function start(root: string, term: ReplayTerminal, wrap: (reader: LoopReader) =>
 				close: async () => { closed = true; await inner.close(); },
 			};
 		},
+		...extra,
 	};
 	let resolved = false;
 	const done = runViewer({ roots: [root] }, runtime).then(() => { resolved = true; });
@@ -120,7 +125,8 @@ test("desktop frame at 80x24: one outer rounded frame, shared dividers with junc
 	assert.equal(s[19].indexOf("┴"), 44);
 	assert.match(s[20], /^│ activity unavailable.*│$/);
 	assert.match(s[21], /^├─+┤$/);
-	assert.match(s[22], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
+	// Overview footer: only keys that work there (design spec section 7, #16).
+	assert.match(s[22], /^│ ↑↓ Items  ⏎ Detail  p Progress  a Activity  ⇧Q Quit +│$/);
 	assert.match(s[23], /^╰─+╯$/);
 	assert.match(s[6], /^│ ● Current item B {2}Evil +title +│ Items +1\/2 │$/);
 	// Category "c". Run count and time on item need complete history (journal coverage), so both are omitted.
@@ -150,7 +156,7 @@ test("desktop frame at 200x50: status in one row and three columns Items 46, mid
 	assert.match(s[6], /^│ ✓ A Parse config +│ c +│ iteration 1\/9 +│$/);
 	assert.match(s[46], /^│ activity unavailable.*│$/);
 	assert.match(s[47], /^├─+┤$/);
-	assert.match(s[48], /^│ a Activity  Esc Back  F Filter  · ⇧Q Quit +│$/);
+	assert.match(s[48], /^│ ↑↓ Items  ⏎ Detail  p Progress  a Activity  ⇧Q Quit +│$/);
 	assert.match(s[49], /^╰─+╯$/);
 	await quitByKeys(h);
 });
@@ -190,7 +196,7 @@ test("resize to phone width drops the outer frame; a tiny terminal renders trunc
 	assert.match(s[6], /^ hb 0s · event +$/);
 	assert.match(s[8], /^ ● Current item B {2}Evil +title +$/);
 	assert.match(s[22], /^ activity unavailable.*$/);
-	assert.match(s[23], /^ a Activity  Esc Back  F Filter  · ⇧Q Quit +$/);
+	assert.match(s[23], /^ ↑↓ Items  ⏎ Detail  p Progress  a Activity  ⇧Q Quit +$/);
 	// Owner, 2026-10-01: no minimum size; render the phone layout and truncate.
 	h.term.resize(12, 3);
 	await until(() => h.term.screen()[0].startsWith(" ◆ Ralph Wa"), "tiny frame");
@@ -510,7 +516,7 @@ for (const cols of [80, 150, 170, 200]) test(`desktop ${cols} columns closes col
 	}
 	assert.match(rows[20], /^│ activity unavailable.*│$/);
 	assert.match(rows[21], /^├─+┤$/);
-	assert.match(rows[22], /^│ a Activity.*Quit.*│$/);
+	assert.match(rows[22], /^│ .*a Activity.*Quit.*│$/);
 	await quitByKeys(h);
 });
 
@@ -538,4 +544,229 @@ test("persisted enforcer alerts drive the production chip; unavailable enforcer 
 		await writeEnforcerStatus(f.root, { v: 1, pid: process.pid, run, configHash: "pinned", state: "down", polledAt: NOW, commitsChecked: 3, counts: { HARD: 0, WARN: 1, INFO: 0 }, stop: null });
 		h.tick(); await until(() => h.term.text().includes("enforcer down"), "down chip");
 	} finally { await quitByKeys(h); }
+});
+
+// ---- Item detail, Diff and Progress (#16) ----
+
+const footerOf = (term: ReplayTerminal) => term.screen()[term.screen().length - 2];
+const SGR_GREEN_ADD = "\x1b[32m+";
+
+/** Item A blocked, then passed (two commits); item B current. `sourceLines` adds a source file to the pass commit. */
+function detailLoop(t: test.TestContext, sourceLines = 0): Fixture {
+	const f = new Fixture([{ id: "A", title: "Parse config", passes: false }, { id: "B", title: "Second", passes: false }]);
+	t.after(() => f.close());
+	f.block("A", T("10:00"));
+	if (sourceLines > 0) writeFileSync(path.join(f.root, "a.ts"), Array.from({ length: sourceLines }, (_, i) => `export const v${i} = ${i};\n`).join(""));
+	f.pass("A", T("10:10"));
+	f.state(true, T("09:59"), "run-a", { owner_heartbeat_at: NOW });
+	return f;
+}
+
+test("Detail lists persisted enforcer findings under the commit they name", async (t) => {
+	const f = detailLoop(t);
+	const pass = f.git("rev-parse", "HEAD");
+	const { appendAlerts, writeEnforcerStatus } = await import("../src/watch/alert-log.ts");
+	const run = { launchId: "viewer", loopToken: "run-a", startedAt: T("09:59") };
+	await appendAlerts(f.root, [{ timestamp: NOW, level: "WARN", rule: "test-edit", item: "A", commit: pass, evidence: ["edited test"], run }]);
+	await writeEnforcerStatus(f.root, { v: 1, pid: process.pid, run, configHash: "pinned", state: "ready", polledAt: NOW, commitsChecked: 2, counts: { HARD: 0, WARN: 1, INFO: 0 }, stop: null });
+	const h = start(f.root, new ReplayTerminal(120, 40));
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	h.term.send("k");
+	h.term.send("\r");
+	await until(() => h.term.text().includes("Commits"), "detail");
+	await until(() => h.term.text().includes("⚠ test-edit"), "finding under the pass commit");
+	await quitByKeys(h);
+});
+
+test("navigation: select, Enter opens Detail, D opens a coloured Diff, [ ] step commits, Esc goes back one level", async (t) => {
+	const f = detailLoop(t);
+	const h = start(f.root, new ReplayTerminal(120, 40));
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	assert.match(footerOf(h.term), /^│ ↑↓ Items {2}⏎ Detail {2}p Progress {2}a Activity {2}⇧Q Quit +│$/);
+	// The default selection is the current item; k moves it up to A.
+	h.term.send("k");
+	h.term.send("\r");
+	await until(() => h.term.text().includes("Commits"), "detail");
+	assert.ok(h.term.text().includes("✓ A  Parse config"));
+	assert.match(footerOf(h.term), /^│ ↑↓ Items {2}D Diff {2}P Raw {2}Esc Back {2}⇧Q Quit +│$/);
+	h.term.send("D");
+	await until(() => h.term.text().includes("diff --git a/.ralph/items.json"), "diff");
+	assert.match(h.term.text(), /[0-9a-f]{7} feat: A +1\/2/);
+	assert.ok(h.term.writes.join("").includes(SGR_GREEN_ADD), "additions are green");
+	assert.match(footerOf(h.term), /^│ \[ \] Commit {2}↑↓ Scroll {2}Esc Item {2}⇧Q Quit +│$/);
+	// `[` steps to the older commit (the blocker), `]` back; the Kitty-encoded `[` works the same.
+	h.term.send("[");
+	await until(() => /blocked\(A\): gate +2\/2/.test(h.term.text()), "older commit");
+	h.term.send("\x1b[93u");
+	await until(() => /feat: A +1\/2/.test(h.term.text()), "newer commit");
+	h.term.send("\x1b[91u");
+	await until(() => /blocked\(A\): gate +2\/2/.test(h.term.text()), "kitty [");
+	h.term.send("\x1b");
+	await until(() => h.term.text().includes("Commits"), "back to detail");
+	h.term.send("\x1b");
+	await until(() => h.term.text().includes("Current item B"), "back to overview");
+	await quitByKeys(h);
+});
+
+test("a git error shows inline in the Diff body; Esc still goes back", async (t) => {
+	const f = detailLoop(t);
+	const shown: string[] = [];
+	const h = start(f.root, new ReplayTerminal(100, 30), undefined, {
+		showCommit: async (_root, sha) => { shown.push(sha); throw new Error("bad object \x1b]0;pwn\x07here"); },
+	});
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	h.term.send("k");
+	h.term.send("\r");
+	await until(() => h.term.text().includes("Commits"), "detail");
+	h.term.send("D");
+	await until(() => h.term.text().includes("✕ git show failed: bad object here"), "inline git error");
+	// Only verified full SHAs from the snapshot history reach git.
+	assert.deepEqual(shown.map((sha) => /^[0-9a-f]{40}$/.test(sha)), [true]);
+	assert.ok(!h.term.writes.join("").includes("pwn"));
+	h.term.send("\x1b");
+	await until(() => h.term.text().includes("Commits"), "back to detail");
+	await quitByKeys(h);
+});
+
+test("P toggles raw and parsed in Detail and Progress; Esc first cancels the quit prompt", async (t) => {
+	const f = detailLoop(t);
+	const h = start(f.root, new ReplayTerminal(120, 40));
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	h.term.send("k");
+	h.term.send("\r");
+	await until(() => h.term.text().includes("Commits"), "detail");
+	assert.ok(!h.term.text().includes("# A passed: done"));
+	// Kitty-encoded Shift+P press, then its release (ignored).
+	h.term.send("\x1b[112;2u");
+	h.term.send("\x1b[112;2:3u");
+	await until(() => h.term.text().includes("# A passed: done"), "raw entry");
+	assert.match(footerOf(h.term), /P Parsed/);
+	h.term.send("P");
+	await until(() => !h.term.text().includes("# A passed: done"), "parsed again");
+	// The quit prompt consumes Esc; the screen stays.
+	h.term.send("Q");
+	await until(() => h.term.text().includes("Quit Ralph Watch?"), "quit prompt");
+	h.term.send("\x1b");
+	await until(() => !h.term.text().includes("Quit Ralph Watch?"), "prompt closed");
+	assert.ok(h.term.text().includes("Commits"));
+	// p opens Progress: newest entry first, raw toggle there too.
+	h.term.send("p");
+	await until(() => h.term.text().includes("1 passed · 1 blocked"), "progress");
+	const body = h.term.screen().join("\n");
+	assert.ok(body.indexOf("A ✓ passed") < body.indexOf("A ✕ blocked"), "newest first");
+	assert.match(footerOf(h.term), /^│ ↑↓ Scroll {2}P Raw {2}Esc Back {2}⇧Q Quit +│$/);
+	h.term.send("P");
+	await until(() => h.term.text().includes("# A blocked: gate"), "raw progress");
+	h.term.send("\x1b");
+	await until(() => h.term.text().includes("Commits"), "back to detail");
+	await quitByKeys(h);
+});
+
+test("Diff and Progress scroll with ↑↓, j k and PgUp/PgDn at 80x24; the phone layout opens the same screens", async (t) => {
+	const f = detailLoop(t, 60);
+	const h = start(f.root, new ReplayTerminal(80, 24));
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	h.term.send("k");
+	h.term.send("\r");
+	h.term.send("D");
+	await until(() => h.term.text().includes("diff --git"), "diff");
+	const firstBody = () => h.term.screen()[7];
+	assert.match(firstBody(), /│ commit [0-9a-f]{7}/);
+	h.term.send("j");
+	await until(() => /│ feat: A/.test(firstBody()), "scrolled one row");
+	h.term.send("k");
+	await until(() => /│ commit [0-9a-f]{7}/.test(firstBody()), "scrolled back");
+	h.term.send("\x1b[6~");
+	await until(() => !/│ commit [0-9a-f]{7}|feat: A/.test(firstBody()), "page down");
+	h.term.send("\x1b[5~");
+	await until(() => /│ commit [0-9a-f]{7}/.test(firstBody()), "page up");
+	h.term.resize(62, 48);
+	await until(() => h.term.screen()[0].startsWith(" ◆ Ralph Watch") && h.term.text().includes("diff --git"), "phone diff");
+	assert.match(h.term.screen()[47], /\[ \] Commit/);
+	await quitByKeys(h);
+});
+
+// ---- Round 1 review regressions (#16) ----
+
+/** Custom user bindings the viewer must give back on every exit path. */
+function customBindings(t: test.TestContext) {
+	const keybindings = getKeybindings();
+	const before = keybindings.getUserBindings();
+	const custom = { ...before, "tui.altScreen.pageUp": ["ctrl+u"], "tui.altScreen.pageDown": ["ctrl+d"] } as typeof before;
+	keybindings.setUserBindings(custom);
+	t.after(() => keybindings.setUserBindings(before));
+	return () => assert.deepEqual(keybindings.getUserBindings(), custom);
+}
+
+test("a failed terminal start restores the key bindings, closes the reader and leaves the alternate screen", async (t) => {
+	const f = runningLoop(t);
+	const restored = customBindings(t);
+	class FailingStart extends ReplayTerminal {
+		override start(): void { throw new Error("no tty"); }
+	}
+	const h = start(f.root, new FailingStart(80, 24));
+	await assert.rejects(h.done, /no tty/);
+	restored();
+	assert.equal(h.closed(), true);
+	assert.equal(h.term.stopped, true);
+});
+
+test("a throwing terminal stop still restores the key bindings, closes the reader and rejects the viewer", async (t) => {
+	const f = runningLoop(t);
+	const restored = customBindings(t);
+	class FailingStop extends ReplayTerminal {
+		override stop(): void { super.stop(); throw new Error("stop failed"); }
+	}
+	const h = start(f.root, new FailingStop(80, 24));
+	await until(() => h.term.text().includes("Current item"), "first frame");
+	h.term.send("Q");
+	await until(() => h.term.text().includes("Quit Ralph Watch?"), "quit prompt");
+	h.term.send("y");
+	await assert.rejects(h.done, /stop failed/);
+	restored();
+	assert.equal(h.closed(), true);
+});
+
+test("at 80x24 the Items panel follows the selection; Enter opens the visible selected item", async (t) => {
+	// 20 items, 14 passed: the current item A15 is below the 14 Items rows a top-aligned list shows.
+	const items = Array.from({ length: 20 }, (_, i) => ({ id: `A${String(i + 1).padStart(2, "0")}`, title: `Item ${i + 1}`, passes: false }));
+	const f = new Fixture(items);
+	t.after(() => f.close());
+	for (let i = 0; i < 14; i++) f.pass(items[i].id, T(`10:${String(i + 10).padStart(2, "0")}`));
+	f.state(true, T("10:00"), "run-a", { owner_heartbeat_at: NOW });
+	const h = start(f.root, new ReplayTerminal(80, 24));
+	const itemsColumn = () => h.term.screen().slice(7, 21).map((row) => row.slice(44));
+	const inverseRow = (id: string) => h.term.writes.some((w) => new RegExp(`\\x1b\\[7m[^\\n]*${id} Item`).test(w));
+	await until(() => itemsColumn().some((row) => row.includes("● A15 Item 15")), "current item visible");
+	assert.ok(inverseRow("A15"), "the default selection is drawn inverse");
+	h.term.send("j");
+	await until(() => itemsColumn().some((row) => row.includes("○ A16 Item 16")) && inverseRow("A16"), "A16 visible and selected");
+	assert.equal(itemsColumn().length, 14);
+	h.term.send("\r");
+	await until(() => /○ A16  Item 16/.test(h.term.text()), "detail of A16");
+	// Moving back to the top scrolls the list back.
+	h.term.send("\x1b");
+	for (let i = 0; i < 16; i++) h.term.send("k");
+	await until(() => itemsColumn()[0].includes("✓ A01 Item 1"), "top of the list");
+	await quitByKeys(h);
+});
+
+test("Overview: PgUp/PgDn scroll an overflowing Current item card and return to the first row", async (t) => {
+	const f = new Fixture([{ id: "A", passes: false }, { id: "B", title: "Second", passes: false }]);
+	t.after(() => f.close());
+	f.pass("A", T("10:00"));
+	// Nine blocked attempts on B overflow the 14-row Current item body at 80x24.
+	for (let i = 0; i < 9; i++) f.block("B", T(`10:${String(i + 10).padStart(2, "0")}`), `# B blocked: gate ${i}\n- Failing command: \`npm test\` exit 1.\n`);
+	f.state(true, T("09:59"), "run-a", { owner_heartbeat_at: NOW });
+	const h = start(f.root, new ReplayTerminal(80, 24));
+	await until(() => h.term.text().includes("Current item B"), "overview");
+	const firstBody = () => h.term.screen()[7];
+	await until(() => /blockers/.test(firstBody()), "facts row first");
+	const before = firstBody();
+	h.term.send("\x1b[6~");
+	await until(() => firstBody() !== before, "page down");
+	assert.match(footerOf(h.term), /↑↓ Items/);
+	h.term.send("\x1b[5~");
+	await until(() => firstBody() === before, "page up");
+	await quitByKeys(h);
 });

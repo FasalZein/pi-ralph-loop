@@ -70,7 +70,7 @@ export function enforcerChip(alerts: readonly Alert[], commits: number): string 
 	return style.green(`✓ enforcer ${commits} ${commits === 1 ? "commit" : "commits"} clean`);
 }
 
-const findItem = (snapshot: LoopSnapshot, key: string | null): ObservedItem | null =>
+export const findItem = (snapshot: LoopSnapshot, key: string | null): ObservedItem | null =>
 	key === null ? null : snapshot.items.find((item) => item.key === key) ?? null;
 
 /** Status badge. Owner Q3 on #15: NEEDS YOU only when the stopped item is blocked. Owner D1: health through deriveLiveness. */
@@ -91,7 +91,7 @@ export function badge(snapshot: LoopSnapshot, now: number, live: LiveFeed | null
 }
 
 /** Join a left and a right part, the right part flush with the end of `width`. */
-function spread(left: string, right: string, width: number): string {
+export function spread(left: string, right: string, width: number): string {
 	const gap = width - visibleWidth(left) - visibleWidth(right);
 	if (!right) return fit(left, width);
 	return gap < 1 ? fit(`${left} ${right}`, width) : `${left}${" ".repeat(gap)}${right}`;
@@ -220,7 +220,7 @@ export function phoneStatusRows(snapshot: LoopSnapshot | null, width: number, no
 
 const label = (item: ObservedItem) => clean(`${item.id ?? item.key} ${item.title}`);
 
-function itemMs(snapshot: LoopSnapshot, key: string): number | null {
+export function itemMs(snapshot: LoopSnapshot, key: string): number | null {
 	const current = snapshot.timeline.currentItem;
 	if (current?.key === key && current.ms !== null) return current.ms;
 	const duration = snapshot.timeline.durations[key];
@@ -233,14 +233,15 @@ export function itemsTitle(snapshot: LoopSnapshot | null, width: number): string
 	return spread(style.bold("Items"), list.length ? `${list.filter((item) => item.passes).length}/${list.length}` : "", width);
 }
 
-/** One row per item: glyph, id, title and its measured duration flush right. */
-export function itemRows(snapshot: LoopSnapshot | null, width: number): string[] {
+/** One row per item: glyph, id, title and its measured duration flush right. The selected row is drawn inverse. */
+export function itemRows(snapshot: LoopSnapshot | null, width: number, selected: string | null = null): string[] {
 	return (snapshot?.items ?? []).map((item) => {
 		const ms = itemMs(snapshot!, item.key);
 		const text = `${GLYPH[item.status]} ${label(item)}`;
-		if (ms === null) return text;
-		const time = formatDuration(ms);
-		return `${fit(text, Math.max(0, width - time.length - 1))} ${time}`;
+		const time = ms === null ? "" : formatDuration(ms);
+		const row = time ? `${fit(text, Math.max(0, width - time.length - 1))} ${time}` : text;
+		// Inner resets would end the inverse early, so each one re-enables it.
+		return item.key === selected ? style.inverse(fit(row, width).replaceAll("\x1b[0m", "\x1b[0m\x1b[7m")) : row;
 	});
 }
 
@@ -254,7 +255,7 @@ export function currentTitle(snapshot: LoopSnapshot | null): string {
 }
 
 /** Word-wrap clean text to `width` columns; a word longer than a row is cut. */
-function wrap(text: string, width: number): string[] {
+export function wrap(text: string, width: number): string[] {
 	if (width <= 0) return [];
 	const rows: string[] = [];
 	let row = "";
@@ -272,12 +273,12 @@ function wrap(text: string, width: number): string[] {
  * A labelled card row: the label column, then text wrapped under itself. `text` must already be
  * sanitized: callers clean untrusted parts and then add trusted styling.
  */
-function cardRow(name: string, text: string, width: number): string[] {
+export function cardRow(name: string, text: string, width: number): string[] {
 	const pad = " ".repeat(CARD_LABEL_COLS);
 	return wrap(text, width - CARD_LABEL_COLS).map((line, index) => `${index === 0 ? style.dim(name.padEnd(CARD_LABEL_COLS)) : pad}${line}`);
 }
 
-const short = (sha: string) => sha.slice(0, 7);
+export const short = (sha: string) => sha.slice(0, 7);
 
 /** One progress attempt card (design spec section 6). Raw entry text is never drawn here. */
 export function attemptCard(card: ObservedAttempt, width: number): string[] {

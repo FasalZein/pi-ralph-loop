@@ -61,6 +61,8 @@ export const style = {
 	// Accent orange, truecolor 236,124,64 (design spec section 1). Status colours come from the terminal theme.
 	accent: sgr("38;2;236;124;64"),
 	bold: sgr("1"),
+	// The selected list row (Overview and Detail item selection, #16).
+	inverse: sgr("7"),
 	dim: sgr("2"),
 	red: sgr("31"),
 	green: sgr("32"),
